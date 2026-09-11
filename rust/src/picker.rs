@@ -123,9 +123,32 @@ pub fn choose_from_list(
     options: &[ListOption],
     external_key: Option<char>,
 ) -> std::io::Result<ListChoice> {
+    choose_from_list_lazy(profiles, mark, heading, hint, options, external_key, None)
+}
+
+/// Same as `choose_from_list`, but a row whose own `label`/`note` are cheap
+/// placeholders can be filled in on demand instead of eagerly for the whole
+/// list: `lazy(option)` is called at most once per row — the first time
+/// that row actually scrolls into the viewport — and its `(label, note)`
+/// results are cached from then on. Use this when computing a row's real
+/// content is expensive per-row (e.g. reading a file) and the list can be
+/// long enough that most rows are never actually looked at.
+pub fn choose_from_list_lazy(
+    profiles: &[Profile],
+    mark: i64,
+    heading: &str,
+    hint: Option<&str>,
+    options: &[ListOption],
+    external_key: Option<char>,
+    lazy: Option<&dyn Fn(&ListOption) -> (Option<String>, Option<String>)>,
+) -> std::io::Result<ListChoice> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut selected = 0usize;
     let mut top = 0usize;
+    // Memoized per row index — computed at most once, the first time that
+    // row is actually rendered (i.e. scrolled near), not for the whole list
+    // up front.
+    let mut resolved: Vec<Option<(Option<String>, Option<String>)>> = vec![None; options.len()];
     ui::hide_cursor();
     loop {
         let mut lines = layout::account_lines(profiles, mark, &stats);
@@ -164,12 +187,32 @@ pub fn choose_from_list(
         // terminal actually is.
         let term_width = (crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)).min(100) as isize;
         let note_budget = (term_width - label_w as isize - 8).max(0) as usize;
+        // Resolve only near the *selection*, not the whole visible slice —
+        // a tall terminal can fit an entire long list on screen at once, at
+        // which point "visible" is no different from "everything" and this
+        // would be exactly as eager as computing it all up front. A small
+        // radius means moving the cursor pays for a handful of rows, not
+        // however many happen to fit on screen.
+        if let Some(f) = lazy {
+            let radius = 3usize;
+            let lo = selected.saturating_sub(radius);
+            let hi = (selected + radius).min(options.len().saturating_sub(1));
+            for i in lo..=hi {
+                if resolved[i].is_none() {
+                    resolved[i] = Some(f(&options[i]));
+                }
+            }
+        }
         for (i, opt) in options.iter().enumerate().take(end).skip(top) {
+            let (label_src, note_src) = match &resolved[i] {
+                Some((lbl, nt)) => (lbl.clone().unwrap_or_else(|| opt.label.clone()), nt.clone().or_else(|| opt.note.clone())),
+                None => (opt.label.clone(), opt.note.clone()),
+            };
             let active = i == selected;
             let marker = if active { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-            let label_text = layout::pad_to(&opt.label, label_w);
+            let label_text = layout::pad_to(&label_src, label_w);
             let label = if active { ui::color::orange_bold(&label_text) } else { label_text };
-            let note = opt.note.as_ref().map(|n| {
+            let note = note_src.as_ref().map(|n| {
                 let clipped: String = n.chars().take(note_budget).collect();
                 format!("   {}", ui::color::dim(&clipped))
             }).unwrap_or_default();

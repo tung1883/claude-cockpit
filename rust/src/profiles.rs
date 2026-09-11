@@ -119,7 +119,7 @@ pub fn install_statusline(name: &str, quiet: bool, only_if_missing: bool) -> Res
     } else {
         serde_json::json!({})
     };
-    let exe = std::env::current_exe().unwrap_or_else(|_| "ccpit".into());
+    let exe = std::env::current_exe().unwrap_or_else(|_| "cpit".into());
     settings["statusLine"] = serde_json::json!({
         "type": "command",
         "command": format!("\"{}\" statusline", exe.display()),

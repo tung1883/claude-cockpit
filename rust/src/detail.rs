@@ -139,7 +139,7 @@ fn capped_section(header_label: &str, count: usize, more_value: &str, mut item: 
 /// recent session (`groups` comes in already in that order — see
 /// `session::grouped_sessions`). Picking a folder row (or "more") opens that
 /// folder's session list, straight into the handoff flow.
-fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
+pub fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
     capped_section("Sessions", groups.len(), "sessions-more", |i| {
         let g = &groups[i];
         let n = g.sessions.len();

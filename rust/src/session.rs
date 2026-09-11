@@ -47,6 +47,72 @@ pub struct SessionGroup {
     pub sessions: Vec<SessionFile>,
 }
 
+/// Bounded-cost approximation of `session_details`, for a *list preview*
+/// row rather than a session you've committed to. A few transcripts in
+/// this profile run 30-40MB; `session_details`'s cheap-prefilter still has
+/// to `read_to_string` the whole file, and on a file that size the I/O
+/// alone is the remaining cost, regardless of how little gets JSON-parsed.
+/// This never reads more than a small head slice (session_name) plus a
+/// bounded tail slice (recap/last prompt) — those almost always live near
+/// the end of the file anyway, and a preview doesn't need perfect accuracy.
+pub fn session_preview(path: &std::path::Path) -> (String, String) {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+    let mut session_name = String::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok).take(30) {
+            if !(line.contains("\"session_name\"") || line.contains("\"sessionName\"")) {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(n) = get_str(&entry, &["session_name", "sessionName"]) {
+                    session_name = n.to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    const TAIL: u64 = 300_000;
+    let mut summary = String::new();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(TAIL);
+        if start > 0 {
+            let _ = file.seek(SeekFrom::Start(start));
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() {
+            let text = String::from_utf8_lossy(&buf);
+            let mut recap = String::new();
+            let mut last_prompt = String::new();
+            for (i, line) in text.lines().enumerate() {
+                if start > 0 && i == 0 {
+                    continue; // likely a partial line left over from the seek
+                }
+                let relevant = line.contains("\"type\":\"summary\"") || line.contains("\"type\":\"compact_summary\"") || line.contains("\"type\":\"user\"");
+                if !relevant {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if entry_type == "summary" || entry_type == "compact_summary" {
+                    if let Some(s) = entry.get("summary").and_then(|v| v.as_str()).or_else(|| entry.get("content").and_then(|v| v.as_str())) {
+                        recap = s.to_string();
+                    }
+                }
+                if entry_type == "user" {
+                    if let Some(c) = entry.get("message").and_then(|m| m.get("content")).and_then(|v| v.as_str()) {
+                        last_prompt = c.to_string();
+                    }
+                }
+            }
+            summary = if !recap.is_empty() { recap } else { last_prompt };
+        }
+    }
+    (session_name, summary)
+}
+
 /// Just the `cwd` (or workspace.current_dir), stopping as soon as it's
 /// found — cwd is set on essentially the first line of a transcript, but
 /// `session_details` can't stop there since it also needs the *last*
@@ -139,6 +205,16 @@ fn get_str<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
 
 /// Best-effort scan of a transcript for display metadata. A deleted or
 /// partially-written session should still be listed, just with blanks.
+///
+/// Some transcripts in this profile run 20-40MB+, and the original version
+/// of this scan parsed *every* line into a dynamic `Value` to check it —
+/// on a file that size, most of that cost is spent fully parsing huge
+/// assistant/tool-call payloads just to throw them away. Two changes make
+/// this cheap regardless of file size: project_path comes from the already-
+/// bounded `session_cwd` (first ~20 lines) instead of scanning to the end,
+/// and every other line gets a plain substring check before it's handed to
+/// serde_json — skipping JSON parsing entirely for the vast majority of
+/// lines, which are assistant/tool entries this scan doesn't care about.
 pub fn session_details(session: &SessionFile) -> SessionDetails {
     let mut d = SessionDetails {
         id: session.id.clone(),
@@ -146,19 +222,25 @@ pub fn session_details(session: &SessionFile) -> SessionDetails {
         session_name: String::new(),
         recap: String::new(),
         last_prompt: String::new(),
-        project_path: String::new(),
+        project_path: session_cwd(&session.file),
     };
     let Ok(content) = std::fs::read_to_string(&session.file) else { return d };
     for line in content.lines() {
         if line.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if let Some(n) = get_str(&entry, &["session_name", "sessionName", "name"]) {
-            d.session_name = n.to_string();
+        let maybe_relevant = line.contains("\"session_name\"")
+            || line.contains("\"sessionName\"")
+            || line.contains("\"type\":\"summary\"")
+            || line.contains("\"type\":\"compact_summary\"")
+            || line.contains("\"type\":\"last-prompt\"")
+            || line.contains("\"type\":\"user\"");
+        if !maybe_relevant {
+            continue;
         }
-        if let Some(p) = entry.get("cwd").and_then(|v| v.as_str()).or_else(|| entry.get("workspace").and_then(|w| w.get("current_dir")).and_then(|v| v.as_str())) {
-            d.project_path = p.to_string();
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if let Some(n) = get_str(&entry, &["session_name", "sessionName"]) {
+            d.session_name = n.to_string();
         }
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if entry_type == "summary" || entry_type == "compact_summary" {
