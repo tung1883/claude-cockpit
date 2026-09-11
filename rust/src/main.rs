@@ -169,8 +169,9 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
 
 /// Read-only detail screen for one session — the "detail first" variant of
 /// the overview's two session-row styles (see detail::session_rows).
-/// Opens one project folder's session list and goes straight into the
-/// handoff flow on pick — no read-only detail stop in between.
+/// Opens one project folder's session list; picking a session opens a small
+/// action menu (resume here / hand off / view conversation) rather than
+/// jumping straight into any one of them.
 fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup) -> Result<()> {
     let options: Vec<picker::ListOption> = group
         .sessions
@@ -196,10 +197,88 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
         })
         .collect();
     let heading = format!("Sessions in {}…", ui::color::orange(&group.folder));
-    if let picker::ListChoice::Picked(id) = picker::choose_from_list(profiles, mark, &heading, Some("choose the session to copy"), &options, None)? {
-        run_handoff(term, profiles, mark, from, &id)?;
+    let picker::ListChoice::Picked(id) = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)? else { return Ok(()) };
+
+    loop {
+        let action_options = [
+            picker::ListOption { label: "Resume here".into(), value: "resume".into(), note: Some(format!("continue it as '{from}'")) },
+            picker::ListOption { label: "Hand off".into(), value: "handoff".into(), note: Some("copy it to another profile".into()) },
+            picker::ListOption { label: "View conversation".into(), value: "view".into(), note: Some("read-only, no Claude launch".into()) },
+        ];
+        let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
+        let picker::ListChoice::Picked(action) = choice else { return Ok(()) };
+        match action.as_str() {
+            "resume" => {
+                let suspend = term.suspend();
+                ui::clear_screen();
+                println!("{} resuming as {} — exit Claude to return here\n", ui::color::dim(ui::glyph::spark()), ui::color::orange(from));
+                launch::launch(from, &["--resume".to_string(), id.clone()])?;
+                drop(suspend);
+                return Ok(());
+            }
+            "handoff" => {
+                run_handoff(term, profiles, mark, from, &id)?;
+                return Ok(());
+            }
+            "view" => {
+                view_conversation(profiles, mark, group, &id)?;
+                // Back to the action menu, not the whole folder — you
+                // likely want to act on what you just read.
+            }
+            _ => return Ok(()),
+        }
     }
+}
+
+/// Read-only transcript viewer — no Claude launch, nothing sent anywhere.
+fn view_conversation(profiles: &[profiles::Profile], mark: i64, group: &session::SessionGroup, session_id: &str) -> Result<()> {
+    let Some(file) = group.sessions.iter().find(|s| s.id == session_id) else { return Ok(()) };
+    let turns = session::read_transcript(&file.file);
+
+    let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+    let mut header = layout::account_lines(profiles, mark, &stats);
+    header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Conversation")));
+    header.push(ui::color::dim(&format!("   {}", group.folder)));
+    header.push(String::new());
+
+    let mut rows: Vec<picker::ScrollRow> = Vec::new();
+    if turns.is_empty() {
+        rows.push(picker::ScrollRow::line(ui::color::dim("  (no readable message text in this transcript)")));
+    }
+    for turn in &turns {
+        let label = if turn.role == "user" { ui::color::orange_bold("You") } else { ui::color::green("Claude") };
+        rows.push(picker::ScrollRow::line(format!("  {label}")));
+        for line in wrap_paragraphs(&turn.text, 90) {
+            rows.push(picker::ScrollRow::info(format!("    {line}")));
+        }
+        rows.push(picker::ScrollRow::line(String::new()));
+    }
+    picker::scroll_screen(&header, &rows, None, None)?;
     Ok(())
+}
+
+/// Word-wraps `text` to `width`, wrapping each existing line separately so
+/// paragraph/blank-line breaks in the original message survive.
+fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in raw_line.split_whitespace() {
+            let candidate = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+            if candidate.chars().count() > width && !cur.is_empty() {
+                out.push(cur);
+                cur = word.to_string();
+            } else {
+                cur = candidate;
+            }
+        }
+        out.push(cur);
+    }
+    out
 }
 
 /// Full folder list (beyond the overview's first 5), sorted by each

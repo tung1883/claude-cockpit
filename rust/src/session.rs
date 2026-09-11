@@ -85,6 +85,45 @@ pub fn grouped_sessions(profile: &str) -> Vec<SessionGroup> {
     order.into_iter().map(|folder| { let sessions = map.remove(&folder).unwrap_or_default(); SessionGroup { folder, sessions } }).collect()
 }
 
+pub struct Turn {
+    pub role: String, // "user" | "assistant"
+    pub text: String,
+}
+
+/// Plain-text turns from a transcript, for a read-only viewer — tool calls
+/// and their results are skipped (this is for reading the conversation,
+/// not auditing it), keeping only actual message text.
+pub fn read_transcript(file: &std::path::Path) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    let Ok(content) = std::fs::read_to_string(file) else { return turns };
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let role = entry.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let Some(content_val) = entry.get("message").and_then(|m| m.get("content")) else { continue };
+        let text = match content_val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let text = text.trim().to_string();
+        if !text.is_empty() {
+            turns.push(Turn { role, text });
+        }
+    }
+    turns
+}
+
 pub struct SessionDetails {
     pub id: String,
     pub modified: SystemTime,
