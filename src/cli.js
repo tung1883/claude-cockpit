@@ -41,16 +41,21 @@ function quote(value) {
   return `"${String(value).replaceAll('"', '\\"')}"`;
 }
 
-function installStatusline(name) {
+// quiet: skip the console messages (used when this runs automatically as part
+// of creating/importing a profile). onlyIfMissing: leave an existing
+// statusLine alone instead of overwriting it (used on import, so we don't
+// clobber a statusline the imported config already had configured).
+function installStatusline(name, { quiet = false, onlyIfMissing = false } = {}) {
   const profile = getProfile(name);
   const settingsPath = path.join(paths.profileDir(profile.name), 'settings.json');
   let settings = {};
   if (fs.existsSync(settingsPath)) {
     try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); }
     catch (error) { throw new Error(`Cannot parse ${settingsPath}: ${error.message}`); }
+    if (onlyIfMissing && settings.statusLine) return false;
     const backup = `${settingsPath}.backup-${Date.now()}`;
     fs.copyFileSync(settingsPath, backup);
-    console.log(`Backed up settings to ${backup}`);
+    if (!quiet) console.log(`Backed up settings to ${backup}`);
   }
   settings.statusLine = {
     type: 'command',
@@ -58,7 +63,16 @@ function installStatusline(name) {
   };
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
-  console.log(`Installed statusline for '${profile.name}'. Restart Claude Code to see it.`);
+  if (!quiet) console.log(`Installed statusline for '${profile.name}'. Restart Claude Code to see it.`);
+  return true;
+}
+
+// Create a profile and wire up the cockpit statusline in one step, so a new
+// account never sits there silently missing stats.
+function createAccount(name) {
+  const profile = addProfile(name);
+  try { installStatusline(profile.name, { quiet: true }); } catch { /* best effort */ }
+  return profile;
 }
 
 function readJson(file) {
@@ -166,6 +180,9 @@ function importProfile(name, source) {
   });
   const homeJson = path.join(path.dirname(src), '.claude.json');
   if (fs.existsSync(homeJson)) fs.copyFileSync(homeJson, path.join(dst, '.claude.json'));
+  // The imported settings.json rarely has our statusline wired up — add it,
+  // but leave alone whatever statusline the imported config already had.
+  try { installStatusline(profile.name, { quiet: true, onlyIfMissing: true }); } catch { /* best effort */ }
   console.log(color.green(`Imported '${src}' into profile '${profile.name}'.`));
   console.log(color.dim('Close any running Claude Code first if the copy looks incomplete, then re-run.'));
   console.log(`Launch it with: ${color.orange('ccpit ' + profile.name)}`);
@@ -855,7 +872,7 @@ async function cockpit(args = []) {
         subScreen(profiles, 'Create a fresh account');
         const name = await promptLine('Account name: ');
         if (name === BACK || !name.trim()) continue;
-        try { addProfile(name.trim()); console.log(color.green(`Created '${name.trim()}'.`)); }
+        try { createAccount(name.trim()); console.log(color.green(`Created '${name.trim()}'.`)); }
         catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
         continue;
       }
@@ -980,7 +997,7 @@ async function cockpit(args = []) {
       const name = await promptLine('New account name: ');
       if (name === BACK || !name.trim()) continue;
       try {
-        const profile = addProfile(name.trim());
+        const profile = createAccount(name.trim());
         leaveAlt();
         console.log(color.green(`Created '${profile.name}'. Launching Claude — run /login inside it.`));
         await launch(profile.name, [], { interactive: true });
@@ -1081,7 +1098,7 @@ async function main(argv) {
     if (command === '--help' || command === '-h' || command === 'help') return usage();
     if (command === 'dashboard' || command === 'accounts') return dashboard();
     if (command === 'open' || command === 'start') return await cockpit(args);
-    if (command === 'add') { const p = addProfile(args[0]); console.log(`Created profile '${p.name}' at ${paths.profileDir(p.name)}`); return; }
+    if (command === 'add') { const p = createAccount(args[0]); console.log(`Created profile '${p.name}' at ${paths.profileDir(p.name)}`); return; }
     if (command === 'import') return importProfile(args[0], args[1]);
     if (command === 'sync') { const [fromP, toP, what] = args; return syncProfiles(fromP, toP, what || 'all'); }
     if (command === 'delete' || command === 'rm') {

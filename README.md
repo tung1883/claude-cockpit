@@ -127,7 +127,10 @@ claude-cockpit run personal
 claude-cockpit run work
 ```
 
-Install the statusline into a profile:
+Every profile gets the cockpit statusline automatically — `add` and `import`
+both wire it into that profile's `settings.json` (on import, only if the
+imported config doesn't already have a `statusLine` of its own). To (re)install
+it by hand, e.g. after editing settings.json directly:
 
 ```powershell
 claude-cockpit install-statusline work
