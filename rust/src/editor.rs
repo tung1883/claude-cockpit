@@ -142,6 +142,68 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                     dirty = true;
                 }
             }
+            // Paragraph jump: skip any blank lines adjacent in that
+            // direction first, then the run of non-blank lines after them —
+            // lands on the next blank/non-blank boundary, same convention
+            // most editors use for Ctrl+Up/Down.
+            KeyCode::Up if key.ctrl => {
+                let mut r = row;
+                while r > 0 && lines[r - 1].trim().is_empty() {
+                    r -= 1;
+                }
+                while r > 0 && !lines[r - 1].trim().is_empty() {
+                    r -= 1;
+                }
+                row = r;
+                col = col.min(char_len(&lines[row]));
+            }
+            KeyCode::Down if key.ctrl => {
+                let mut r = row;
+                while r + 1 < lines.len() && lines[r + 1].trim().is_empty() {
+                    r += 1;
+                }
+                while r + 1 < lines.len() && !lines[r + 1].trim().is_empty() {
+                    r += 1;
+                }
+                row = r;
+                col = col.min(char_len(&lines[row]));
+            }
+            KeyCode::Left if key.ctrl => {
+                if col == 0 {
+                    if row > 0 {
+                        row -= 1;
+                        col = char_len(&lines[row]);
+                    }
+                } else {
+                    let chars: Vec<char> = lines[row].chars().collect();
+                    let mut c = col;
+                    while c > 0 && chars[c - 1].is_whitespace() {
+                        c -= 1;
+                    }
+                    while c > 0 && !chars[c - 1].is_whitespace() {
+                        c -= 1;
+                    }
+                    col = c;
+                }
+            }
+            KeyCode::Right if key.ctrl => {
+                let chars: Vec<char> = lines[row].chars().collect();
+                if col >= chars.len() {
+                    if row + 1 < lines.len() {
+                        row += 1;
+                        col = 0;
+                    }
+                } else {
+                    let mut c = col;
+                    while c < chars.len() && chars[c].is_whitespace() {
+                        c += 1;
+                    }
+                    while c < chars.len() && !chars[c].is_whitespace() {
+                        c += 1;
+                    }
+                    col = c;
+                }
+            }
             KeyCode::Up => row = row.saturating_sub(1),
             KeyCode::Down => row += 1,
             KeyCode::Left => {
