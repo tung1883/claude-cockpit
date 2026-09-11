@@ -102,7 +102,7 @@ claude-cockpit sessions --all
 
 Adding an account creates its isolated profile; authenticate it with `/login` when Claude opens.
 
-Account rotation is currently manual. Use `handoff` to continue a transcript under another account. The statusline reports quota data, but it does not interrupt and restart a running interactive Claude process automatically when a limit is reached.
+Use `handoff` (or `h` inside the cockpit) to continue a transcript under another account. The cockpit also does this on its own: the statusline hook caches the last quota reading it saw for a profile, and after Claude exits with that profile at its 5h/7d cap, the cockpit copies the just-run session to whichever other profile has the most headroom and offers to resume it there. It can't interrupt a *running* Claude process mid-turn — stdio is inherited straight through to the terminal while Claude runs — so detection happens right after that process exits, not live.
 
 Each profile has its own credentials, sessions, plugins, and settings under:
 
@@ -147,7 +147,13 @@ claude-cockpit handoff <session-id> personal work
 claude-cockpit run work --resume <session-id>
 ```
 
+Or from inside the cockpit: press `h` on a profile, pick the session, then pick the target profile — it offers to launch the resumed session right there.
+
 The handoff copies the JSONL transcript locally. The next Claude turn will resend that history as context, so the copy itself costs no tokens but the resumed turn does consume context/quota.
+
+### Auto-handoff
+
+The cockpit's statusline hook writes `.cockpit-quota.json` into each profile's config dir on every render, recording the last-seen 5h/7d usage percentages (it can only see this while Claude is running and calling the statusline command — it has no visibility into a running Claude process otherwise). When you exit Claude and that cache says the profile you were just in hit ≥95% on either window, the cockpit picks whichever other profile has the lowest cached usage, copies the session you were just running to it, and asks whether to resume it there immediately.
 
 ## Statusline
 
@@ -208,4 +214,4 @@ $env:CLAUDE_COCKPIT_NOTES = '0'   # disable entirely
 
 ## Design boundaries
 
-This project does not mutate Claude’s live credential files and does not automatically bypass usage limits. Automatic rotation can be added above the explicit `handoff` primitive, but it should be used only with accounts the operator owns and in accordance with Anthropic’s terms.
+This project does not mutate Claude's live credential files. Auto-handoff only ever copies a session transcript between profiles you already own once one hits its own usage cap — it never bypasses a limit, just moves the conversation to an account that has headroom. Use it only across accounts you own and in accordance with Anthropic's terms.

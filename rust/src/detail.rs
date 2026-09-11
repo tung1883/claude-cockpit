@@ -5,6 +5,7 @@ use crate::inspect::{self, Inspection};
 use crate::layout::{self, pad_to};
 use crate::picker::ScrollRow;
 use crate::profiles::Profile;
+use crate::session;
 use crate::ui::{self, color};
 use crossterm::terminal;
 
@@ -113,9 +114,79 @@ fn ms_to_relative_age(ms: u128) -> String {
     }
 }
 
+/// Shared shape for every pickable overview section (Plugins/Skills/MCP/
+/// Sessions): header line, up to the first 5 items, then a "(N more…)" row
+/// when there's more — so one long section can't push the rest of the
+/// overview off screen. `item(i)` returns that row's (pick value, rendered
+/// text); `more_value` is what the trailing row resolves to.
+fn capped_section(header_label: &str, count: usize, more_value: &str, mut item: impl FnMut(usize) -> (String, String)) -> Vec<ScrollRow> {
+    let mut rows = vec![ScrollRow::line(format!("  {} {}", color::orange_bold(header_label), color::dim(&format!("({count})"))))];
+    if count == 0 {
+        rows.push(ScrollRow::line(format!("    {}", color::dim("none"))));
+        return rows;
+    }
+    for i in 0..count.min(5) {
+        let (value, text) = item(i);
+        rows.push(ScrollRow::pick(format!("  {text}"), value));
+    }
+    if count > 5 {
+        rows.push(ScrollRow::pick(format!("    {}", color::dim(&format!("({} more…)", count - 5))), more_value.to_string()));
+    }
+    rows
+}
+
+/// Sessions grouped by project folder, folders ordered by their own most
+/// recent session (`groups` comes in already in that order — see
+/// `session::grouped_sessions`). Picking a folder row (or "more") opens that
+/// folder's session list, straight into the handoff flow.
+fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
+    capped_section("Sessions", groups.len(), "sessions-more", |i| {
+        let g = &groups[i];
+        let n = g.sessions.len();
+        let latest_age = g.sessions.first().map(|s| session::relative_age(Some(s.modified))).unwrap_or_default();
+        // Clip one char short of the pad width so a truncated path still
+        // lands under it with a gap — clip_mid can return exactly `max`
+        // chars, and pad_to only adds space when strictly shorter. The
+        // count itself is padded too, so the "·" lines up regardless of
+        // how many digits "N sessions" runs to.
+        let count = pad_to(&format!("{n} session{}", if n == 1 { "" } else { "s" }), 14);
+        let text = format!("{}  {}", pad_to(&clip_mid(&g.folder, 39), 40), color::dim(&format!("{count}·  {latest_age}")));
+        (format!("folder:{i}"), text)
+    })
+}
+
+/// Plugin/skill/MCP list options for the "N more…" full-list popup —
+/// (label, pick value, note), matching `item_detail`'s "kind:i" pick format.
+pub fn plugin_options(snap: &Inspection) -> Vec<(String, String, String)> {
+    snap.plugins
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let label = format!("{}{}", short_id(&p.id), if p.enabled { "" } else { " (off)" });
+            let tok = if p.md_bytes > 0 { format!("  {}", inspect::est_tokens(p.md_bytes)) } else { String::new() };
+            (label, format!("plugin:{i}"), format!("{}{tok}", inspect::human_bytes(p.bytes as f64)))
+        })
+        .collect()
+}
+
+pub fn skill_options(snap: &Inspection) -> Vec<(String, String, String)> {
+    snap.skills
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| {
+            let tok = inspect::est_tokens(if sk.md_bytes > 0 { sk.md_bytes } else { sk.bytes });
+            (sk.name.clone(), format!("skill:{i}"), format!("{}  {tok}", inspect::human_bytes(sk.bytes as f64)))
+        })
+        .collect()
+}
+
+pub fn mcp_options(snap: &Inspection) -> Vec<(String, String, String)> {
+    snap.mcps.iter().enumerate().map(|(i, m)| (m.name.clone(), format!("mcp:{i}"), m.kind.clone())).collect()
+}
+
 /// Overview screen: account, activity/storage, then a pickable list of
 /// plugins/skills/MCP servers. Row values are "plugin:i" / "skill:i" / "mcp:i".
-pub fn profile_overview(snap: &Inspection, name: &str, profiles: &[Profile], mark: i64) -> (Vec<String>, Vec<ScrollRow>) {
+pub fn profile_overview(snap: &Inspection, name: &str, profiles: &[Profile], mark: i64, groups: &[session::SessionGroup]) -> (Vec<String>, Vec<ScrollRow>) {
     let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut header = layout::account_lines(profiles, mark, &stats);
     header.push(format!("{} {}  {}", color::orange(ui::glyph::back()), color::orange(name), color::dim("— details")));
@@ -126,68 +197,59 @@ pub fn profile_overview(snap: &Inspection, name: &str, profiles: &[Profile], mar
     let act = &snap.activity;
 
     rows.push(ScrollRow::line(format!("  {}", color::orange_bold("Account"))));
-    rows.push(ScrollRow::line(kv("email", &format!("{}{}", acc.email, if !acc.name.is_empty() { color::dim(&format!("  ({})", acc.name)) } else { String::new() }), 14)));
-    rows.push(ScrollRow::line(kv("plan", &acc.plan, 14)));
-    rows.push(ScrollRow::line(kv("org", &acc.org, 14)));
-    rows.push(ScrollRow::line(kv("rate tier", &acc.rate_tier, 14)));
-    rows.push(ScrollRow::line(kv(
+    rows.push(ScrollRow::info(kv("email", &format!("{}{}", acc.email, if !acc.name.is_empty() { color::dim(&format!("  ({})", acc.name)) } else { String::new() }), 14)));
+    rows.push(ScrollRow::info(kv("plan", &acc.plan, 14)));
+    rows.push(ScrollRow::info(kv("org", &acc.org, 14)));
+    rows.push(ScrollRow::info(kv("rate tier", &acc.rate_tier, 14)));
+    rows.push(ScrollRow::info(kv(
         "created",
         &format!("{}{}", acc.created, if acc.sub_created != "—" { color::dim(&format!("  · sub {}", acc.sub_created)) } else { String::new() }),
         14,
     )));
-    rows.push(ScrollRow::line(kv("token", &format!("expires {}", acc.token_expiry), 14)));
+    rows.push(ScrollRow::info(kv("token", &format!("expires {}", acc.token_expiry), 14)));
     rows.push(ScrollRow::line(String::new()));
 
     rows.push(ScrollRow::line(format!("  {}", color::orange_bold("Activity"))));
-    rows.push(ScrollRow::line(kv(
+    rows.push(ScrollRow::info(kv(
         "startups",
         &format!("{}{}", act.startups, if act.first_start != "—" { color::dim(&format!("  · first {}", act.first_start)) } else { String::new() }),
         14,
     )));
-    rows.push(ScrollRow::line(kv("projects", &act.projects.to_string(), 14)));
-    rows.push(ScrollRow::line(kv(
+    rows.push(ScrollRow::info(kv("projects", &act.projects.to_string(), 14)));
+    rows.push(ScrollRow::info(kv(
         "sessions",
         &format!("{}  {}", act.session_count, color::dim(&format!("{} · last {}", inspect::human_bytes(act.session_bytes as f64), ms_to_relative_age(act.last_active_ms)))),
         14,
     )));
-    rows.push(ScrollRow::line(kv("history", &inspect::human_bytes(act.history_bytes as f64), 14)));
-    rows.push(ScrollRow::line(kv("disk total", &inspect::human_bytes(act.total_bytes as f64), 14)));
+    rows.push(ScrollRow::info(kv("history", &inspect::human_bytes(act.history_bytes as f64), 14)));
+    rows.push(ScrollRow::info(kv("disk total", &inspect::human_bytes(act.total_bytes as f64), 14)));
     rows.push(ScrollRow::line(String::new()));
 
-    rows.push(ScrollRow::line(format!("  {} {}", color::orange_bold("Plugins"), color::dim(&format!("({})", snap.plugins.len())))));
-    if snap.plugins.is_empty() {
-        rows.push(ScrollRow::line(format!("    {}", color::dim("none"))));
-    } else {
-        for (i, p) in snap.plugins.iter().enumerate() {
-            let label = format!("{}{}", short_id(&p.id), if p.enabled { "" } else { " (off)" });
-            let tok = if p.md_bytes > 0 { inspect::est_tokens(p.md_bytes) } else { String::new() };
-            let text = format!("{}{}", pad_to(&label, 32), color::dim(&format!("{}{tok}", pad_to(&inspect::human_bytes(p.bytes as f64), 9))));
-            rows.push(ScrollRow::pick(format!("  {text}"), format!("plugin:{i}")));
-        }
-    }
+    rows.extend(capped_section("Plugins", snap.plugins.len(), "plugin-more", |i| {
+        let p = &snap.plugins[i];
+        let label = format!("{}{}", short_id(&p.id), if p.enabled { "" } else { " (off)" });
+        let tok = if p.md_bytes > 0 { inspect::est_tokens(p.md_bytes) } else { String::new() };
+        let text = format!("{}{}", pad_to(&label, 32), color::dim(&format!("{}{tok}", pad_to(&inspect::human_bytes(p.bytes as f64), 9))));
+        (format!("plugin:{i}"), text)
+    }));
     rows.push(ScrollRow::line(String::new()));
 
-    rows.push(ScrollRow::line(format!("  {} {}", color::orange_bold("Skills"), color::dim(&format!("({})", snap.skills.len())))));
-    if snap.skills.is_empty() {
-        rows.push(ScrollRow::line(format!("    {}", color::dim("none"))));
-    } else {
-        for (i, sk) in snap.skills.iter().enumerate() {
-            let tok = inspect::est_tokens(if sk.md_bytes > 0 { sk.md_bytes } else { sk.bytes });
-            let text = format!("{}{}", pad_to(&sk.name, 32), color::dim(&format!("{}{tok}", pad_to(&inspect::human_bytes(sk.bytes as f64), 9))));
-            rows.push(ScrollRow::pick(format!("  {text}"), format!("skill:{i}")));
-        }
-    }
+    rows.extend(capped_section("Skills", snap.skills.len(), "skill-more", |i| {
+        let sk = &snap.skills[i];
+        let tok = inspect::est_tokens(if sk.md_bytes > 0 { sk.md_bytes } else { sk.bytes });
+        let text = format!("{}{}", pad_to(&sk.name, 32), color::dim(&format!("{}{tok}", pad_to(&inspect::human_bytes(sk.bytes as f64), 9))));
+        (format!("skill:{i}"), text)
+    }));
     rows.push(ScrollRow::line(String::new()));
 
-    rows.push(ScrollRow::line(format!("  {} {}", color::orange_bold("MCP servers"), color::dim(&format!("({})", snap.mcps.len())))));
-    if snap.mcps.is_empty() {
-        rows.push(ScrollRow::line(format!("    {}", color::dim("none"))));
-    } else {
-        for (i, m) in snap.mcps.iter().enumerate() {
-            let text = format!("{}{}", pad_to(&m.name, 24), color::dim(&m.kind));
-            rows.push(ScrollRow::pick(format!("  {text}"), format!("mcp:{i}")));
-        }
-    }
+    rows.extend(capped_section("MCP servers", snap.mcps.len(), "mcp-more", |i| {
+        let m = &snap.mcps[i];
+        let text = format!("{}{}", pad_to(&m.name, 24), color::dim(&m.kind));
+        (format!("mcp:{i}"), text)
+    }));
+    rows.push(ScrollRow::line(String::new()));
+
+    rows.extend(folder_rows(groups));
     rows.push(ScrollRow::line(String::new()));
 
     (header, rows)

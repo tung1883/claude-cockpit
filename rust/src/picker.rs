@@ -12,6 +12,7 @@ pub enum Action {
     Add,
     Import,
     Sync(String),
+    Handoff(String),
     Delete(String),
     Refresh,
 }
@@ -32,7 +33,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
         lines.extend(layout::hint_grid(
             &[
                 &[("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("q", "quit")],
-                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync")],
+                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff")],
             ],
             16,
         ));
@@ -77,6 +78,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
                 ui::show_cursor();
                 return Ok(Action::Sync(profiles[selected].name.clone()));
             }
+            KeyCode::Char('h') => {
+                ui::show_cursor();
+                return Ok(Action::Handoff(profiles[selected].name.clone()));
+            }
             KeyCode::Char('d') => {
                 ui::show_cursor();
                 return Ok(Action::Delete(profiles[selected].name.clone()));
@@ -115,6 +120,7 @@ pub fn choose_from_list(
 ) -> std::io::Result<ListChoice> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut selected = 0usize;
+    let mut top = 0usize;
     ui::hide_cursor();
     loop {
         let mut lines = layout::account_lines(profiles, mark, &stats);
@@ -123,12 +129,49 @@ pub fn choose_from_list(
             lines.push(ui::color::dim(&format!("   {h}")));
         }
         lines.push(String::new());
-        for (i, opt) in options.iter().enumerate() {
+
+        // Fixed chrome above/below the list (account block + heading/hint +
+        // blank + rule + hint line + a little slack) so a long list (e.g.
+        // hundreds of sessions) scrolls in place instead of overflowing the
+        // terminal and letting its own scrollback fake the movement.
+        let chrome = lines.len() + 4;
+        let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(chrome).max(3);
+        if selected < top {
+            top = selected;
+        }
+        if selected >= top + viewport {
+            top = selected - viewport + 1;
+        }
+        top = top.min(options.len().saturating_sub(viewport));
+        let end = (top + viewport).min(options.len());
+
+        if top > 0 {
+            lines.push(ui::color::dim(&format!("    ↑ {top} more")));
+        }
+        // Every label padded to the widest one so notes start on a shared
+        // column, then the note itself clipped to whatever's left of the
+        // terminal width — otherwise a long recap/path runs straight past
+        // the divider below instead of stopping at it.
+        let label_w = options.iter().map(|o| o.label.chars().count()).max().unwrap_or(0).clamp(8, 24);
+        // Match ui::rule's own cap — the divider below never renders wider
+        // than 100 cols even on a wider terminal, so the budget has to use
+        // the same cap or text can run past a rule that's shorter than the
+        // terminal actually is.
+        let term_width = (crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)).min(100) as isize;
+        let note_budget = (term_width - label_w as isize - 8).max(0) as usize;
+        for (i, opt) in options.iter().enumerate().take(end).skip(top) {
             let active = i == selected;
             let marker = if active { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-            let label = if active { ui::color::orange_bold(&opt.label) } else { opt.label.clone() };
-            let note = opt.note.as_ref().map(|n| format!("   {}", ui::color::dim(n))).unwrap_or_default();
+            let label_text = layout::pad_to(&opt.label, label_w);
+            let label = if active { ui::color::orange_bold(&label_text) } else { label_text };
+            let note = opt.note.as_ref().map(|n| {
+                let clipped: String = n.chars().take(note_budget).collect();
+                format!("   {}", ui::color::dim(&clipped))
+            }).unwrap_or_default();
             lines.push(format!(" {marker} {label}{note}"));
+        }
+        if end < options.len() {
+            lines.push(ui::color::dim(&format!("    ↓ {} more", options.len() - end)));
         }
         lines.push(String::new());
         lines.push(ui::rule(None));
@@ -182,6 +225,11 @@ impl ScrollRow {
     }
     pub fn pick(text: impl Into<String>, value: impl Into<String>) -> Self {
         ScrollRow { text: text.into(), selectable: true, value: Some(value.into()) }
+    }
+    /// Navigable (↑/↓ stop on it, it highlights) but nothing to open - Enter
+    /// is a no-op on it, same as `pick` rows with no value.
+    pub fn info(text: impl Into<String>) -> Self {
+        ScrollRow { text: text.into(), selectable: true, value: None }
     }
 }
 

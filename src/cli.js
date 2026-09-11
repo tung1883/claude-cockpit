@@ -660,22 +660,25 @@ function profileOverview(snap, name, profiles, mark) {
   const rows = [];
   const head = title => rows.push({ text: `  ${color.orangeBold(title)}`, selectable: false });
   const line = text => rows.push({ text, selectable: false });
+  // No `value` - so Enter is a no-op (nothing to open yet), but the row is
+  // still selectable: ↑/↓ stop on it and highlight it like a pickable row.
+  const info = text => rows.push({ text, selectable: true });
   const gap = () => rows.push({ text: '', selectable: false });
 
   head('Account');
-  line(kv('email', `${acc.email}${acc.name ? color.dim(`  (${acc.name})`) : ''}`));
-  line(kv('plan', acc.plan));
-  line(kv('org', acc.org));
-  line(kv('rate tier', acc.rateTier));
-  line(kv('created', `${acc.created}${acc.subCreated !== '—' ? color.dim(`  · sub ${acc.subCreated}`) : ''}`));
-  line(kv('token', `expires ${acc.tokenExpiry}`));
+  info(kv('email', `${acc.email}${acc.name ? color.dim(`  (${acc.name})`) : ''}`));
+  info(kv('plan', acc.plan));
+  info(kv('org', acc.org));
+  info(kv('rate tier', acc.rateTier));
+  info(kv('created', `${acc.created}${acc.subCreated !== '—' ? color.dim(`  · sub ${acc.subCreated}`) : ''}`));
+  info(kv('token', `expires ${acc.tokenExpiry}`));
   gap();
   head('Activity');
-  line(kv('startups', `${act.startups}${act.firstStart !== '—' ? color.dim(`  · first ${act.firstStart}`) : ''}`));
-  line(kv('projects', String(act.projects)));
-  line(kv('sessions', `${act.sessionCount}  ${color.dim(`${inspect.humanBytes(act.sessionBytes)} · last ${relativeAge(act.lastActive ? new Date(act.lastActive) : null)}`)}`));
-  line(kv('history', inspect.humanBytes(act.historyBytes)));
-  line(kv('disk total', inspect.humanBytes(act.totalBytes)));
+  info(kv('startups', `${act.startups}${act.firstStart !== '—' ? color.dim(`  · first ${act.firstStart}`) : ''}`));
+  info(kv('projects', String(act.projects)));
+  info(kv('sessions', `${act.sessionCount}  ${color.dim(`${inspect.humanBytes(act.sessionBytes)} · last ${relativeAge(act.lastActive ? new Date(act.lastActive) : null)}`)}`));
+  info(kv('history', inspect.humanBytes(act.historyBytes)));
+  info(kv('disk total', inspect.humanBytes(act.totalBytes)));
   gap();
 
   const section = (title, items, render, kind) => {

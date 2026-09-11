@@ -8,6 +8,7 @@ mod layout;
 mod paths;
 mod picker;
 mod profiles;
+mod quota;
 mod session;
 mod statusline;
 mod sync;
@@ -98,6 +99,128 @@ fn not_yet_implemented(what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Session list formatted as `choose_from_list` options — id, session name
+/// (if any), project, and age — newest first (`session_files` already sorts
+/// that way).
+fn session_list_options(profile: &str) -> Vec<picker::ListOption> {
+    session::session_files(profile)
+        .iter()
+        .map(|s| {
+            let d = session::session_details(s);
+            let age = session::relative_age(Some(d.modified));
+            let label = if !d.session_name.is_empty() { d.session_name.clone() } else { d.id.chars().take(8).collect::<String>() };
+            let proj = if d.project_path.is_empty() { String::new() } else { format!("{} · ", d.project_path.replace('\\', "/")) };
+            picker::ListOption { label, value: d.id.clone(), note: Some(format!("{proj}{age}")) }
+        })
+        .collect()
+}
+
+/// The shared tail of every handoff flow once a session is chosen: pick a
+/// target profile, copy the transcript, offer to resume there immediately.
+fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, session_id: &str) -> Result<()> {
+    let others: Vec<&profiles::Profile> = profiles.iter().filter(|p| p.name != from).collect();
+    if others.is_empty() {
+        ui::home_clear();
+        println!("{}\n", ui::banner());
+        println!("{}", ui::color::dim("Need a second profile to hand off into."));
+        picker::prompt_line("Press Enter...")?;
+        return Ok(());
+    }
+    let target_options: Vec<picker::ListOption> = others
+        .iter()
+        .map(|p| {
+            let count = layout::account_stat(&p.name).count;
+            let note = match quota::load(&p.name) {
+                Some(q) => format!("{count} sessions · {:.0}% used", quota::usage(&q)),
+                None => format!("{count} sessions"),
+            };
+            picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(note) }
+        })
+        .collect();
+    let target = match picker::choose_from_list(profiles, mark, "Copy session into…", None, &target_options, None)? {
+        picker::ListChoice::Picked(t) => t,
+        _ => return Ok(()),
+    };
+
+    ui::home_clear();
+    match handoff::copy_session(from, &target, session_id) {
+        Ok(_) => {
+            println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'.")));
+            let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
+            if matches!(go.as_deref(), Some("")) {
+                let suspend = term.suspend();
+                ui::clear_screen();
+                println!(
+                    "{} resuming as {} — exit Claude to return here\n",
+                    ui::color::dim(ui::glyph::spark()),
+                    ui::color::orange(&target),
+                );
+                launch::launch(&target, &["--resume".to_string(), session_id.to_string()])?;
+                drop(suspend);
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", ui::color::red(&format!("Error: {e}")));
+            picker::prompt_line("Press Enter...")?;
+        }
+    }
+    Ok(())
+}
+
+/// Read-only detail screen for one session — the "detail first" variant of
+/// the overview's two session-row styles (see detail::session_rows).
+/// Opens one project folder's session list and goes straight into the
+/// handoff flow on pick — no read-only detail stop in between.
+fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup) -> Result<()> {
+    let options: Vec<picker::ListOption> = group
+        .sessions
+        .iter()
+        .map(|s| {
+            let d = session::session_details(s);
+            let label = if !d.session_name.is_empty() { d.session_name.clone() } else { d.id.chars().take(8).collect::<String>() };
+            let age = session::relative_age(Some(d.modified));
+            // A recap only exists once a session has compacted — rare for a
+            // short one — so fall back to the last prompt, which is nearly
+            // always there.
+            let summary = if !d.recap.is_empty() { &d.recap } else { &d.last_prompt };
+            let note = if summary.is_empty() {
+                age
+            } else {
+                let flat: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+                // Age is padded so the "·" lands on the same column no
+                // matter how many digits/characters the age runs to
+                // ("7d ago" vs "10d ago" vs "just now").
+                format!("{}·  {}", layout::pad_to(&age, 10), flat.chars().take(80).collect::<String>())
+            };
+            picker::ListOption { label, value: d.id.clone(), note: Some(note) }
+        })
+        .collect();
+    let heading = format!("Sessions in {}…", ui::color::orange(&group.folder));
+    if let picker::ListChoice::Picked(id) = picker::choose_from_list(profiles, mark, &heading, Some("choose the session to copy"), &options, None)? {
+        run_handoff(term, profiles, mark, from, &id)?;
+    }
+    Ok(())
+}
+
+/// Full folder list (beyond the overview's first 5), sorted by each
+/// folder's most recent session — picking one drills into its sessions.
+fn open_all_folders(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, groups: &[session::SessionGroup]) -> Result<()> {
+    let options: Vec<picker::ListOption> = groups
+        .iter()
+        .map(|g| {
+            let n = g.sessions.len();
+            let latest_age = g.sessions.first().map(|s| session::relative_age(Some(s.modified))).unwrap_or_default();
+            picker::ListOption { label: g.folder.clone(), value: g.folder.clone(), note: Some(format!("{n} session{}  ·  {latest_age}", if n == 1 { "" } else { "s" })) }
+        })
+        .collect();
+    if let picker::ListChoice::Picked(folder) = picker::choose_from_list(profiles, mark, "All project folders…", None, &options, None)? {
+        if let Some(group) = groups.iter().find(|g| g.folder == folder) {
+            open_folder_sessions(term, profiles, mark, from, group)?;
+        }
+    }
+    Ok(())
+}
+
 fn cockpit() -> Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return dashboard();
@@ -128,7 +251,7 @@ fn cockpit() -> Result<()> {
         cursor = cursor.min(profiles.len() - 1);
         let action = picker::pick_profile(&profiles, cursor)?;
         let mark = match &action {
-            Action::Open(n) | Action::Detail(n) | Action::Sync(n) | Action::Delete(n) => {
+            Action::Open(n) | Action::Detail(n) | Action::Sync(n) | Action::Handoff(n) | Action::Delete(n) => {
                 profiles.iter().position(|p| &p.name == n)
             }
             _ => None,
@@ -193,16 +316,89 @@ fn cockpit() -> Result<()> {
                 );
                 launch::launch(&name, &[])?;
                 drop(suspend); // restore alt screen + raw mode before the next repaint
+
+                // Auto-handoff: the statusline hook cached the last quota
+                // reading it saw while Claude was running (main.rs can't see
+                // Claude's own output — stdio was inherited straight
+                // through). If that reading says this profile just ran dry,
+                // offer to copy the session that was just running onto
+                // whichever other profile has the most headroom.
+                if quota::load(&name).is_some_and(|q| quota::is_exhausted(&q)) {
+                    let candidate = profiles
+                        .iter()
+                        .filter(|p| p.name != name)
+                        .filter(|p| !quota::load(&p.name).is_some_and(|q| quota::is_exhausted(&q)))
+                        .min_by(|a, b| {
+                            let ua = quota::load(&a.name).map(|q| quota::usage(&q)).unwrap_or(0.0);
+                            let ub = quota::load(&b.name).map(|q| quota::usage(&q)).unwrap_or(0.0);
+                            ua.partial_cmp(&ub).unwrap()
+                        })
+                        .map(|p| p.name.clone());
+                    let latest = session::session_files(&name).into_iter().next();
+                    if let (Some(candidate), Some(latest)) = (candidate, latest) {
+                        ui::home_clear();
+                        println!("{}\n", ui::banner());
+                        println!("{}", ui::color::yellow(&format!("'{name}' just hit its usage limit.")));
+                        match handoff::copy_session(&name, &candidate, &latest.id) {
+                            Ok(_) => {
+                                println!("{}", ui::color::dim(&format!("Latest session copied to '{candidate}'.")));
+                                let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
+                                if matches!(go.as_deref(), Some("")) {
+                                    let suspend = term.suspend();
+                                    ui::clear_screen();
+                                    println!(
+                                        "{} resuming as {} — exit Claude to return here\n",
+                                        ui::color::dim(ui::glyph::spark()),
+                                        ui::color::orange(&candidate),
+                                    );
+                                    launch::launch(&candidate, &["--resume".to_string(), latest.id.clone()])?;
+                                    drop(suspend);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{}", ui::color::red(&format!("Handoff failed: {e}")));
+                                picker::prompt_line("Press Enter...")?;
+                            }
+                        }
+                    }
+                }
             }
             Action::Detail(name) => {
                 let snap = inspect::build_inspection(&paths::profile_dir(&name));
+                let groups = session::grouped_sessions(&name);
                 let m = mark.map(|m| m as i64).unwrap_or(-1);
                 let mut at: Option<String> = None;
                 loop {
-                    let (header, rows) = detail::profile_overview(&snap, &name, &profiles, m);
+                    let (header, rows) = detail::profile_overview(&snap, &name, &profiles, m, &groups);
                     let res = picker::scroll_screen(&header, &rows, at.as_deref())?;
                     let Some(pick) = res else { break };
                     at = Some(pick.clone());
+
+                    if let Some(idx_str) = pick.strip_prefix("folder:") {
+                        if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
+                            open_folder_sessions(&mut term, &profiles, m, &name, group)?;
+                        }
+                        continue;
+                    }
+                    if pick == "sessions-more" {
+                        open_all_folders(&mut term, &profiles, m, &name, &groups)?;
+                        continue;
+                    }
+                    if pick == "plugin-more" || pick == "skill-more" || pick == "mcp-more" {
+                        let (heading, opts) = match pick.as_str() {
+                            "plugin-more" => ("All plugins…", detail::plugin_options(&snap)),
+                            "skill-more" => ("All skills…", detail::skill_options(&snap)),
+                            _ => ("All MCP servers…", detail::mcp_options(&snap)),
+                        };
+                        let options: Vec<picker::ListOption> =
+                            opts.into_iter().map(|(label, value, note)| picker::ListOption { label, value, note: Some(note) }).collect();
+                        if let picker::ListChoice::Picked(v) = picker::choose_from_list(&profiles, m, heading, None, &options, None)? {
+                            let (h2, r2) = detail::item_detail(&snap, &v, &profiles, m);
+                            picker::scroll_screen(&h2, &r2, None)?;
+                        }
+                        continue;
+                    }
+
                     let (h2, r2) = detail::item_detail(&snap, &pick, &profiles, m);
                     picker::scroll_screen(&h2, &r2, None)?;
                 }
@@ -332,6 +528,23 @@ fn cockpit() -> Result<()> {
                     eprintln!("{}", ui::color::red(&format!("Error: {e}")));
                 }
                 picker::prompt_line("Press Enter to return to the menu...")?;
+            }
+            Action::Handoff(name) => {
+                let options = session_list_options(&name);
+                if options.is_empty() {
+                    ui::home_clear();
+                    println!("{}\n", ui::banner());
+                    println!("{}", ui::color::dim(&format!("No sessions to hand off from '{name}'.")));
+                    picker::prompt_line("Press Enter...")?;
+                    continue;
+                }
+                let m = mark.map(|m| m as i64).unwrap_or(-1);
+                let heading = format!("Hand off a session from {}…", ui::color::orange(&name));
+                let session_id = match picker::choose_from_list(&profiles, m, &heading, Some("choose the session to copy"), &options, None)? {
+                    picker::ListChoice::Picked(id) => id,
+                    _ => continue,
+                };
+                run_handoff(&mut term, &profiles, m, &name, &session_id)?;
             }
         }
     }

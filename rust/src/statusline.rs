@@ -333,10 +333,29 @@ pub fn render(input: &Value) -> String {
     format!("{}\n{}", align(&cols1), align(&cols2))
 }
 
+/// Pulls just the two rate-limit windows out of the payload, for the quota
+/// cache — kept separate from `render`'s own parsing so the display logic
+/// above stays untangled from the caching side effect below.
+fn extract_quota(input: &Value) -> crate::quota::Quota {
+    let rate = first_object(input, &["rate_limits", "rateLimits"]);
+    let five = first_object(&rate, &["five_hour", "5h", "fiveHour"]);
+    let seven = first_object(&rate, &["seven_day", "7d", "sevenDay"]);
+    crate::quota::Quota {
+        five_pct: number(&[get_f64(&five, &["used_percentage"]), get_f64(&five, &["usedPercent"]), get_f64(&five, &["percentage"])]),
+        seven_pct: number(&[get_f64(&seven, &["used_percentage"]), get_f64(&seven, &["usedPercent"]), get_f64(&seven, &["percentage"])]),
+        five_resets_at: number(&[get_f64(&five, &["resets_at"]), get_f64(&five, &["reset_at"])]),
+        seven_resets_at: number(&[get_f64(&seven, &["resets_at"]), get_f64(&seven, &["reset_at"])]),
+        updated_ms: now_ms(),
+    }
+}
+
 pub fn main() {
     let mut raw = String::new();
     use std::io::Read;
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: Value = if raw.trim().is_empty() { Value::Null } else { serde_json::from_str(&raw).unwrap_or(Value::Null) };
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        crate::quota::save(std::path::Path::new(&dir), &extract_quota(&input));
+    }
     print!("{}", render(&input));
 }

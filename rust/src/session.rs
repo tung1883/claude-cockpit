@@ -42,6 +42,27 @@ pub fn session_files(profile: &str) -> Vec<SessionFile> {
     result
 }
 
+pub struct SessionGroup {
+    pub folder: String,
+    pub sessions: Vec<SessionFile>,
+}
+
+/// Sessions grouped by project folder, each group's sessions newest-first.
+/// Groups themselves come out ordered by their own most recent session:
+/// `session_files` already returns newest-first, so a folder's position the
+/// first time it's seen while scanning *is* that order — no separate sort
+/// needed.
+pub fn grouped_sessions(profile: &str) -> Vec<SessionGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Vec<SessionFile>> = std::collections::HashMap::new();
+    for f in session_files(profile) {
+        let raw = session_details(&f).project_path;
+        let folder = if raw.is_empty() { "(unknown project)".to_string() } else { raw.replace('\\', "/") };
+        map.entry(folder.clone()).or_insert_with(|| { order.push(folder.clone()); Vec::new() }).push(f);
+    }
+    order.into_iter().map(|folder| { let sessions = map.remove(&folder).unwrap_or_default(); SessionGroup { folder, sessions } }).collect()
+}
+
 pub struct SessionDetails {
     pub id: String,
     pub modified: SystemTime,

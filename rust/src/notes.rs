@@ -192,13 +192,15 @@ pub fn ensure_project_notes(root: &Path) -> Vec<String> {
 }
 
 // --- Master file section format -------------------------------------------
-// ## <project name>
+// ---------- <project name> ------------
 // <!-- ccpit:path=<absolute project path> -->
 // <body>
 //
+// (sections separated by 2 blank lines)
+//
 // A heading is only a section boundary when a marker immediately follows it,
-// so a project's own "## something" inside its body text isn't mistaken for
-// one.
+// so a project's own "---------- something ------------" inside its body
+// text isn't mistaken for one.
 
 struct Section {
     key: String,
@@ -239,13 +241,18 @@ pub fn get_section_body(content: &str, key: &str) -> Option<String> {
 }
 
 pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> String {
-    let block = format!("## {name}\n<!-- ccpit:path={key} -->\n{}\n", body.trim());
+    let block = format!("---------- {name} ------------\n<!-- ccpit:path={key} -->\n{}\n", body.trim());
     let sections = find_sections(content);
     if let Some(existing) = sections.iter().find(|s| s.key == key) {
-        format!("{}{}{}", &content[..existing.start], block, &content[existing.end..])
+        let rest = content[existing.end..].trim_start_matches('\n');
+        if rest.is_empty() {
+            format!("{}{}", &content[..existing.start], block)
+        } else {
+            format!("{}{}\n\n{}", &content[..existing.start], block, rest)
+        }
     } else {
         let trimmed = content.trim_end();
-        if trimmed.is_empty() { block } else { format!("{trimmed}\n\n{block}") }
+        if trimmed.is_empty() { block } else { format!("{trimmed}\n\n\n{block}") }
     }
 }
 
