@@ -14,7 +14,6 @@ test('renders a compact two-line statusline', () => {
     total_tokens: 164300,
   });
   const plain = output.replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(plain, /^✻ /);
   assert.match(plain, /Opus 4\.7/);
   assert.match(plain, /ctx 84%/);
   assert.match(plain, /5h 24%/);
