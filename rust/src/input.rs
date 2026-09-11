@@ -8,6 +8,7 @@ pub struct Key {
     pub code: KeyCode,
     pub ctrl: bool,
     pub shift: bool,
+    pub alt: bool,
 }
 
 pub fn read_key() -> std::io::Result<Key> {
@@ -20,6 +21,7 @@ pub fn read_key() -> std::io::Result<Key> {
                     code: k.code,
                     ctrl: k.modifiers.contains(KeyModifiers::CONTROL),
                     shift: k.modifiers.contains(KeyModifiers::SHIFT),
+                    alt: k.modifiers.contains(KeyModifiers::ALT),
                 });
             }
         }

@@ -95,10 +95,9 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
             out.push(format!(" {}", ui::color::red(&format!("Save failed: {err}"))));
         }
         out.push(format!(
-            " {} save   {} save & exit   {} move   {} quit without saving",
+            " {} save   {} save & exit   {} quit without saving",
             ui::color::dim("Ctrl+S"),
             ui::color::dim("Esc"),
-            ui::color::dim("↑/↓/←/→"),
             ui::color::dim("Ctrl+C"),
         ));
         ui::repaint(&out);
@@ -127,6 +126,20 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                 if !dirty || save(&lines, &mut dirty, &mut save_error) {
                     ui::show_cursor();
                     return Ok(());
+                }
+            }
+            KeyCode::Up if key.alt => {
+                if row > 0 {
+                    lines.swap(row, row - 1);
+                    row -= 1;
+                    dirty = true;
+                }
+            }
+            KeyCode::Down if key.alt => {
+                if row + 1 < lines.len() {
+                    lines.swap(row, row + 1);
+                    row += 1;
+                    dirty = true;
                 }
             }
             KeyCode::Up => row = row.saturating_sub(1),
@@ -158,6 +171,35 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                 row += 1;
                 col = 0;
                 dirty = true;
+            }
+            // Deletes the word behind the cursor (trailing whitespace, then
+            // the run of non-whitespace before it) instead of one char.
+            // Falls back to the plain join-with-previous-line behavior at
+            // column 0, same as a regular Backspace there.
+            KeyCode::Backspace if key.ctrl => {
+                if col == 0 {
+                    if row > 0 {
+                        let cur = lines.remove(row);
+                        col = char_len(&lines[row - 1]);
+                        lines[row - 1].push_str(&cur);
+                        row -= 1;
+                        dirty = true;
+                    }
+                } else {
+                    let chars: Vec<char> = lines[row].chars().collect();
+                    let mut start = col;
+                    while start > 0 && chars[start - 1].is_whitespace() {
+                        start -= 1;
+                    }
+                    while start > 0 && !chars[start - 1].is_whitespace() {
+                        start -= 1;
+                    }
+                    let b_start = byte_at(&lines[row], start);
+                    let b_end = byte_at(&lines[row], col);
+                    lines[row].replace_range(b_start..b_end, "");
+                    col = start;
+                    dirty = true;
+                }
             }
             KeyCode::Backspace => {
                 if col > 0 {
