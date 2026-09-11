@@ -8,3 +8,6 @@ npm-debug.log*
 # ccpit
 TODO.md
 PLAN.md
+
+# Rust rewrite build artifacts
+rust/target/
