@@ -28,7 +28,22 @@ const glyph = {
   pointer: enabled ? '❯' : '>',
   spark: enabled ? '✻' : '*',
   dot: enabled ? '·' : '-',
+  back: enabled ? '←' : '<-',
 };
+
+// Hand stdin back to a child process cleanly: drop our keypress listeners,
+// leave raw mode, stop reading, restore the cursor. Without this a spawned
+// interactive program (Claude Code) can appear frozen because this process is
+// still holding stdin in raw/flowing mode.
+function resetStdin() {
+  const s = process.stdin;
+  try { s.removeAllListeners('keypress'); } catch { /* ignore */ }
+  try { if (s.isTTY && s.isRaw) s.setRawMode(false); } catch { /* ignore */ }
+  try { s.pause(); } catch { /* ignore */ }
+  // Full SGR reset + show cursor so no lingering color/attribute bleeds into
+  // the child program's output.
+  if (enabled) process.stdout.write('\x1b[0m\x1b[?25h');
+}
 
 function clearScreen() {
   if (enabled) process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
@@ -66,5 +81,5 @@ function makeRepainter() {
 }
 
 module.exports = {
-  enabled, color, glyph, clearScreen, hideCursor, showCursor, banner, rule, makeRepainter,
+  enabled, color, glyph, clearScreen, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter,
 };

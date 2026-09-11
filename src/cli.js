@@ -4,11 +4,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { addProfile, getProfile, listProfiles, removeProfile } = require('./profiles');
 const paths = require('./paths');
 const { copySession } = require('./handoff');
-const { color, glyph, clearScreen, hideCursor, showCursor, banner, rule, makeRepainter } = require('./ui');
+const { color, glyph, clearScreen, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter } = require('./ui');
 
 function usage() {
   const c = color;
@@ -87,7 +87,8 @@ function syncProfiles(fromName, toName, what = 'all') {
   const to = getProfile(toName);
   if (from.name === to.name) throw new Error('Source and target are the same profile.');
   const valid = ['plugins', 'skills', 'mcp'];
-  const want = what === 'all' ? valid : [what];
+  const want = Array.isArray(what) ? what : what === 'all' ? valid : [what];
+  if (!want.length) throw new Error('Nothing selected to sync.');
   if (!want.every(w => valid.includes(w))) throw new Error('what must be one of: plugins, skills, mcp, all');
   const src = paths.profileDir(from.name);
   const dst = paths.profileDir(to.name);
@@ -243,12 +244,10 @@ function accountStat(name) {
 
 // The account list. Shown at all times — in the picker and above every sub-prompt.
 function accountLines(profiles, selected = -1, stats = null) {
-  const lines = [
-    banner(),
-    '',
-    color.dim('  Pick an account to launch Claude with an isolated profile.'),
-    '',
-  ];
+  const lines = [banner(), ''];
+  if (profiles.length) {
+    lines.push(color.dim('  Each account is an isolated Claude Code login.'), '');
+  }
   profiles.forEach((profile, index) => {
     const active = index === selected;
     const marker = active ? color.orange(glyph.pointer) : ' ';
@@ -268,36 +267,81 @@ function accountLines(profiles, selected = -1, stats = null) {
 // Returned by promptLine when the user asks to go back (`<-` or Esc).
 const BACK = Symbol('back');
 
+// Read-only key wait: shows `lines`, returns on ←/Esc/Enter/q.
+function pauseScreen(lines) {
+  return new Promise(resolve => {
+    clearScreen();
+    hideCursor();
+    process.stdout.write(lines.join('\n') + '\n');
+    const stdin = process.stdin;
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
+    const onKey = (str, key) => {
+      key = key || {};
+      const name = key.name || str;
+      if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
+      if (['escape', 'left', 'h', 'return', 'enter', 'q'].includes(name)) {
+        stdin.removeListener('keypress', onKey);
+        if (stdin.isRaw) stdin.setRawMode(false);
+        stdin.pause();
+        showCursor();
+        resolve();
+      }
+    };
+    stdin.on('keypress', onKey);
+  });
+}
+
+// What a profile has enabled: plugin ids, skill dirs, MCP server names.
+function profileInventory(name) {
+  const dir = paths.profileDir(name);
+  const settings = readJson(path.join(dir, 'settings.json'));
+  const claudeJson = readJson(path.join(dir, '.claude.json'));
+  const plugins = Object.entries(settings.enabledPlugins || {}).filter(([, v]) => v).map(([k]) => k).sort();
+  let skills = [];
+  try {
+    skills = fs.readdirSync(path.join(dir, 'skills'), { withFileTypes: true })
+      .filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+  } catch { /* no skills dir */ }
+  const mcp = [...new Set([
+    ...Object.keys(claudeJson.mcpServers || {}),
+    ...Object.keys(settings.mcpServers || {}),
+  ])].sort();
+  return { plugins, skills, mcp };
+}
+
 // Repaint the persistent account list, then a feature heading with a back hint.
-function subScreen(profiles, heading) {
+function subScreen(profiles, heading, mark = -1) {
   clearScreen();
-  const lines = accountLines(profiles);
-  lines.push(`${color.dim('<-')} ${color.bold(heading)}`);
-  lines.push(color.dim('   type <- or press Esc to go back'));
+  const lines = accountLines(profiles, mark);
+  lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
+  lines.push(color.dim(`   press ${glyph.back} or Esc to go back`));
   lines.push('');
   process.stdout.write(lines.join('\n') + '\n');
 }
 
-// A line prompt that also resolves to BACK on `<-` (then Enter) or a lone Esc.
+// A line prompt that resolves to BACK on ←/Esc (or an empty Enter after typing nothing).
 function promptLine(question) {
   return new Promise(resolve => {
     const stdin = process.stdin;
     let buf = '';
-    process.stdout.write(`${color.dim('<-')} ${question}`);
+    process.stdout.write(`${color.orange(glyph.back)} ${question}`);
     readline.emitKeypressEvents(stdin);
     const wasRaw = Boolean(stdin.isRaw);
     if (stdin.isTTY) stdin.setRawMode(true);
     stdin.resume();
     const done = value => {
       stdin.removeListener('keypress', onKey);
-      if (stdin.isTTY) stdin.setRawMode(wasRaw);
+      if (stdin.isTTY && !wasRaw) stdin.setRawMode(false);
+      stdin.pause();
       process.stdout.write('\n');
       resolve(value);
     };
     const onKey = (str, key) => {
       key = key || {};
       const name = key.name || '';
-      if (name === 'escape') return done(BACK);
+      if (name === 'escape' || (name === 'left' && !buf)) return done(BACK);
       if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
       if (name === 'return' || name === 'enter') return done(buf.trim() === '<-' ? BACK : buf);
       if (name === 'backspace') {
@@ -310,10 +354,146 @@ function promptLine(question) {
   });
 }
 
-// Interactive account picker. Resolves to an action the caller loop acts on.
-function pickProfile(profiles) {
+// Arrow-key checklist. Toggle rows with Enter/Space, then move to the "→ Go"
+// row and press Enter to confirm. Resolves to an array of the checked values,
+// or BACK on ←/Esc. `options` may pre-set `checked: true`.
+function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = -1 }) {
   return new Promise(resolve => {
+    const stdin = process.stdin;
+    const checked = options.map(o => Boolean(o.checked));
     let selected = 0;
+    const rows = options.length + 1; // + the Go row
+    const repaint = makeRepainter();
+    let firstRender = true;
+
+    const render = () => {
+      if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
+      const lines = accountLines(profiles, mark);
+      lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
+      if (hint) lines.push(color.dim(`   ${hint}`));
+      lines.push('');
+      options.forEach((opt, index) => {
+        const active = index === selected;
+        const marker = active ? color.orange(glyph.pointer) : ' ';
+        const box = checked[index] ? color.orange('[x]') : color.dim('[ ]');
+        const label = active ? color.orangeBold(opt.label) : opt.label;
+        lines.push(` ${marker} ${box} ${label}${opt.note ? `   ${color.dim(opt.note)}` : ''}`);
+      });
+      lines.push('');
+      const goActive = selected === options.length;
+      const count = checked.filter(Boolean).length;
+      const go = `${color.orange(glyph.pointer + ' →')} ${goActive ? color.orangeBold(goLabel) : goLabel}`;
+      lines.push(` ${goActive ? go : `   ${color.dim('→')} ${goLabel}`}   ${color.dim(`${count} selected`)}`);
+      lines.push('');
+      lines.push(rule());
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Space')} toggle    ${color.dim('Enter')} toggle / go    ${color.dim(`${glyph.back}/Esc`)} back`);
+      repaint(lines);
+    };
+
+    const cleanup = () => {
+      stdin.removeListener('keypress', onKey);
+      if (stdin.isRaw) stdin.setRawMode(false);
+      stdin.pause();
+      showCursor();
+    };
+    const done = value => { cleanup(); resolve(value); };
+
+    const onKey = (str, key) => {
+      key = key || {};
+      const name = key.name || str;
+      if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
+      if (name === 'escape' || name === 'left' || name === 'h') return done(BACK);
+      if (name === 'up' || name === 'k' || (key.shift && name === 'tab')) {
+        selected = (selected + rows - 1) % rows;
+        return render();
+      }
+      if (name === 'down' || name === 'j' || name === 'tab') {
+        selected = (selected + 1) % rows;
+        return render();
+      }
+      const onGo = selected === options.length;
+      if (name === 'space' || str === ' ') {
+        if (!onGo) { checked[selected] = !checked[selected]; render(); }
+        return;
+      }
+      if (name === 'return' || name === 'enter') {
+        if (onGo) return done(options.filter((_, i) => checked[i]).map(o => o.value));
+        checked[selected] = !checked[selected];
+        return render();
+      }
+    };
+
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('keypress', onKey);
+    render();
+  });
+}
+
+// Arrow-key list picker. Shows the account list for context, then `options`
+// with a ❯ pointer. ↑/↓ or k/j move, Enter selects, ←/Esc returns BACK.
+function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
+  return new Promise(resolve => {
+    const stdin = process.stdin;
+    let selected = 0;
+    const repaint = makeRepainter();
+    let firstRender = true;
+
+    const render = () => {
+      if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
+      const lines = accountLines(profiles, mark);
+      lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
+      if (hint) lines.push(color.dim(`   ${hint}`));
+      lines.push('');
+      options.forEach((opt, index) => {
+        const active = index === selected;
+        const marker = active ? color.orange(glyph.pointer) : ' ';
+        const label = active ? color.orangeBold(opt.label) : opt.label;
+        lines.push(` ${marker} ${label}${opt.note ? `   ${color.dim(opt.note)}` : ''}`);
+      });
+      lines.push('');
+      lines.push(rule());
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} select    ${color.dim(`${glyph.back}/Esc`)} back`);
+      repaint(lines);
+    };
+
+    const cleanup = () => {
+      stdin.removeListener('keypress', onKey);
+      if (stdin.isRaw) stdin.setRawMode(false);
+      stdin.pause();
+      showCursor();
+    };
+    const done = value => { cleanup(); resolve(value); };
+
+    const onKey = (str, key) => {
+      key = key || {};
+      const name = key.name || str;
+      if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
+      if (name === 'escape' || name === 'left' || name === 'h') return done(BACK);
+      if (name === 'up' || name === 'k' || (key.shift && name === 'tab')) {
+        selected = (selected + options.length - 1) % options.length;
+        return render();
+      }
+      if (name === 'down' || name === 'j' || name === 'tab') {
+        selected = (selected + 1) % options.length;
+        return render();
+      }
+      if (name === 'return' || name === 'enter') return done(options[selected].value);
+    };
+
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('keypress', onKey);
+    render();
+  });
+}
+
+// Interactive account picker. Resolves to an action the caller loop acts on.
+function pickProfile(profiles, start = 0) {
+  return new Promise(resolve => {
+    let selected = Math.max(0, Math.min(start, profiles.length - 1));
     const stdin = process.stdin;
     // Read session stats once — the picker list is static while it is open.
     const stats = profiles.map(p => accountStat(p.name));
@@ -323,8 +503,8 @@ function pickProfile(profiles) {
     const render = () => {
       if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
       const lines = accountLines(profiles, selected, stats);
-      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} launch    ${color.dim('r')} refresh    ${color.dim('q')} quit`);
-      lines.push(` ${color.dim('a')} add    ${color.dim('i')} import    ${color.dim('s')} sync plugins/skills/mcp    ${color.dim('d')} delete`);
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} launch    ${color.dim('→')} view plugins/skills/mcp    ${color.dim('r')} refresh    ${color.dim('q')} quit`);
+      lines.push(` ${color.dim('a')} add    ${color.dim('i')} import    ${color.dim('s')} sync    ${color.dim('d')} delete`);
       repaint(lines);
     };
 
@@ -353,6 +533,7 @@ function pickProfile(profiles) {
         return render();
       }
       if (name === 'return' || name === 'enter') return finish({ type: 'open', name: profiles[selected].name });
+      if (name === 'right' || name === 'l') return finish({ type: 'detail', name: profiles[selected].name });
       if (name === 'a') return finish({ type: 'add' });
       if (name === 'i') return finish({ type: 'import' });
       if (name === 's') return finish({ type: 'sync', name: profiles[selected].name });
@@ -380,34 +561,68 @@ async function cockpit(args = []) {
   if (args[0]) return launch(args[0], args.slice(1));           // `claude-cockpit <profile> [args]`
   if (!process.stdin.isTTY || !process.stdout.isTTY) return dashboard();
 
+  let cursor = 0; // remembered account row, so sub-screens return you to it
   for (;;) {
     let profiles = listProfiles();
     if (!profiles.length) {
-      console.log(`${banner()}\n`);
-      console.log(color.dim('  No accounts yet.'));
-      console.log(`  ${color.dim('1')} import this machine's existing login (${color.dim('~/.claude')})`);
-      console.log(`  ${color.dim('2')} create a fresh empty account`);
-      const pick = (await ask('  choice (blank to quit): ')).trim();
-      if (pick === '1') {
-        const name = (await ask('  profile name [main]: ')).trim() || 'main';
-        try { importProfile(name); } catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
-        continue;
-      }
-      if (pick === '2') {
-        const name = (await ask('  account name: ')).trim();
-        if (!name) return;
-        try { addProfile(name); console.log(color.green(`Created '${name}'.`)); }
+      const pick = await chooseFromList({
+        profiles: [],
+        heading: 'No accounts yet — set one up',
+        hint: 'each account is an isolated Claude Code login',
+        options: [
+          { label: 'Import this machine\'s existing login', value: 'import', note: '~/.claude — keeps sessions, plugins, skills' },
+          { label: 'Create a fresh empty account', value: 'add', note: 'log in with /login afterward' },
+          { label: 'Quit', value: 'quit' },
+        ],
+      });
+      if (pick === BACK || pick === 'quit') { clearScreen(); return; }
+      if (pick === 'import') {
+        subScreen(profiles, 'Import an existing login');
+        const name = await promptLine('Profile name [main]: ');
+        if (name === BACK) continue;
+        try { importProfile(name.trim() || 'main'); }
         catch (error) { console.error(color.red(`Error: ${error.message}`)); }
+        await ask('Press Enter...');
         continue;
       }
-      return;
+      if (pick === 'add') {
+        subScreen(profiles, 'Create a fresh account');
+        const name = await promptLine('Account name: ');
+        if (name === BACK || !name.trim()) continue;
+        try { addProfile(name.trim()); console.log(color.green(`Created '${name.trim()}'.`)); }
+        catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
+        continue;
+      }
+      continue;
     }
 
-    const action = await pickProfile(profiles);
+    cursor = Math.max(0, Math.min(cursor, profiles.length - 1));
+    const action = await pickProfile(profiles, cursor);
+    const mark = profiles.findIndex(p => p.name === action.name);
+    if (mark >= 0) cursor = mark;
     if (action.type === 'quit') { clearScreen(); return; }
     if (action.type === 'refresh') continue;
+    if (action.type === 'detail') {
+      const inv = profileInventory(action.name);
+      const lines = accountLines(profiles, mark);
+      lines.push(`${color.orange(glyph.back)} ${color.bold(`'${action.name}'  —  plugins · skills · MCP`)}`);
+      lines.push('');
+      const section = (title, items) => {
+        lines.push(`  ${color.orangeBold(title)} ${color.dim(`(${items.length})`)}`);
+        if (!items.length) lines.push(`    ${color.dim('none')}`);
+        else for (const item of items) lines.push(`    ${color.dim(glyph.dot)} ${item}`);
+        lines.push('');
+      };
+      section('Plugins', inv.plugins);
+      section('Skills', inv.skills);
+      section('MCP servers', inv.mcp);
+      lines.push(rule());
+      lines.push(` ${color.dim(`${glyph.back} / Esc / Enter`)} back`);
+      await pauseScreen(lines);
+      continue;
+    }
     if (action.type === 'import') {
-      subScreen(profiles, 'Import an existing login into a new profile');
+      subScreen(profiles, 'Import an existing login into a new profile', mark);
       const name = await promptLine('Profile name for the imported login [main]: ');
       if (name === BACK) continue;
       const dir = await promptLine('Source config dir [~/.claude]: ');
@@ -420,39 +635,54 @@ async function cockpit(args = []) {
     if (action.type === 'sync') {
       const others = profiles.filter(p => p.name !== action.name);
       if (!others.length) {
-        subScreen(profiles, `Sync from '${action.name}'`);
+        subScreen(profiles, `Sync from '${action.name}'`, mark);
         console.log(color.dim('Need a second profile to sync into.'));
         await ask('Press Enter...');
         continue;
       }
-      subScreen(profiles, `Copy plugins/skills/mcp from '${action.name}' into which profile?`);
-      others.forEach((p, i) => console.log(`  ${color.dim(String(i + 1))} ${p.name}`));
-      console.log('');
-      const target = await promptLine('target #: ');
+      const target = await chooseFromList({
+        profiles,
+        mark,
+        heading: `Sync plugins / skills / MCP from '${action.name}' into…`,
+        hint: 'choose the target account',
+        options: others.map(p => ({
+          label: p.name, value: p.name, note: `${accountStat(p.name).count} sessions`,
+        })),
+      });
       if (target === BACK) continue;
-      const pick = others[Number(target.trim()) - 1];
-      if (!pick) { console.log(color.dim('Cancelled.')); await ask('Press Enter...'); continue; }
-      const what = await promptLine('what [all/plugins/skills/mcp]: ');
+      const what = await chooseMulti({
+        profiles,
+        mark,
+        heading: `Sync  '${action.name}'  ${glyph.pointer}  '${target}'`,
+        hint: 'tick what to copy, then → Go',
+        options: [
+          { label: 'Plugins', value: 'plugins', note: 'installed plugins + marketplaces', checked: true },
+          { label: 'Skills', value: 'skills', note: 'personal skills', checked: true },
+          { label: 'MCP servers', value: 'mcp', note: '.claude.json + settings.json', checked: true },
+        ],
+      });
       if (what === BACK) continue;
-      try { syncProfiles(action.name, pick.name, what.trim() || 'all'); }
+      clearScreen();
+      if (!what.length) { console.log(color.dim('Nothing selected.')); await ask('Press Enter...'); continue; }
+      try { syncProfiles(action.name, target, what); }
       catch (error) { console.error(color.red(`Error: ${error.message}`)); }
       await ask('Press Enter to return to the menu...');
       continue;
     }
     if (action.type === 'delete') {
-      subScreen(profiles, `Delete profile '${action.name}'`);
+      subScreen(profiles, `Delete profile '${action.name}'`, mark);
       console.log(color.red(`Everything under ${paths.profileDir(action.name)} will be removed.`));
       console.log(color.dim('That account\'s login, sessions, plugins, and settings. Cannot be undone.'));
       console.log('');
       const confirm = await promptLine('Type the profile name to confirm: ');
       if (confirm === BACK) continue;
       if (confirm.trim() === action.name) {
-        try { removeProfile(action.name); console.log(color.green(`Deleted '${action.name}'.`)); }
-        catch (error) { console.error(color.red(`Error: ${error.message}`)); }
+        try { removeProfile(action.name); continue; } // straight back to the menu
+        catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
       } else {
         console.log(color.dim('Cancelled.'));
+        await ask('Press Enter...');
       }
-      await ask('Press Enter to return to the menu...');
       continue;
     }
     if (action.type === 'add') {
@@ -468,11 +698,46 @@ async function cockpit(args = []) {
     }
     if (action.type === 'open') {
       clearScreen();
-      console.log(color.dim(`${glyph.spark} launching Claude as '${action.name}' — exit Claude to return here\n`));
+      process.stdout.write(`${color.dim(`${glyph.spark} launching Claude as '${action.name}' — exit Claude to return here`)}\n\n${color.reset}`);
       await launch(action.name, [], { interactive: true });
       // fall through: loop repaints the menu
     }
   }
+}
+
+// Resolve how to start Claude. On Windows we avoid the `claude.cmd` shim so
+// Ctrl+C inside Claude does not drop to cmd.exe's "Terminate batch job (Y/N)?"
+// prompt — we run the real .exe (or cli.js via node) that the shim points at.
+let claudeTargetCache;
+function claudeTarget() {
+  if (claudeTargetCache) return claudeTargetCache;
+  const set = value => (claudeTargetCache = value);
+
+  const bin = process.env.CLAUDE_BIN;
+  if (bin) return set({ command: bin, prefix: [], shell: /\.(cmd|bat)$/i.test(bin) });
+  if (process.platform !== 'win32') return set({ command: 'claude', prefix: [], shell: false });
+
+  const where = spawnSync('where', ['claude'], { encoding: 'utf8' });
+  const shims = where.status === 0 ? where.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean) : [];
+  for (const shim of shims) {
+    const dir = path.dirname(shim);
+    const guesses = [];
+    if (/\.(cmd|bat|ps1)$/i.test(shim)) {
+      try {
+        const text = fs.readFileSync(shim, 'utf8');
+        const m = text.match(/%[~a-z0-9]*dp0%[\\/]?([^"'\s]+?\.(?:exe|js))/i);
+        if (m) guesses.push(path.join(dir, m[1]));
+      } catch { /* unreadable shim */ }
+    }
+    guesses.push(
+      path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+      path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js'),
+    );
+    const hit = guesses.find(p => { try { return fs.existsSync(p); } catch { return false; } });
+    if (hit && hit.toLowerCase().endsWith('.js')) return set({ command: process.execPath, prefix: [hit], shell: false });
+    if (hit) return set({ command: hit, prefix: [], shell: false });
+  }
+  return set({ command: 'claude.cmd', prefix: [], shell: true });
 }
 
 // Spawn Claude with the profile's isolated config dir.
@@ -480,18 +745,31 @@ async function cockpit(args = []) {
 // otherwise the process exits with Claude's code.
 function launch(profile, args, { interactive = false } = {}) {
   return new Promise(resolve => {
-    const command = process.env.CLAUDE_BIN || (process.platform === 'win32' ? 'claude.cmd' : 'claude');
-    const child = spawn(command, args, {
+    resetStdin(); // release stdin so Claude's own prompt gets the keyboard
+    const target = claudeTarget();
+    const command = target.command;
+    const child = spawn(command, [...target.prefix, ...args], {
       stdio: 'inherit',
       env: { ...process.env, CLAUDE_CONFIG_DIR: paths.profileDir(profile) },
       windowsHide: false,
-      shell: process.platform === 'win32',
+      shell: target.shell,
     });
+    // Ctrl+C is delivered to the whole console group. Let Claude own it while it
+    // runs — ignore it here so the cockpit survives and shows the menu again.
+    const ignore = () => {};
+    process.on('SIGINT', ignore);
+    process.on('SIGBREAK', ignore);
+    const restoreSignals = () => {
+      process.removeListener('SIGINT', ignore);
+      process.removeListener('SIGBREAK', ignore);
+    };
     child.on('exit', code => {
+      restoreSignals();
       if (interactive) resolve(code ?? 0);
       else process.exit(code ?? 0);
     });
     child.on('error', error => {
+      restoreSignals();
       if (error.code === 'ENOENT') {
         console.error(color.red(`Claude CLI not found (${command}). Install Claude Code or set CLAUDE_BIN to its full path.`));
         console.error(color.dim('Example: $env:CLAUDE_BIN = "$env:APPDATA\\npm\\claude.cmd"'));
