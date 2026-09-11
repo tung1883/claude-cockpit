@@ -999,6 +999,7 @@ async function cockpit(args = []) {
       try {
         const profile = createAccount(name.trim());
         leaveAlt();
+        clearScreen(); // primary buffer keeps scrolling across launches; wipe it first
         console.log(color.green(`Created '${profile.name}'. Launching Claude — run /login inside it.`));
         await launch(profile.name, [], { interactive: true });
         enterAlt();
@@ -1007,6 +1008,7 @@ async function cockpit(args = []) {
     }
     if (action.type === 'open') {
       leaveAlt(); // give Claude the real terminal (its own alt screen, scrollback)
+      clearScreen(); // primary buffer keeps scrolling across launches; wipe it first
       process.stdout.write(`${color.dim(`${glyph.spark} launching Claude as `)}${color.orange(action.name)}${color.dim(' — exit Claude to return here')}\n\n${color.reset}`);
       await launch(action.name, [], { interactive: true });
       enterAlt();
