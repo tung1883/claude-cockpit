@@ -57,6 +57,12 @@ function leaveAlt() {
   if (enabled && inAlt) { process.stdout.write('\x1b[?25h\x1b[?1049l'); inAlt = false; }
 }
 process.on('exit', leaveAlt);
+// Belt-and-suspenders: whatever caused the process to exit — quit, an
+// uncaught error, Ctrl+C — the terminal must get raw mode back. Screens
+// swapping between each other deliberately leave stdin in raw mode (that's
+// the fix for the stdin-wedging bug), so something has to release it on the
+// way out or the shell you return to is left broken (no echo/line editing).
+process.on('exit', resetStdin);
 
 // Hard wipe — use only for a real reset (startup, returning from Claude).
 function clearScreen() {

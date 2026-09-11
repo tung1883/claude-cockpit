@@ -4,3 +4,7 @@ npm-debug.log*
 
 # Local test/store data if the default location is overridden into the repo.
 .claude-multi-cockpit/
+
+# ccpit
+TODO.md
+PLAN.md

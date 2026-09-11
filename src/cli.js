@@ -9,6 +9,7 @@ const { addProfile, getProfile, listProfiles, removeProfile } = require('./profi
 const paths = require('./paths');
 const { copySession } = require('./handoff');
 const inspect = require('./inspect');
+const notes = require('./notes');
 const { color, glyph, clearScreen, homeClear, enterAlt, leaveAlt, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter } = require('./ui');
 
 function usage() {
@@ -23,6 +24,7 @@ ${c.bold('Commands')}
   add <name>                    Create an isolated account profile
   import <name> [dir]           Copy an existing login (default ~/.claude) into a profile
   sync <from> <to> [what]       Copy plugins/skills/mcp between profiles (what: plugins|skills|mcp|all)
+  notes [dir]                   Sync a project's TODO.md/PLAN.md with the master files right now
   delete <name>                 Delete a profile and all its data
   list                          List profiles
   login <name>                  Launch Claude to log that profile in
@@ -304,10 +306,12 @@ function invalidateInspection(name) {
 function prefetchInspection(name) {
   if (inspectionCache.has(name) || inFlight.has(name)) return;
   inFlight.add(name);
+  notes.debugLog(`prefetchInspection scheduled for ${name}`);
   setImmediate(() => {
+    notes.debugLog(`prefetchInspection scan start for ${name}`);
     try { inspectionCache.set(name, inspect.buildInspection(paths.profileDir(name))); }
     catch { /* best effort — detail view will retry synchronously */ }
-    finally { inFlight.delete(name); }
+    finally { inFlight.delete(name); notes.debugLog(`prefetchInspection scan done for ${name}`); }
   });
 }
 function getInspection(name) {
@@ -351,6 +355,24 @@ function hintGrid(rows, cell = 16) {
 // Returned by promptLine when the user asks to go back (`<-` or Esc).
 const BACK = Symbol('back');
 
+// Raw mode + flowing stdin persist for the whole interactive cockpit session
+// — only the keypress LISTENER changes as screens come and go. Toggling
+// setRawMode/pause/resume on every single screen transition (which every
+// screen used to do independently) is what would silently stop stdin from
+// ever delivering another keypress after a few cycles on Windows — no error,
+// it just goes dead, which looks exactly like the whole app freezing.
+// resetStdin() (used when handing off to Claude or an external editor) is
+// still the one legitimate place raw mode actually gets released.
+function beginKeys(stdin, onKey) {
+  readline.emitKeypressEvents(stdin);
+  if (stdin.isTTY && !stdin.isRaw) stdin.setRawMode(true);
+  if (stdin.isPaused()) stdin.resume();
+  stdin.on('keypress', onKey);
+}
+function endKeys(stdin, onKey) {
+  stdin.removeListener('keypress', onKey);
+}
+
 // Scrollable read-only list. `rows` are { text, selectable, value? }. ↑/↓ or
 // k/j move the highlight over selectable rows (scrolling the viewport).
 // Enter/→ on a row that has a `value` resolves { pick: value }; ←/Esc/q resolve
@@ -392,9 +414,7 @@ function scrollScreen({ header, rows, footerHint, start }) {
     };
 
     const finish = value => {
-      stdin.removeListener('keypress', onKey);
-      if (stdin.isRaw) stdin.setRawMode(false);
-      stdin.pause();
+      endKeys(stdin, onKey);
       showCursor();
       resolve(value);
     };
@@ -417,12 +437,149 @@ function scrollScreen({ header, rows, footerHint, start }) {
       if (name === 'pagedown') { pos = Math.min(selectableIdx.length - 1, pos + 5); return render(); }
     };
 
-    readline.emitKeypressEvents(stdin);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('keypress', onKey);
+    beginKeys(stdin, onKey);
     render();
   });
+}
+
+// A small in-terminal text editor — no shelling out to notepad/vim. Loads
+// `file` (or starts empty if it doesn't exist yet), lets you move around and
+// type, and writes it back on save. Unlike the other screens here it shows
+// the real terminal cursor (positioned with a raw ANSI move after each
+// repaint) instead of drawing a `❯` pointer — that's what makes it feel like
+// an editor rather than a menu.
+function editFile(file, { profiles = [], mark = -1, title } = {}) {
+  return new Promise(resolve => {
+    let lines = readSafeLines(file);
+    let row = 0;
+    let col = 0;
+    let top = 0;
+    let dirty = false;
+    let saveError = null; // set when a save fails, shown until the next keypress
+    const stdin = process.stdin;
+    const repaint = makeRepainter();
+    let firstRender = true;
+
+    const content = () => lines.join('\n');
+    // Never throws: another process (agent, editor, AV scanner) can hold the
+    // file at the wrong moment. A failed save keeps your edits in the buffer
+    // and reports it instead of crashing out of the keypress handler, which
+    // would leave stdin's raw mode/listener stranded for whatever screen
+    // comes next.
+    const save = () => {
+      try { fs.writeFileSync(file, `${content()}\n`); dirty = false; saveError = null; return true; }
+      catch (error) { saveError = error.message; return false; }
+    };
+    const clamp = () => {
+      row = Math.max(0, Math.min(row, lines.length - 1));
+      col = Math.max(0, Math.min(col, lines[row].length));
+    };
+
+    const render = () => {
+      if (firstRender) { showCursor(); firstRender = false; }
+      clamp();
+      const header = accountLines(profiles, mark);
+      header.push(`${color.orange(glyph.back)} ${color.bold(title || path.basename(file))}${dirty ? color.yellow(' •  unsaved') : ''}`);
+      header.push(color.dim(`   ${file}`));
+      header.push('');
+      const viewport = Math.max(5, (process.stdout.rows || 24) - header.length - 5);
+      if (row < top) top = row;
+      if (row >= top + viewport) top = row - viewport + 1;
+      top = Math.max(0, Math.min(top, Math.max(0, lines.length - viewport)));
+      const out = [...header];
+      const end = Math.min(lines.length, top + viewport);
+      if (top > 0) out.push(color.dim(`    ↑ ${top} more`));
+      for (let i = top; i < end; i++) out.push(`${color.dim(String(i + 1).padStart(3))} ${lines[i]}`);
+      if (end < lines.length) out.push(color.dim(`    ↓ ${lines.length - end} more`));
+      out.push('');
+      out.push(rule());
+      if (saveError) out.push(` ${color.red(`Save failed: ${saveError}`)}`);
+      out.push(` ${color.dim('Ctrl+S')} save   ${color.dim('Esc')} save & exit   ${color.dim('↑/↓/←/→')} move   ${color.dim('Ctrl+C')} quit without saving`);
+      repaint(out);
+      const gutter = 4; // "NNN " line-number column
+      const termRow = header.length + 1 + (row - top) + (top > 0 ? 1 : 0);
+      const termCol = 1 + gutter + col;
+      process.stdout.write(`\x1b[${termRow};${termCol}H`);
+    };
+
+    const cleanup = () => { endKeys(stdin, onKey); };
+    const finish = () => { cleanup(); resolve(); };
+
+    const insert = text => {
+      const line = lines[row];
+      lines[row] = line.slice(0, col) + text + line.slice(col);
+      col += text.length;
+      dirty = true;
+    };
+
+    const onKey = (str, key) => {
+      key = key || {};
+      const name = key.name || '';
+      if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
+
+      try { handleKey(str, key, name); }
+      catch (error) {
+        // A bug here must never crash out of the listener with stdin still in
+        // raw mode — that strands a dead listener for whatever screen comes
+        // next, which then looks like the whole app has frozen.
+        saveError = error.message;
+        render();
+      }
+    };
+
+    const handleKey = (str, key, name) => {
+      if (key.ctrl && name === 's') { save(); return render(); }
+      // Esc always saves & exits — matches the footer hint. A failed save
+      // (locked file, etc.) keeps you in the editor with the error shown
+      // instead of losing the buffer; discarding on purpose is Ctrl+C.
+      if (name === 'escape') { if (!dirty || save()) return finish(); return render(); }
+      if (name === 'up') { row--; return render(); }
+      if (name === 'down') { row++; return render(); }
+      if (name === 'left') {
+        if (col > 0) col--;
+        else if (row > 0) { row--; col = lines[row].length; }
+        return render();
+      }
+      if (name === 'right') {
+        if (col < lines[row].length) col++;
+        else if (row < lines.length - 1) { row++; col = 0; }
+        return render();
+      }
+      if (name === 'home') { col = 0; return render(); }
+      if (name === 'end') { col = lines[row].length; return render(); }
+      if (name === 'pageup') { row -= 10; return render(); }
+      if (name === 'pagedown') { row += 10; return render(); }
+      if (name === 'return' || name === 'enter') {
+        const rest = lines[row].slice(col);
+        lines[row] = lines[row].slice(0, col);
+        lines.splice(row + 1, 0, rest);
+        row++; col = 0; dirty = true;
+        return render();
+      }
+      if (name === 'backspace') {
+        if (col > 0) { lines[row] = lines[row].slice(0, col - 1) + lines[row].slice(col); col--; dirty = true; }
+        else if (row > 0) { col = lines[row - 1].length; lines[row - 1] += lines[row]; lines.splice(row, 1); row--; dirty = true; }
+        return render();
+      }
+      if (name === 'delete') {
+        if (col < lines[row].length) { lines[row] = lines[row].slice(0, col) + lines[row].slice(col + 1); dirty = true; }
+        else if (row < lines.length - 1) { lines[row] += lines[row + 1]; lines.splice(row + 1, 1); dirty = true; }
+        return render();
+      }
+      if (name === 'tab') { insert('  '); return render(); }
+      if (str && !key.ctrl && !key.meta && str >= ' ') { insert(str); return render(); }
+    };
+
+    beginKeys(stdin, onKey);
+    render();
+  });
+}
+
+function readSafeLines(file) {
+  let content = '';
+  try { content = fs.readFileSync(file, 'utf8'); } catch { /* new file */ }
+  const lines = content.split(/\r?\n/);
+  return lines.length ? lines : [''];
 }
 
 // What a profile has enabled: plugin ids, skill dirs, MCP server names.
@@ -612,14 +769,8 @@ function promptLine(question) {
     const stdin = process.stdin;
     let buf = '';
     process.stdout.write(`${color.orange(glyph.back)} ${question}`);
-    readline.emitKeypressEvents(stdin);
-    const wasRaw = Boolean(stdin.isRaw);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
     const done = value => {
-      stdin.removeListener('keypress', onKey);
-      if (stdin.isTTY && !wasRaw) stdin.setRawMode(false);
-      stdin.pause();
+      endKeys(stdin, onKey);
       process.stdout.write('\n');
       resolve(value);
     };
@@ -635,7 +786,7 @@ function promptLine(question) {
       }
       if (str && !key.ctrl && !key.meta && str >= ' ') { buf += str; process.stdout.write(str); }
     };
-    stdin.on('keypress', onKey);
+    beginKeys(stdin, onKey);
   });
 }
 
@@ -701,9 +852,7 @@ function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = 
     };
 
     const cleanup = () => {
-      stdin.removeListener('keypress', onKey);
-      if (stdin.isRaw) stdin.setRawMode(false);
-      stdin.pause();
+      endKeys(stdin, onKey);
       showCursor();
     };
     const done = value => { cleanup(); resolve(value); };
@@ -730,17 +879,14 @@ function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = 
       }
     };
 
-    readline.emitKeypressEvents(stdin);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('keypress', onKey);
+    beginKeys(stdin, onKey);
     render();
   });
 }
 
 // Arrow-key list picker. Shows the account list for context, then `options`
 // with a ❯ pointer. ↑/↓ or k/j move, Enter selects, ←/Esc returns BACK.
-function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
+function chooseFromList({ profiles, heading, hint, options, mark = -1, externalKey }) {
   return new Promise(resolve => {
     const stdin = process.stdin;
     let selected = 0;
@@ -761,14 +907,13 @@ function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
       });
       lines.push('');
       lines.push(rule());
-      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} select    ${color.dim(`${glyph.back}/Esc`)} back`);
+      const externalHint = externalKey ? `    ${color.dim(externalKey)} external editor` : '';
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} select${externalHint}    ${color.dim(`${glyph.back}/Esc`)} back`);
       repaint(lines);
     };
 
     const cleanup = () => {
-      stdin.removeListener('keypress', onKey);
-      if (stdin.isRaw) stdin.setRawMode(false);
-      stdin.pause();
+      endKeys(stdin, onKey);
       showCursor();
     };
     const done = value => { cleanup(); resolve(value); };
@@ -776,6 +921,7 @@ function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
     const onKey = (str, key) => {
       key = key || {};
       const name = key.name || str;
+      notes.debugLog(`chooseFromList keypress: ${name}`);
       if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
       if (name === 'escape' || name === 'left' || name === 'h') return done(BACK);
       if (name === 'up' || name === 'k' || (key.shift && name === 'tab')) {
@@ -787,12 +933,10 @@ function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
         return render();
       }
       if (name === 'return' || name === 'enter') return done(options[selected].value);
+      if (externalKey && name === externalKey) return done({ pick: options[selected].value, external: true });
     };
 
-    readline.emitKeypressEvents(stdin);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('keypress', onKey);
+    beginKeys(stdin, onKey);
     render();
   });
 }
@@ -812,16 +956,14 @@ function pickProfile(profiles, start = 0) {
       prefetchInspection(profiles[selected].name); // so → usually opens instantly
       const lines = accountLines(profiles, selected, stats);
       lines.push(...hintGrid([
-        [['↑/↓', 'move'], ['→', 'view'], ['r', 'refresh'], ['q', 'quit']],
+        [['↑/↓', 'move'], ['→', 'view'], ['n', 'notes'], ['r', 'refresh'], ['q', 'quit']],
         [['a', 'add'], ['i', 'import'], ['d', 'delete'], ['s', 'sync']],
       ]));
       repaint(lines);
     };
 
     const cleanup = () => {
-      stdin.removeListener('keypress', onKey);
-      if (stdin.isRaw) stdin.setRawMode(false);
-      stdin.pause();
+      endKeys(stdin, onKey);
       showCursor();
     };
 
@@ -833,6 +975,7 @@ function pickProfile(profiles, start = 0) {
     const onKey = (str, key) => {
       key = key || {};
       const name = key.name || str;
+      notes.debugLog(`pickProfile keypress: ${name}`);
       if ((key.ctrl && name === 'c') || name === 'q' || name === 'escape') return finish({ type: 'quit' });
       if (name === 'up' || name === 'k' || (key.shift && name === 'tab')) {
         selected = (selected + profiles.length - 1) % profiles.length;
@@ -844,6 +987,7 @@ function pickProfile(profiles, start = 0) {
       }
       if (name === 'return' || name === 'enter') return finish({ type: 'open', name: profiles[selected].name });
       if (name === 'right' || name === 'l') return finish({ type: 'detail', name: profiles[selected].name });
+      if (name === 'n') return finish({ type: 'notes' });
       if (name === 'a') return finish({ type: 'add' });
       if (name === 'i') return finish({ type: 'import' });
       if (name === 's') return finish({ type: 'sync', name: profiles[selected].name });
@@ -851,10 +995,7 @@ function pickProfile(profiles, start = 0) {
       if (name === 'r') return finish({ type: 'refresh' });
     };
 
-    readline.emitKeypressEvents(stdin);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('keypress', onKey);
+    beginKeys(stdin, onKey);
     render();
   });
 }
@@ -887,7 +1028,7 @@ async function cockpit(args = []) {
           { label: 'Quit', value: 'quit' },
         ],
       });
-      if (pick === BACK || pick === 'quit') { leaveAlt(); return; }
+      if (pick === BACK || pick === 'quit') { leaveAlt(); process.exit(0); }
       if (pick === 'import') {
         subScreen(profiles, 'Import an existing login');
         const name = await promptLine('Profile name [main]: ');
@@ -912,7 +1053,12 @@ async function cockpit(args = []) {
     const action = await pickProfile(profiles, cursor);
     const mark = profiles.findIndex(p => p.name === action.name);
     if (mark >= 0) cursor = mark;
-    if (action.type === 'quit') { leaveAlt(); return; }
+    // Explicit process.exit: since screens now deliberately leave stdin
+    // resumed between transitions (that's the fix for the stdin-wedging
+    // bug), a resumed stream keeps the event loop alive forever — without
+    // this, quitting would just leave the process sitting there doing
+    // nothing instead of actually returning you to the shell.
+    if (action.type === 'quit') { leaveAlt(); process.exit(0); }
     if (action.type === 'refresh') { invalidateInspection(); continue; }
     if (action.type === 'detail') {
       // No intermediate "loading" paint here — that would be a second screen
@@ -928,6 +1074,36 @@ async function cockpit(args = []) {
         at = res.pick;
         await scrollScreen(itemDetail(snap, res.pick, profiles, mark));
       }
+      continue;
+    }
+    if (action.type === 'notes') {
+      notes.debugLog('cli: notes action start');
+      const root = notes.projectRoot(process.cwd());
+      notes.debugLog(`cli: projectRoot resolved to ${root}`);
+      const master = notes.masterPaths();
+      notes.ensureProjectNotes(root);
+      notes.debugLog('cli: ensureProjectNotes returned, opening chooser');
+      const choice = await chooseFromList({
+        profiles,
+        heading: `Notes for ${color.orange(path.basename(root))}`,
+        hint: 'Enter edits it here — e for your $EDITOR instead',
+        options: [
+          { label: 'TODO.md', value: path.join(root, 'TODO.md'), note: 'this project' },
+          { label: 'PLAN.md', value: path.join(root, 'PLAN.md'), note: 'this project' },
+          { label: 'Master TODO.md', value: master.todo, note: 'every project' },
+          { label: 'Master PLAN.md', value: master.plan, note: 'every project' },
+        ],
+        externalKey: 'e',
+      });
+      notes.debugLog(`cli: chooser resolved: ${JSON.stringify(choice)}`);
+      if (choice === BACK) { notes.debugLog('cli: notes action back'); continue; }
+      const file = choice.pick ?? choice;
+      if (choice.external) await openInEditor(file);
+      else await editFile(file, { profiles, title: path.basename(file) });
+      notes.debugLog('cli: editor closed, syncing');
+      const session = notes.createSession(root); // one-shot: reconcile both ways, then stop
+      session.stop();
+      notes.debugLog('cli: notes action done');
       continue;
     }
     if (action.type === 'import') {
@@ -1059,7 +1235,7 @@ function claudeTarget() {
   if (bin) return set({ command: bin, prefix: [], shell: /\.(cmd|bat)$/i.test(bin) });
   if (process.platform !== 'win32') return set({ command: 'claude', prefix: [], shell: false });
 
-  const where = spawnSync('where', ['claude'], { encoding: 'utf8' });
+  const where = spawnSync('where', ['claude'], { encoding: 'utf8', timeout: 3000 });
   const shims = where.status === 0 ? where.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean) : [];
   for (const shim of shims) {
     const dir = path.dirname(shim);
@@ -1082,12 +1258,52 @@ function claudeTarget() {
   return set({ command: 'claude.cmd', prefix: [], shell: true });
 }
 
+// Open a file in the user's editor ($VISUAL / $EDITOR, else notepad/nano) and
+// resolve once it's closed. Handles a multi-word editor command like "code
+// --wait". SIGINT is ignored here the same way it is around a Claude launch,
+// so Ctrl+C inside the editor doesn't take the cockpit down with it.
+function openInEditor(file) {
+  return new Promise(resolve => {
+    resetStdin();
+    const editorCmd = process.env.VISUAL || process.env.EDITOR || (process.platform === 'win32' ? 'notepad' : 'nano');
+    const parts = editorCmd.match(/(?:[^\s"]+|"[^"]*")+/g) || [editorCmd];
+    const strip = s => s.replace(/^"|"$/g, '');
+    const cmd = strip(parts[0]);
+    const cmdArgs = [...parts.slice(1).map(strip), file];
+    const child = spawn(cmd, cmdArgs, { stdio: 'inherit', shell: process.platform === 'win32' });
+    const ignore = () => {};
+    process.on('SIGINT', ignore);
+    process.on('SIGBREAK', ignore);
+    const restore = () => { process.removeListener('SIGINT', ignore); process.removeListener('SIGBREAK', ignore); };
+    child.on('exit', () => { restore(); resolve(); });
+    child.on('error', error => {
+      restore();
+      console.error(color.red(`Could not open editor (${cmd}): ${error.message}`));
+      console.error(color.dim('Set $env:EDITOR to your preferred editor.'));
+      resolve();
+    });
+  });
+}
+
 // Spawn Claude with the profile's isolated config dir.
 // interactive:true resolves when Claude exits (so the cockpit menu can resume);
 // otherwise the process exits with Claude's code.
 function launch(profile, args, { interactive = false } = {}) {
   return new Promise(resolve => {
     resetStdin(); // release stdin so Claude's own prompt gets the keyboard
+
+    // TODO.md / PLAN.md: ensure they exist + are .gitignore'd in whatever
+    // project Claude is about to run in, and keep them mirrored into the
+    // master notes files for as long as this session runs.
+    const projectRoot = notes.projectRoot(process.cwd());
+    const notesSession = notes.createSession(projectRoot);
+    if (notesSession.tracked.length) {
+      console.log(color.dim(
+        `Note: ${notesSession.tracked.join(', ')} already tracked by git — ` +
+        `run 'git rm --cached ${notesSession.tracked.join(' ')}' if you want them untracked.`,
+      ));
+    }
+
     const target = claudeTarget();
     const command = target.command;
     const child = spawn(command, [...target.prefix, ...args], {
@@ -1101,17 +1317,18 @@ function launch(profile, args, { interactive = false } = {}) {
     const ignore = () => {};
     process.on('SIGINT', ignore);
     process.on('SIGBREAK', ignore);
-    const restoreSignals = () => {
+    const cleanup = () => {
       process.removeListener('SIGINT', ignore);
       process.removeListener('SIGBREAK', ignore);
+      notesSession.stop();
     };
     child.on('exit', code => {
-      restoreSignals();
+      cleanup();
       if (interactive) resolve(code ?? 0);
       else process.exit(code ?? 0);
     });
     child.on('error', error => {
-      restoreSignals();
+      cleanup();
       if (error.code === 'ENOENT') {
         console.error(color.red(`Claude CLI not found (${command}). Install Claude Code or set CLAUDE_BIN to its full path.`));
         console.error(color.dim('Example: $env:CLAUDE_BIN = "$env:APPDATA\\npm\\claude.cmd"'));
@@ -1134,6 +1351,20 @@ async function main(argv) {
     if (command === 'add') { const p = createAccount(args[0]); console.log(`Created profile '${p.name}' at ${paths.profileDir(p.name)}`); return; }
     if (command === 'import') return importProfile(args[0], args[1]);
     if (command === 'sync') { const [fromP, toP, what] = args; return syncProfiles(fromP, toP, what || 'all'); }
+    if (command === 'notes') {
+      const dir = args[0] ? path.resolve(args[0]) : process.cwd();
+      const root = notes.projectRoot(dir);
+      const session = notes.createSession(root);
+      session.stop();
+      console.log(`Synced ${color.orange(root)} <-> ${color.dim(notes.masterPaths().todo)}`);
+      if (session.tracked.length) {
+        console.log(color.dim(
+          `Note: ${session.tracked.join(', ')} already tracked by git — ` +
+          `run 'git rm --cached ${session.tracked.join(' ')}' if you want them untracked.`,
+        ));
+      }
+      return;
+    }
     if (command === 'delete' || command === 'rm') {
       const target = getProfile(args[0]);
       if (args[1] !== '--yes' && args[1] !== '-y') throw new Error(`Pass --yes to confirm: claude-cockpit delete ${target.name} --yes`);
@@ -1155,4 +1386,4 @@ async function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2));
 
-module.exports = { profileOverview, itemDetail, syncProfiles, profileInventory, inspect };
+module.exports = { profileOverview, itemDetail, syncProfiles, profileInventory, inspect, editFile, chooseFromList, pickProfile, cockpit };

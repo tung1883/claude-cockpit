@@ -185,6 +185,27 @@ node src/cli.js run work
 
 Set it before starting Claude so the statusline process inherits the theme. Set `NO_COLOR=1` to disable ANSI colors.
 
+## Project notes: TODO.md / PLAN.md
+
+Every project you launch Claude into through `ccpit` (any of `run`/`login`/`ccpit <profile>`/picking an account from the menu) automatically gets:
+
+- a `TODO.md` and `PLAN.md` at the project root (the git top-level if it's a repo, else the directory you ran `ccpit` from) — created once, from an empty skeleton, and never overwritten if they already exist;
+- a `.gitignore` entry for both, added inside a `# ccpit` marker block so re-running never duplicates it. This happens whether or not the directory is a git repo. If either file was already tracked by git, cockpit prints a note to `git rm --cached` it yourself rather than doing that automatically;
+- live, two-way sync with one global master `TODO.md`/`PLAN.md` for as long as that Claude session runs: edit the project's file and it's mirrored into that project's section of the master file; edit the project's section in the master file and it flows back down. Each project gets one section in the master file, keyed by its path (`<!-- ccpit:path=... -->`) so renaming a project's directory doesn't lose the link as long as the path itself is unchanged, and two projects with the same folder name never collide.
+
+Conflict rule is last-write-wins: whichever side changed more recently (tracked by content hash, falling back to file mtime when neither side has prior sync history) overwrites the other. A reconciliation pass also runs once at the start and end of every session, to catch edits made while nothing was watching.
+
+Master files default to `~/.claude-multi-cockpit/TODO.md` and `.../PLAN.md`; point them elsewhere with `CLAUDE_COCKPIT_NOTES_DIR`. Turn the whole feature off with `CLAUDE_COCKPIT_NOTES=0`.
+
+If notes syncing ever seems to hang, set `CLAUDE_COCKPIT_NOTES_DEBUG=1` before reproducing it — every step (git calls, file ensure, reconcile, watch setup/teardown) gets a timestamped line in `~/.claude-multi-cockpit/notes-debug.log`. The last line before it hangs is the call that never returned.
+
+**View/edit from the cockpit menu**: press `n`, pick a file, and `Enter` opens it in cockpit's own small built-in text editor right there in the terminal — no notepad, no external process. Arrow keys to move, type to insert, `Backspace`/`Delete`, `Ctrl+S` to save without leaving, `Esc` to save and exit, `Ctrl+C` to bail without saving. Press `e` instead of `Enter` if you'd rather open it in `$VISUAL`/`$EDITOR` (falls back to `notepad`/`nano`). Either way, closing it triggers an immediate two-way sync before you're back at the menu. Sync from the command line without opening anything: `ccpit notes [dir]`.
+
+```powershell
+$env:CLAUDE_COCKPIT_NOTES_DIR = 'C:\Users\you\notes'
+$env:CLAUDE_COCKPIT_NOTES = '0'   # disable entirely
+```
+
 ## Design boundaries
 
 This project does not mutate Claude’s live credential files and does not automatically bypass usage limits. Automatic rotation can be added above the explicit `handoff` primitive, but it should be used only with accounts the operator owns and in accordance with Anthropic’s terms.
