@@ -15,6 +15,7 @@ pub enum Action {
     Handoff(String),
     Delete(String),
     Refresh,
+    Shell,
 }
 
 /// The main account picker. One blocking `read_key()` call per loop
@@ -33,7 +34,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
         lines.extend(layout::hint_grid(
             &[
                 &[("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("q", "quit")],
-                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff")],
+                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff"), ("g", "shell")],
             ],
             16,
         ));
@@ -89,6 +90,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
             KeyCode::Char('r') => {
                 ui::show_cursor();
                 return Ok(Action::Refresh);
+            }
+            KeyCode::Char('g') => {
+                ui::show_cursor();
+                return Ok(Action::Shell);
             }
             _ => {}
         }

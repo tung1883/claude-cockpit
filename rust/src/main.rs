@@ -263,6 +263,14 @@ fn cockpit() -> Result<()> {
         match action {
             Action::Quit => return Ok(()),
             Action::Refresh => continue,
+            Action::Shell => {
+                let suspend = term.suspend();
+                ui::clear_screen();
+                println!("{} opening a shell here — exit it to return\n", ui::color::dim(ui::glyph::spark()));
+                let cwd = std::env::current_dir()?;
+                launch::open_shell(&cwd)?;
+                drop(suspend);
+            }
             Action::Add => {
                 ui::home_clear();
                 println!("{}\n", ui::banner());

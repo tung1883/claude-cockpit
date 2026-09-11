@@ -105,6 +105,34 @@ pub fn open_in_editor(file: &Path) -> Result<()> {
     }
 }
 
+/// Drops into a real interactive shell in `cwd`, inheriting stdio, and
+/// waits for it to exit. A side channel for things like git that never
+/// touches Claude's process or transcript — the whole point of it existing
+/// separately from Claude's own Bash tool.
+pub fn open_shell(cwd: &Path) -> Result<()> {
+    let mut cmd = if cfg!(windows) {
+        // This platform's primary shell is PowerShell — prefer it over
+        // dropping to cmd.exe when it's actually on PATH.
+        if which::which("pwsh").is_ok() {
+            Command::new("pwsh")
+        } else if which::which("powershell").is_ok() {
+            Command::new("powershell")
+        } else {
+            Command::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()))
+        }
+    } else {
+        Command::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
+    };
+    cmd.current_dir(cwd);
+    match cmd.status() {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            eprintln!("{}", ui::color::red(&format!("Could not launch a shell: {error}")));
+            Ok(())
+        }
+    }
+}
+
 /// Splits "code --wait" into ["code", "--wait"], respecting simple double quotes.
 fn split_command(s: &str) -> Vec<String> {
     let re = Regex::new(r#"[^\s"]+|"[^"]*""#).unwrap(); // matches launch.js's split-on-quoted-words
