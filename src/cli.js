@@ -72,6 +72,7 @@ function installStatusline(name, { quiet = false, onlyIfMissing = false } = {}) 
 function createAccount(name) {
   const profile = addProfile(name);
   try { installStatusline(profile.name, { quiet: true }); } catch { /* best effort */ }
+  invalidateInspection(profile.name);
   return profile;
 }
 
@@ -183,6 +184,7 @@ function importProfile(name, source) {
   // The imported settings.json rarely has our statusline wired up — add it,
   // but leave alone whatever statusline the imported config already had.
   try { installStatusline(profile.name, { quiet: true, onlyIfMissing: true }); } catch { /* best effort */ }
+  invalidateInspection(profile.name);
   console.log(color.green(`Imported '${src}' into profile '${profile.name}'.`));
   console.log(color.dim('Close any running Claude Code first if the copy looks incomplete, then re-run.'));
   console.log(`Launch it with: ${color.orange('ccpit ' + profile.name)}`);
@@ -285,6 +287,32 @@ function accountStat(name) {
     statCache.set(name, { count: sessions.length, age: relativeAge(sessions[0]?.modified) });
   }
   return statCache.get(name);
+}
+
+// The full profile inspection (plugins/skills/sessions scan) is the slow
+// part of opening the detail view — a few hundred ms on a big profile. We
+// pre-build it in the background for whichever row is highlighted, so by the
+// time you press → it's usually already sitting in cache and the view opens
+// instantly. `inFlight` guards against scheduling the same scan twice while
+// the user is still holding an arrow key.
+let inspectionCache = new Map();
+const inFlight = new Set();
+function invalidateInspection(name) {
+  if (name) inspectionCache.delete(name);
+  else inspectionCache = new Map();
+}
+function prefetchInspection(name) {
+  if (inspectionCache.has(name) || inFlight.has(name)) return;
+  inFlight.add(name);
+  setImmediate(() => {
+    try { inspectionCache.set(name, inspect.buildInspection(paths.profileDir(name))); }
+    catch { /* best effort — detail view will retry synchronously */ }
+    finally { inFlight.delete(name); }
+  });
+}
+function getInspection(name) {
+  if (!inspectionCache.has(name)) inspectionCache.set(name, inspect.buildInspection(paths.profileDir(name)));
+  return inspectionCache.get(name);
 }
 
 // Visible width (ANSI escapes don't take columns) and a padder that uses it.
@@ -781,6 +809,7 @@ function pickProfile(profiles, start = 0) {
 
     const render = () => {
       if (firstRender) { hideCursor(); firstRender = false; }
+      prefetchInspection(profiles[selected].name); // so → usually opens instantly
       const lines = accountLines(profiles, selected, stats);
       lines.push(...hintGrid([
         [['↑/↓', 'move'], ['→', 'view'], ['r', 'refresh'], ['q', 'quit']],
@@ -884,10 +913,12 @@ async function cockpit(args = []) {
     const mark = profiles.findIndex(p => p.name === action.name);
     if (mark >= 0) cursor = mark;
     if (action.type === 'quit') { leaveAlt(); return; }
-    if (action.type === 'refresh') continue;
+    if (action.type === 'refresh') { invalidateInspection(); continue; }
     if (action.type === 'detail') {
-      process.stdout.write(`\x1b[H\x1b[0J${color.dim('  reading profile…')}`);
-      const snap = inspect.buildInspection(paths.profileDir(action.name));
+      // No intermediate "loading" paint here — that would be a second screen
+      // swap (picker -> loading -> overview) and read as a flicker. One
+      // blocking build, then scrollScreen paints straight over the picker.
+      const snap = getInspection(action.name);
       let at;
       for (;;) {
         const view = profileOverview(snap, action.name, profiles, mark);
@@ -971,7 +1002,7 @@ async function cockpit(args = []) {
       });
       homeClear();
       if (!Object.keys(spec).length) { console.log(color.dim('Nothing selected.')); await ask('Press Enter...'); continue; }
-      try { syncProfiles(action.name, target, spec); }
+      try { syncProfiles(action.name, target, spec); invalidateInspection(target); }
       catch (error) { console.error(color.red(`Error: ${error.message}`)); }
       await ask('Press Enter to return to the menu...');
       continue;
@@ -984,7 +1015,7 @@ async function cockpit(args = []) {
       const confirm = await promptLine('Type the profile name to confirm: ');
       if (confirm === BACK) continue;
       if (confirm.trim() === action.name) {
-        try { removeProfile(action.name); continue; } // straight back to the menu
+        try { removeProfile(action.name); invalidateInspection(action.name); continue; } // straight back to the menu
         catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
       } else {
         console.log(color.dim('Cancelled.'));
