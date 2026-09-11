@@ -30,9 +30,18 @@ profile. The picker is a loop: when you exit Claude (`/exit`, or Ctrl+C twice)
 you return to the cockpit menu instead of the shell, so switching accounts never
 means retyping the command. Press `q` or `Esc` in the menu to leave entirely.
 
-Navigate with Up/Down (or `k`/`j`), `Enter` to launch, `a` to add an account,
-`i` to import an existing login, `d` to delete the selected profile (type its
-name to confirm), `r` to refresh the session counts, `q`/`Esc` to quit.
+Navigate with Up/Down (or `k`/`j`), `Enter` to launch, `→` to inspect the
+selected account, `a` to add an account, `i` to import an existing login, `d` to
+delete the selected profile (type its name to confirm), `s` to sync, `r` to
+refresh the session counts, `q`/`Esc` to quit.
+
+`→` opens a read-only detail view: account identity (email, plan, org, token
+expiry), activity and storage (startups, session count and size, disk usage),
+and a list of every plugin, skill, and MCP server with its on-disk size and a
+rough token estimate. `Enter` on any of those opens a per-item screen — version,
+install date, commit, markdown/instruction size, contents for a plugin;
+description and files for a skill; type and command for an MCP server. Token
+figures are estimates (instruction bytes ÷ 4), not live tool budgets.
 
 To reuse an account you are already logged into on this machine, import its
 config instead of logging in again — this keeps its sessions, plugins, skills,

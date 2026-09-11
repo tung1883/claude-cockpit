@@ -8,6 +8,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { addProfile, getProfile, listProfiles, removeProfile } = require('./profiles');
 const paths = require('./paths');
 const { copySession } = require('./handoff');
+const inspect = require('./inspect');
 const { color, glyph, clearScreen, homeClear, enterAlt, leaveAlt, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter } = require('./ui');
 
 function usage() {
@@ -305,15 +306,20 @@ function hintGrid(rows, cell = 16) {
 // Returned by promptLine when the user asks to go back (`<-` or Esc).
 const BACK = Symbol('back');
 
-// Scrollable read-only list. `rows` are { text, selectable }. ↑/↓ or k/j move
-// the highlight over selectable rows (scrolling the viewport); ←/Esc/Enter/q exit.
-function scrollScreen({ header, rows, footerHint }) {
+// Scrollable read-only list. `rows` are { text, selectable, value? }. ↑/↓ or
+// k/j move the highlight over selectable rows (scrolling the viewport).
+// Enter/→ on a row that has a `value` resolves { pick: value }; ←/Esc/q resolve
+// null. `footerHint` overrides the default key hint line.
+function scrollScreen({ header, rows, footerHint, start }) {
   return new Promise(resolve => {
     const stdin = process.stdin;
     const repaint = makeRepainter();
     let firstRender = true;
     const selectableIdx = rows.map((r, i) => (r.selectable ? i : -1)).filter(i => i >= 0);
-    let pos = 0; // index into selectableIdx
+    const anyPickable = rows.some(r => r.value !== undefined);
+    // Start on the row whose value matches `start` (so returning from a
+    // sub-screen keeps your place), else the first selectable row.
+    let pos = Math.max(0, selectableIdx.findIndex(i => rows[i].value === start));
     let top = 0; // first visible row
     const viewport = Math.max(5, (process.stdout.rows || 24) - header.length - 5);
 
@@ -335,21 +341,29 @@ function scrollScreen({ header, rows, footerHint }) {
       if (end < rows.length) lines.push(color.dim(`    ↓ ${rows.length - end} more`));
       lines.push('');
       lines.push(rule());
-      lines.push(` ${color.dim('↑/↓')} move    ${color.dim(`${glyph.back}/Esc`)} back`);
-      if (footerHint) lines.push(color.dim(`   ${footerHint}`));
+      const hint = footerHint || ` ${color.dim('↑/↓')} move${anyPickable ? `    ${color.dim('Enter')} open` : ''}    ${color.dim(`${glyph.back}/Esc`)} back`;
+      lines.push(hint);
       repaint(lines);
+    };
+
+    const finish = value => {
+      stdin.removeListener('keypress', onKey);
+      if (stdin.isRaw) stdin.setRawMode(false);
+      stdin.pause();
+      showCursor();
+      resolve(value);
     };
 
     const onKey = (str, key) => {
       key = key || {};
       const name = key.name || str;
       if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
-      if (['escape', 'left', 'h', 'return', 'enter', 'q'].includes(name)) {
-        stdin.removeListener('keypress', onKey);
-        if (stdin.isRaw) stdin.setRawMode(false);
-        stdin.pause();
-        showCursor();
-        return resolve();
+      if (['escape', 'left', 'h', 'q'].includes(name)) return finish(null);
+      if (name === 'return' || name === 'enter' || name === 'right' || name === 'l') {
+        const row = rows[selectableIdx[pos]];
+        if (row && row.value !== undefined) return finish({ pick: row.value });
+        if (!anyPickable) return finish(null);
+        return;
       }
       if (!selectableIdx.length) return;
       if (name === 'up' || name === 'k') { pos = (pos + selectableIdx.length - 1) % selectableIdx.length; return render(); }
@@ -382,6 +396,160 @@ function profileInventory(name) {
     ...Object.keys(settings.mcpServers || {}),
   ])].sort();
   return { plugins, skills, mcp };
+}
+
+function termWidth() {
+  return Math.min(process.stdout.columns || 80, 100);
+}
+
+// Shorten a plain string to `max` visible chars, keeping both ends (best for
+// file paths — the tail says which plugin/version it is).
+function clipMid(text, max) {
+  const s = String(text);
+  if (s.length <= max || max < 8) return s;
+  const keep = max - 1;
+  return s.slice(0, Math.ceil(keep / 2)) + '…' + s.slice(s.length - Math.floor(keep / 2));
+}
+
+// A two-column "key   value" line, key dimmed, aligned to `w`.
+function kv(key, value, w = 14) {
+  return `    ${color.dim(padTo(key, w))}${value}`;
+}
+
+// Break a path/command into terminal-width chunks, preferring a break right
+// after a path separator so each piece still reads like a path fragment.
+function wrapHard(text, width) {
+  const s = String(text);
+  if (s.length <= width) return [s];
+  const parts = [];
+  let rest = s;
+  while (rest.length > width) {
+    const window = rest.slice(0, width);
+    const sep = Math.max(window.lastIndexOf('\\'), window.lastIndexOf('/'));
+    const cut = sep > width * 0.4 ? sep + 1 : width;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest) parts.push(rest);
+  return parts;
+}
+
+// Dimmed value wrapped onto continuation lines (indented under the value
+// column) instead of being cut off — for paths / long commands.
+function kvWrap(key, text, w = 14) {
+  const indent = ' '.repeat(4 + w);
+  const parts = wrapHard(text, termWidth() - 4 - w);
+  return parts.map((part, i) => (i === 0 ? kv(key, color.dim(part), w) : `${indent}${color.dim(part)}`));
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const shortId = id => id.replace('@claude-plugins-official', '@official');
+
+// Overview screen for a profile: account, activity/storage, then a pickable
+// list of plugins / skills / MCP servers (Enter opens per-item detail).
+// `snap` is a cached inspect.buildInspection() result — no filesystem work here.
+function profileOverview(snap, name, profiles, mark) {
+  const { account: acc, activity: act, plugins, skills, mcps } = snap;
+
+  const header = accountLines(profiles, mark);
+  header.push(`${color.orange(glyph.back)} ${color.orange(name)}  ${color.dim('— details')}`);
+  header.push('');
+
+  const rows = [];
+  const head = title => rows.push({ text: `  ${color.orangeBold(title)}`, selectable: false });
+  const line = text => rows.push({ text, selectable: false });
+  const gap = () => rows.push({ text: '', selectable: false });
+
+  head('Account');
+  line(kv('email', `${acc.email}${acc.name ? color.dim(`  (${acc.name})`) : ''}`));
+  line(kv('plan', acc.plan));
+  line(kv('org', acc.org));
+  line(kv('rate tier', acc.rateTier));
+  line(kv('created', `${acc.created}${acc.subCreated !== '—' ? color.dim(`  · sub ${acc.subCreated}`) : ''}`));
+  line(kv('token', `expires ${acc.tokenExpiry}`));
+  gap();
+  head('Activity');
+  line(kv('startups', `${act.startups}${act.firstStart !== '—' ? color.dim(`  · first ${act.firstStart}`) : ''}`));
+  line(kv('projects', String(act.projects)));
+  line(kv('sessions', `${act.sessionCount}  ${color.dim(`${inspect.humanBytes(act.sessionBytes)} · last ${relativeAge(act.lastActive ? new Date(act.lastActive) : null)}`)}`));
+  line(kv('history', inspect.humanBytes(act.historyBytes)));
+  line(kv('disk total', inspect.humanBytes(act.totalBytes)));
+  gap();
+
+  const section = (title, items, render, kind) => {
+    head(`${title} ${color.dim(`(${items.length})`)}`);
+    if (!items.length) { line(`    ${color.dim('none')}`); gap(); return; }
+    items.forEach((item, i) => rows.push({ text: `  ${render(item)}`, selectable: true, value: `${kind}:${i}` }));
+    gap();
+  };
+  section('Plugins', plugins, p =>
+    `${padTo(shortId(p.id) + (p.enabled ? '' : ' (off)'), 32)}${color.dim(`${padTo(inspect.humanBytes(p.size.bytes), 9)}${p.size.mdBytes ? inspect.estTokens(p.size.mdBytes) : ''}`)}`, 'plugin');
+  section('Skills', skills, s =>
+    `${padTo(s.name, 32)}${color.dim(`${padTo(inspect.humanBytes(s.bytes), 9)}${inspect.estTokens(s.mdBytes || s.bytes)}`)}`, 'skill');
+  section('MCP servers', mcps, m => `${padTo(m.name, 24)}${color.dim(m.type)}`, 'mcp');
+
+  return { header, rows };
+}
+
+// Per-item detail screen. `pick` is "kind:index" from profileOverview rows.
+function itemDetail(snap, pick, profiles, mark) {
+  const [kind, idxRaw] = pick.split(':');
+  const idx = Number(idxRaw);
+  const header = accountLines(profiles, mark);
+  const rows = [];
+  const line = text => rows.push({ text, selectable: false });
+
+  if (kind === 'plugin') {
+    const p = snap.plugins[idx];
+    header.push(`${color.orange(glyph.back)} ${color.orange(clipMid(p.id, termWidth() - 12))}  ${color.dim('— plugin')}`);
+    header.push('');
+    line(kv('marketplace', p.marketplace));
+    line(kv('version', p.version));
+    line(kv('enabled', p.enabled ? color.green('yes') : color.dim('no')));
+    line(kv('scope', p.scope));
+    line(kv('installed', p.installedAt));
+    line(kv('updated', p.lastUpdated));
+    line(kv('commit', p.sha));
+    line(kv('size', p.size.bytes ? `${inspect.humanBytes(p.size.bytes)}  ${color.dim(plural(p.size.files, 'file'))}` : color.dim('not on disk')));
+    if (p.size.mdBytes) line(kv('instructions', `${inspect.humanBytes(p.size.mdBytes)} of markdown  ${color.dim(`${inspect.estTokens(p.size.mdBytes)} if all loaded`)}`));
+    if (p.contents) line(kv('contents', `${plural(p.contents.skills, 'skill')} · ${plural(p.contents.commands, 'command')} · ${plural(p.contents.agents, 'agent')}`));
+    line('');
+    for (const l of kvWrap('path', p.path.replace(os.homedir(), '~'))) line(l);
+  } else if (kind === 'skill') {
+    const s = snap.skills[idx];
+    header.push(`${color.orange(glyph.back)} ${color.orange(s.name)}  ${color.dim('— skill')}`);
+    header.push('');
+    line(kv('size', `${inspect.humanBytes(s.bytes)}  ${color.dim(plural(s.fileCount, 'file'))}`));
+    line(kv('tokens', `${inspect.estTokens(s.mdBytes || s.bytes)}  ${color.dim('(SKILL.md loads on trigger; the rest on demand)')}`));
+    line(kv('files', s.files.join(', ') || '—'));
+    line('');
+    line(`  ${color.dim('description')}`);
+    for (const chunk of wrapText(s.description || '—', 72)) line(`    ${chunk}`);
+  } else {
+    const m = snap.mcps[idx];
+    header.push(`${color.orange(glyph.back)} ${color.orange(m.name)}  ${color.dim('— MCP server')}`);
+    header.push('');
+    line(kv('type', m.type));
+    for (const l of kvWrap('command', m.command)) line(l);
+    for (const l of kvWrap('url', m.url)) line(l);
+    line(kv('env', m.envKeys.length ? `${m.envKeys.join(', ')}  ${color.dim('(values hidden)')}` : '—'));
+    line('');
+    line(`  ${color.dim('Token cost is decided at runtime by the tool definitions this')}`);
+    line(`  ${color.dim('server returns — it cannot be measured from disk.')}`);
+  }
+  return { header, rows, footerHint: ` ${color.dim(`${glyph.back}/Esc/Enter`)} back` };
+}
+
+function wrapText(text, width) {
+  const words = String(text).split(/\s+/);
+  const lines = [];
+  let cur = '';
+  for (const word of words) {
+    if ((cur + ' ' + word).trim().length > width) { if (cur) lines.push(cur); cur = word; }
+    else cur = (cur ? `${cur} ` : '') + word;
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : ['—'];
 }
 
 // Repaint the persistent account list, then a feature heading with a back hint.
@@ -701,21 +869,17 @@ async function cockpit(args = []) {
     if (action.type === 'quit') { leaveAlt(); return; }
     if (action.type === 'refresh') continue;
     if (action.type === 'detail') {
-      const inv = profileInventory(action.name);
-      const header = accountLines(profiles, mark);
-      header.push(`${color.orange(glyph.back)} ${color.orange(action.name)}  ${color.dim('—  plugins · skills · MCP')}`);
-      header.push('');
-      const rows = [];
-      const section = (title, items) => {
-        rows.push({ text: `  ${color.orangeBold(title)} ${color.dim(`(${items.length})`)}`, selectable: false });
-        if (!items.length) rows.push({ text: `    ${color.dim('none')}`, selectable: false });
-        else for (const item of items) rows.push({ text: `  ${item}`, selectable: true });
-        rows.push({ text: '', selectable: false });
-      };
-      section('Plugins', inv.plugins);
-      section('Skills', inv.skills);
-      section('MCP servers', inv.mcp);
-      await scrollScreen({ header, rows });
+      process.stdout.write(`\x1b[H\x1b[0J${color.dim('  reading profile…')}`);
+      const snap = inspect.buildInspection(paths.profileDir(action.name));
+      let at;
+      for (;;) {
+        const view = profileOverview(snap, action.name, profiles, mark);
+        view.start = at;
+        const res = await scrollScreen(view);
+        if (!res) break;
+        at = res.pick;
+        await scrollScreen(itemDetail(snap, res.pick, profiles, mark));
+      }
       continue;
     }
     if (action.type === 'import') {
@@ -939,4 +1103,6 @@ async function main(argv) {
   } catch (error) { leaveAlt(); console.error(color.red(`Error: ${error.message}`)); process.exitCode = 1; }
 }
 
-main(process.argv.slice(2));
+if (require.main === module) main(process.argv.slice(2));
+
+module.exports = { profileOverview, itemDetail, syncProfiles, profileInventory, inspect };
