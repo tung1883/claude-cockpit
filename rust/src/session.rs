@@ -47,6 +47,28 @@ pub struct SessionGroup {
     pub sessions: Vec<SessionFile>,
 }
 
+/// Just the `cwd` (or workspace.current_dir), stopping as soon as it's
+/// found — cwd is set on essentially the first line of a transcript, but
+/// `session_details` can't stop there since it also needs the *last*
+/// recap/prompt in the file, forcing a full read. Grouping only needs the
+/// folder, so this is the cheap path: on a profile with hundreds of
+/// sessions, that full-file scan per session is what made the sessions
+/// view slow to open.
+fn session_cwd(path: &std::path::Path) -> String {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else { return String::new() };
+    for line in BufReader::new(file).lines().map_while(Result::ok).take(20) {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if let Some(p) = entry.get("cwd").and_then(|v| v.as_str()).or_else(|| entry.get("workspace").and_then(|w| w.get("current_dir")).and_then(|v| v.as_str())) {
+            return p.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Sessions grouped by project folder, each group's sessions newest-first.
 /// Groups themselves come out ordered by their own most recent session:
 /// `session_files` already returns newest-first, so a folder's position the
@@ -56,7 +78,7 @@ pub fn grouped_sessions(profile: &str) -> Vec<SessionGroup> {
     let mut order: Vec<String> = Vec::new();
     let mut map: std::collections::HashMap<String, Vec<SessionFile>> = std::collections::HashMap::new();
     for f in session_files(profile) {
-        let raw = session_details(&f).project_path;
+        let raw = session_cwd(&f.file);
         let folder = if raw.is_empty() { "(unknown project)".to_string() } else { raw.replace('\\', "/") };
         map.entry(folder.clone()).or_insert_with(|| { order.push(folder.clone()); Vec::new() }).push(f);
     }
