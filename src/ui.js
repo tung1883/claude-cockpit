@@ -45,8 +45,26 @@ function resetStdin() {
   if (enabled) process.stdout.write('\x1b[0m\x1b[?25h');
 }
 
+// Alternate screen buffer: a fixed-size page with no scrollback and no
+// scrolling, so every repaint (home + overwrite + erase-below) is stable and
+// never makes the terminal scroll or flash. Enter once on start, leave on exit
+// and before handing the terminal to Claude.
+let inAlt = false;
+function enterAlt() {
+  if (enabled && !inAlt) { process.stdout.write('\x1b[?1049h\x1b[H'); inAlt = true; }
+}
+function leaveAlt() {
+  if (enabled && inAlt) { process.stdout.write('\x1b[?25h\x1b[?1049l'); inAlt = false; }
+}
+process.on('exit', leaveAlt);
+
+// Hard wipe — use only for a real reset (startup, returning from Claude).
 function clearScreen() {
   if (enabled) process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+}
+// Soft reset for switching between cockpit screens: home + erase below, no flash.
+function homeClear() {
+  if (enabled) process.stdout.write('\x1b[H\x1b[0J');
 }
 function hideCursor() {
   if (enabled) process.stdout.write('\x1b[?25l');
@@ -59,27 +77,26 @@ function banner() {
   return `${color.orangeBold(glyph.spark)} ${color.bold('Claude Cockpit')}`;
 }
 
-function rule(width = 44) {
-  return color.gray('─'.repeat(width));
+function rule(width) {
+  const cols = width || Math.min(process.stdout.columns || 80, 100);
+  return color.gray('─'.repeat(Math.max(8, cols)));
 }
 
-// Repaint a block of lines in place — moves the cursor up over the previous
-// block and overwrites each line instead of clearing the whole screen, so
-// navigation does not flicker. Pass the same line count every call.
+// Repaint a block of lines anchored to the top of the screen: home the cursor,
+// overwrite each line, then erase anything below. No full-screen wipe, so there
+// is no flash — not between keystrokes and not between screens. Every cockpit
+// screen paints from row 1, so switching screens just overwrites in place.
 function makeRepainter() {
-  let painted = 0;
   return lines => {
     if (!enabled) { process.stdout.write(lines.join('\n') + '\n'); return; }
-    let out = '';
-    if (painted) out += `\x1b[${painted}A`;
-    for (const line of lines) out += `\r\x1b[K${line}\n`;
-    // clear any leftover lines from a taller previous paint
-    for (let i = lines.length; i < painted; i++) out += '\r\x1b[K\n';
-    process.stdout.write(out);
-    painted = Math.max(lines.length, painted);
+    // Home, clear+write each line, join with CR+LF, then erase below. No
+    // trailing newline — a newline on the last row scrolls the page and the
+    // next paint lands one row higher: that one-row jitter is the "flicker".
+    const body = lines.map(line => `\x1b[2K${line}`).join('\r\n');
+    process.stdout.write(`\x1b[H${body}\x1b[0J`);
   };
 }
 
 module.exports = {
-  enabled, color, glyph, clearScreen, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter,
+  enabled, color, glyph, clearScreen, homeClear, enterAlt, leaveAlt, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter,
 };

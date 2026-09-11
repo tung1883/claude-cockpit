@@ -8,7 +8,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { addProfile, getProfile, listProfiles, removeProfile } = require('./profiles');
 const paths = require('./paths');
 const { copySession } = require('./handoff');
-const { color, glyph, clearScreen, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter } = require('./ui');
+const { color, glyph, clearScreen, homeClear, enterAlt, leaveAlt, hideCursor, showCursor, resetStdin, banner, rule, makeRepainter } = require('./ui');
 
 function usage() {
   const c = color;
@@ -81,49 +81,68 @@ function copyDir(src, dst) {
 }
 
 // Copy plugins / skills / MCP servers from one profile into another.
-// `what` is 'plugins' | 'skills' | 'mcp' | 'all'.
-function syncProfiles(fromName, toName, what = 'all') {
+// `spec` may be:
+//   'all'                        every kind, every item
+//   'plugins' | 'skills' | 'mcp' that whole kind
+//   ['skills', 'mcp']            those whole kinds
+//   { plugins: 'all', skills: ['a', 'b'], mcp: [...] }  per-item selection
+function syncProfiles(fromName, toName, spec) {
   const from = getProfile(fromName);
   const to = getProfile(toName);
   if (from.name === to.name) throw new Error('Source and target are the same profile.');
+
   const valid = ['plugins', 'skills', 'mcp'];
-  const want = Array.isArray(what) ? what : what === 'all' ? valid : [what];
-  if (!want.length) throw new Error('Nothing selected to sync.');
-  if (!want.every(w => valid.includes(w))) throw new Error('what must be one of: plugins, skills, mcp, all');
+  if (typeof spec === 'string') {
+    spec = spec === 'all' ? { plugins: 'all', skills: 'all', mcp: 'all' } : { [spec]: 'all' };
+  } else if (Array.isArray(spec)) {
+    spec = Object.fromEntries(spec.map(kind => [kind, 'all']));
+  }
+  spec = spec || {};
+  if (!valid.some(kind => spec[kind])) throw new Error('Nothing selected to sync.');
+
+  const inv = profileInventory(from.name);
   const src = paths.profileDir(from.name);
   const dst = paths.profileDir(to.name);
   const srcSettings = path.join(src, 'settings.json');
   const dstSettings = path.join(dst, 'settings.json');
+  const pick = (sel, available) => (sel === 'all' ? available : available.filter(x => sel.includes(x)));
 
-  if (want.includes('plugins')) {
+  if (spec.plugins) {
+    const ids = pick(spec.plugins, inv.plugins);
     copyDir(path.join(src, 'plugins'), path.join(dst, 'plugins'));
     const s = readJson(srcSettings);
     const d = readJson(dstSettings);
-    d.enabledPlugins = { ...d.enabledPlugins, ...s.enabledPlugins };
+    d.enabledPlugins = d.enabledPlugins || {};
+    for (const id of ids) d.enabledPlugins[id] = (s.enabledPlugins || {})[id] ?? true;
     d.extraKnownMarketplaces = { ...d.extraKnownMarketplaces, ...s.extraKnownMarketplaces };
     writeJson(dstSettings, d);
-    console.log(color.green(`Synced plugins ${from.name} -> ${to.name}`));
+    console.log(color.green(`Synced ${ids.length} plugin${ids.length === 1 ? '' : 's'}`));
   }
 
-  if (want.includes('skills')) {
-    const copied = copyDir(path.join(src, 'skills'), path.join(dst, 'skills'));
-    console.log(color.green(`Synced skills ${from.name} -> ${to.name}${copied ? '' : ' (none found)'}`));
+  if (spec.skills) {
+    const names = pick(spec.skills, inv.skills);
+    let n = 0;
+    for (const name of names) {
+      if (copyDir(path.join(src, 'skills', name), path.join(dst, 'skills', name))) n++;
+    }
+    console.log(color.green(`Synced ${n} skill${n === 1 ? '' : 's'}`));
   }
 
-  if (want.includes('mcp')) {
+  if (spec.mcp) {
+    const names = pick(spec.mcp, inv.mcp);
     const sc = readJson(path.join(src, '.claude.json'));
     const dc = readJson(path.join(dst, '.claude.json'));
-    dc.mcpServers = { ...dc.mcpServers, ...sc.mcpServers };
-    writeJson(path.join(dst, '.claude.json'), dc);
     const s = readJson(srcSettings);
     const d = readJson(dstSettings);
-    d.mcpServers = { ...d.mcpServers, ...s.mcpServers };
-    if (s.enabledMcpjsonServers) {
-      d.enabledMcpjsonServers = [...new Set([...(d.enabledMcpjsonServers || []), ...s.enabledMcpjsonServers])];
+    dc.mcpServers = dc.mcpServers || {};
+    d.mcpServers = d.mcpServers || {};
+    for (const name of names) {
+      if ((sc.mcpServers || {})[name]) dc.mcpServers[name] = sc.mcpServers[name];
+      if ((s.mcpServers || {})[name]) d.mcpServers[name] = s.mcpServers[name];
     }
+    writeJson(path.join(dst, '.claude.json'), dc);
     writeJson(dstSettings, d);
-    const count = Object.keys({ ...sc.mcpServers, ...s.mcpServers }).length;
-    console.log(color.green(`Synced ${count} MCP server${count === 1 ? '' : 's'} ${from.name} -> ${to.name}`));
+    console.log(color.green(`Synced ${names.length} MCP server${names.length === 1 ? '' : 's'}`));
   }
   console.log(color.dim('Restart Claude Code in the target profile to pick these up.'));
 }
@@ -237,26 +256,39 @@ function showSessions(name) {
   }
 }
 
+// Session counts require walking each profile's projects tree. accountLines is
+// rebuilt on every keystroke, so cache the result and only rescan when the
+// cockpit loop clears it (a new menu iteration or an explicit refresh).
+let statCache = new Map();
+function invalidateStats() { statCache = new Map(); }
 function accountStat(name) {
-  const sessions = sessionFiles(name);
-  return { count: sessions.length, age: relativeAge(sessions[0]?.modified) };
+  if (!statCache.has(name)) {
+    const sessions = sessionFiles(name);
+    statCache.set(name, { count: sessions.length, age: relativeAge(sessions[0]?.modified) });
+  }
+  return statCache.get(name);
 }
+
+// Visible width (ANSI escapes don't take columns) and a padder that uses it.
+const visLen = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+const padTo = (s, width) => s + ' '.repeat(Math.max(0, width - visLen(s)));
 
 // The account list. Shown at all times — in the picker and above every sub-prompt.
 function accountLines(profiles, selected = -1, stats = null) {
   const lines = [banner(), ''];
   if (profiles.length) {
-    lines.push(color.dim('  Each account is an isolated Claude Code login.'), '');
+    lines.push(color.dim(' Each account is an isolated Claude Code login.'), '');
   }
+  const nameWidth = Math.min(24, Math.max(12, ...profiles.map(p => p.name.length)) + 2);
   profiles.forEach((profile, index) => {
     const active = index === selected;
     const marker = active ? color.orange(glyph.pointer) : ' ';
     const name = active ? color.orangeBold(profile.name) : profile.name;
-    const pad = ' '.repeat(Math.max(0, 18 - profile.name.length));
     const st = stats ? stats[index] : accountStat(profile.name);
     lines.push(
-      ` ${marker} ${name}${pad} ` +
-      `${color.dim(String(st.count).padStart(3) + ' sessions')}   ${color.dim(st.age)}`,
+      ` ${marker} ${padTo(name, nameWidth)}` +
+      `${color.dim(padTo(`${String(st.count).padStart(3)} sessions`, 14))}` +
+      `${color.dim(st.age)}`,
     );
   });
   lines.push('');
@@ -264,19 +296,50 @@ function accountLines(profiles, selected = -1, stats = null) {
   return lines;
 }
 
+// Two rows of key hints laid out on an aligned grid.
+function hintGrid(rows, cell = 16) {
+  return rows.map(cells =>
+    ' ' + cells.map(c => padTo(`${color.dim(c[0])} ${c[1]}`, cell)).join('').replace(/\s+$/, ''));
+}
+
 // Returned by promptLine when the user asks to go back (`<-` or Esc).
 const BACK = Symbol('back');
 
-// Read-only key wait: shows `lines`, returns on ←/Esc/Enter/q.
-function pauseScreen(lines) {
+// Scrollable read-only list. `rows` are { text, selectable }. ↑/↓ or k/j move
+// the highlight over selectable rows (scrolling the viewport); ←/Esc/Enter/q exit.
+function scrollScreen({ header, rows, footerHint }) {
   return new Promise(resolve => {
-    clearScreen();
-    hideCursor();
-    process.stdout.write(lines.join('\n') + '\n');
     const stdin = process.stdin;
-    readline.emitKeypressEvents(stdin);
-    if (stdin.isTTY) stdin.setRawMode(true);
-    stdin.resume();
+    const repaint = makeRepainter();
+    let firstRender = true;
+    const selectableIdx = rows.map((r, i) => (r.selectable ? i : -1)).filter(i => i >= 0);
+    let pos = 0; // index into selectableIdx
+    let top = 0; // first visible row
+    const viewport = Math.max(5, (process.stdout.rows || 24) - header.length - 5);
+
+    const render = () => {
+      if (firstRender) { hideCursor(); firstRender = false; }
+      const active = selectableIdx[pos] ?? -1;
+      if (active >= 0 && active < top) top = active;
+      if (active >= top + viewport) top = active - viewport + 1;
+      top = Math.max(0, Math.min(top, Math.max(0, rows.length - viewport)));
+      const lines = [...header];
+      const end = Math.min(rows.length, top + viewport);
+      if (top > 0) lines.push(color.dim(`    ↑ ${top} more`));
+      for (let i = top; i < end; i++) {
+        const row = rows[i];
+        if (!row.selectable) { lines.push(row.text); continue; }
+        const on = i === active;
+        lines.push(` ${on ? color.orange(glyph.pointer) : ' '} ${on ? color.orangeBold(row.text) : row.text}`);
+      }
+      if (end < rows.length) lines.push(color.dim(`    ↓ ${rows.length - end} more`));
+      lines.push('');
+      lines.push(rule());
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim(`${glyph.back}/Esc`)} back`);
+      if (footerHint) lines.push(color.dim(`   ${footerHint}`));
+      repaint(lines);
+    };
+
     const onKey = (str, key) => {
       key = key || {};
       const name = key.name || str;
@@ -286,10 +349,20 @@ function pauseScreen(lines) {
         if (stdin.isRaw) stdin.setRawMode(false);
         stdin.pause();
         showCursor();
-        resolve();
+        return resolve();
       }
+      if (!selectableIdx.length) return;
+      if (name === 'up' || name === 'k') { pos = (pos + selectableIdx.length - 1) % selectableIdx.length; return render(); }
+      if (name === 'down' || name === 'j') { pos = (pos + 1) % selectableIdx.length; return render(); }
+      if (name === 'pageup') { pos = Math.max(0, pos - 5); return render(); }
+      if (name === 'pagedown') { pos = Math.min(selectableIdx.length - 1, pos + 5); return render(); }
     };
+
+    readline.emitKeypressEvents(stdin);
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
     stdin.on('keypress', onKey);
+    render();
   });
 }
 
@@ -313,12 +386,11 @@ function profileInventory(name) {
 
 // Repaint the persistent account list, then a feature heading with a back hint.
 function subScreen(profiles, heading, mark = -1) {
-  clearScreen();
   const lines = accountLines(profiles, mark);
   lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
   lines.push(color.dim(`   press ${glyph.back} or Esc to go back`));
   lines.push('');
-  process.stdout.write(lines.join('\n') + '\n');
+  process.stdout.write(`\x1b[H${lines.join('\n')}\n\x1b[0J`);
 }
 
 // A line prompt that resolves to BACK on ←/Esc (or an empty Enter after typing nothing).
@@ -354,39 +426,64 @@ function promptLine(question) {
   });
 }
 
-// Arrow-key checklist. Toggle rows with Enter/Space, then move to the "→ Go"
-// row and press Enter to confirm. Resolves to an array of the checked values,
-// or BACK on ←/Esc. `options` may pre-set `checked: true`.
-function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = -1 }) {
+// Arrow-key checklist. ↑/↓ move, Space/Enter toggle a row, move to "→ Go" and
+// Enter to confirm. An option with `items: [...]` is drillable: → opens a
+// sub-checklist for its individual items.
+// Resolves to:
+//   BACK
+//   { go: true, checked, sub, selected }   sub[i] = null (all) | string[] (subset)
+//   { drill: i, checked, sub, selected }   caller opens the sub-list for row i
+function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = -1, state }) {
   return new Promise(resolve => {
     const stdin = process.stdin;
-    const checked = options.map(o => Boolean(o.checked));
-    let selected = 0;
-    const rows = options.length + 1; // + the Go row
+    const checked = state?.checked ? state.checked.slice() : options.map(o => Boolean(o.checked));
+    const sub = state?.sub ? state.sub.slice() : options.map(() => null);
+    let selected = state?.selected ?? 0;
+    const rows = options.length + 1;
     const repaint = makeRepainter();
     let firstRender = true;
+    let top = 0;
+    const viewport = Math.max(4, (process.stdout.rows || 24) - (profiles.length ? profiles.length + 6 : 4) - 8);
+
+    const snapshot = () => ({ checked: checked.slice(), sub: sub.slice(), selected });
+
+    const rowNote = (opt, i) => {
+      if (opt.items && Array.isArray(sub[i])) return `${sub[i].length} of ${opt.items.length}`;
+      if (opt.items && checked[i]) return `all ${opt.items.length}`;
+      return opt.note || '';
+    };
 
     const render = () => {
-      if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
+      if (firstRender) { hideCursor(); firstRender = false; }
+      if (selected < top) top = selected;
+      if (selected >= top + viewport) top = selected - viewport + 1;
+      top = Math.max(0, Math.min(top, Math.max(0, options.length - viewport)));
       const lines = accountLines(profiles, mark);
       lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
       if (hint) lines.push(color.dim(`   ${hint}`));
       lines.push('');
-      options.forEach((opt, index) => {
-        const active = index === selected;
+      const end = Math.min(options.length, top + viewport);
+      if (top > 0) lines.push(color.dim(`    ↑ ${top} more`));
+      for (let i = top; i < end; i++) {
+        const opt = options[i];
+        const active = i === selected;
         const marker = active ? color.orange(glyph.pointer) : ' ';
-        const box = checked[index] ? color.orange('[x]') : color.dim('[ ]');
+        const box = checked[i] ? color.orange('[x]') : color.dim('[ ]');
         const label = active ? color.orangeBold(opt.label) : opt.label;
-        lines.push(` ${marker} ${box} ${label}${opt.note ? `   ${color.dim(opt.note)}` : ''}`);
-      });
+        const arrow = opt.items && opt.items.length ? color.dim(' →') : '';
+        const note = rowNote(opt, i);
+        lines.push(` ${marker} ${box} ${label}${arrow}${note ? `   ${color.dim(note)}` : ''}`);
+      }
+      if (end < options.length) lines.push(color.dim(`    ↓ ${options.length - end} more`));
       lines.push('');
       const goActive = selected === options.length;
       const count = checked.filter(Boolean).length;
-      const go = `${color.orange(glyph.pointer + ' →')} ${goActive ? color.orangeBold(goLabel) : goLabel}`;
+      const go = `${color.orange(`${glyph.pointer} →`)} ${goActive ? color.orangeBold(goLabel) : goLabel}`;
       lines.push(` ${goActive ? go : `   ${color.dim('→')} ${goLabel}`}   ${color.dim(`${count} selected`)}`);
       lines.push('');
       lines.push(rule());
-      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Space')} toggle    ${color.dim('Enter')} toggle / go    ${color.dim(`${glyph.back}/Esc`)} back`);
+      const drillHint = options.some(o => o.items && o.items.length) ? `    ${color.dim('→')} choose items` : '';
+      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Space')} toggle    ${color.dim('Enter')} toggle / go${drillHint}    ${color.dim(`${glyph.back}/Esc`)} back`);
       repaint(lines);
     };
 
@@ -403,21 +500,18 @@ function chooseMulti({ profiles, heading, hint, options, goLabel = 'Go', mark = 
       const name = key.name || str;
       if (key.ctrl && name === 'c') { showCursor(); process.exit(130); }
       if (name === 'escape' || name === 'left' || name === 'h') return done(BACK);
-      if (name === 'up' || name === 'k' || (key.shift && name === 'tab')) {
-        selected = (selected + rows - 1) % rows;
-        return render();
-      }
-      if (name === 'down' || name === 'j' || name === 'tab') {
-        selected = (selected + 1) % rows;
-        return render();
-      }
+      if (name === 'up' || name === 'k') { selected = (selected + rows - 1) % rows; return render(); }
+      if (name === 'down' || name === 'j' || name === 'tab') { selected = (selected + 1) % rows; return render(); }
       const onGo = selected === options.length;
+      if ((name === 'right' || name === 'l') && !onGo && options[selected].items && options[selected].items.length) {
+        return done({ drill: selected, ...snapshot() });
+      }
       if (name === 'space' || str === ' ') {
         if (!onGo) { checked[selected] = !checked[selected]; render(); }
         return;
       }
       if (name === 'return' || name === 'enter') {
-        if (onGo) return done(options.filter((_, i) => checked[i]).map(o => o.value));
+        if (onGo) return done({ go: true, ...snapshot() });
         checked[selected] = !checked[selected];
         return render();
       }
@@ -441,7 +535,7 @@ function chooseFromList({ profiles, heading, hint, options, mark = -1 }) {
     let firstRender = true;
 
     const render = () => {
-      if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
+      if (firstRender) { hideCursor(); firstRender = false; }
       const lines = accountLines(profiles, mark);
       lines.push(`${color.orange(glyph.back)} ${color.bold(heading)}`);
       if (hint) lines.push(color.dim(`   ${hint}`));
@@ -501,10 +595,12 @@ function pickProfile(profiles, start = 0) {
     let firstRender = true;
 
     const render = () => {
-      if (firstRender) { clearScreen(); hideCursor(); firstRender = false; }
+      if (firstRender) { hideCursor(); firstRender = false; }
       const lines = accountLines(profiles, selected, stats);
-      lines.push(` ${color.dim('↑/↓')} move    ${color.dim('Enter')} launch    ${color.dim('→')} view plugins/skills/mcp    ${color.dim('r')} refresh    ${color.dim('q')} quit`);
-      lines.push(` ${color.dim('a')} add    ${color.dim('i')} import    ${color.dim('s')} sync    ${color.dim('d')} delete`);
+      lines.push(...hintGrid([
+        [['↑/↓', 'move'], ['→', 'view'], ['r', 'refresh'], ['q', 'quit']],
+        [['a', 'add'], ['i', 'import'], ['d', 'delete'], ['s', 'sync']],
+      ]));
       repaint(lines);
     };
 
@@ -561,8 +657,10 @@ async function cockpit(args = []) {
   if (args[0]) return launch(args[0], args.slice(1));           // `claude-cockpit <profile> [args]`
   if (!process.stdin.isTTY || !process.stdout.isTTY) return dashboard();
 
+  enterAlt(); // fixed page: screens repaint in place, terminal never scrolls
   let cursor = 0; // remembered account row, so sub-screens return you to it
   for (;;) {
+    invalidateStats(); // rescan session counts once per menu visit, not per keypress
     let profiles = listProfiles();
     if (!profiles.length) {
       const pick = await chooseFromList({
@@ -575,7 +673,7 @@ async function cockpit(args = []) {
           { label: 'Quit', value: 'quit' },
         ],
       });
-      if (pick === BACK || pick === 'quit') { clearScreen(); return; }
+      if (pick === BACK || pick === 'quit') { leaveAlt(); return; }
       if (pick === 'import') {
         subScreen(profiles, 'Import an existing login');
         const name = await promptLine('Profile name [main]: ');
@@ -600,25 +698,24 @@ async function cockpit(args = []) {
     const action = await pickProfile(profiles, cursor);
     const mark = profiles.findIndex(p => p.name === action.name);
     if (mark >= 0) cursor = mark;
-    if (action.type === 'quit') { clearScreen(); return; }
+    if (action.type === 'quit') { leaveAlt(); return; }
     if (action.type === 'refresh') continue;
     if (action.type === 'detail') {
       const inv = profileInventory(action.name);
-      const lines = accountLines(profiles, mark);
-      lines.push(`${color.orange(glyph.back)} ${color.bold(`'${action.name}'  —  plugins · skills · MCP`)}`);
-      lines.push('');
+      const header = accountLines(profiles, mark);
+      header.push(`${color.orange(glyph.back)} ${color.orange(action.name)}  ${color.dim('—  plugins · skills · MCP')}`);
+      header.push('');
+      const rows = [];
       const section = (title, items) => {
-        lines.push(`  ${color.orangeBold(title)} ${color.dim(`(${items.length})`)}`);
-        if (!items.length) lines.push(`    ${color.dim('none')}`);
-        else for (const item of items) lines.push(`    ${color.dim(glyph.dot)} ${item}`);
-        lines.push('');
+        rows.push({ text: `  ${color.orangeBold(title)} ${color.dim(`(${items.length})`)}`, selectable: false });
+        if (!items.length) rows.push({ text: `    ${color.dim('none')}`, selectable: false });
+        else for (const item of items) rows.push({ text: `  ${item}`, selectable: true });
+        rows.push({ text: '', selectable: false });
       };
       section('Plugins', inv.plugins);
       section('Skills', inv.skills);
       section('MCP servers', inv.mcp);
-      lines.push(rule());
-      lines.push(` ${color.dim(`${glyph.back} / Esc / Enter`)} back`);
-      await pauseScreen(lines);
+      await scrollScreen({ header, rows });
       continue;
     }
     if (action.type === 'import') {
@@ -635,7 +732,7 @@ async function cockpit(args = []) {
     if (action.type === 'sync') {
       const others = profiles.filter(p => p.name !== action.name);
       if (!others.length) {
-        subScreen(profiles, `Sync from '${action.name}'`, mark);
+        subScreen(profiles, `Sync from ${color.orange(action.name)}`, mark);
         console.log(color.dim('Need a second profile to sync into.'));
         await ask('Press Enter...');
         continue;
@@ -643,34 +740,63 @@ async function cockpit(args = []) {
       const target = await chooseFromList({
         profiles,
         mark,
-        heading: `Sync plugins / skills / MCP from '${action.name}' into…`,
+        heading: `Sync plugins / skills / MCP from ${color.orange(action.name)} into…`,
         hint: 'choose the target account',
         options: others.map(p => ({
           label: p.name, value: p.name, note: `${accountStat(p.name).count} sessions`,
         })),
       });
       if (target === BACK) continue;
-      const what = await chooseMulti({
-        profiles,
-        mark,
-        heading: `Sync  '${action.name}'  ${glyph.pointer}  '${target}'`,
-        hint: 'tick what to copy, then → Go',
-        options: [
-          { label: 'Plugins', value: 'plugins', note: 'installed plugins + marketplaces', checked: true },
-          { label: 'Skills', value: 'skills', note: 'personal skills', checked: true },
-          { label: 'MCP servers', value: 'mcp', note: '.claude.json + settings.json', checked: true },
-        ],
+
+      const inv = profileInventory(action.name);
+      const cats = [
+        { label: 'Plugins', value: 'plugins', items: inv.plugins, note: `${inv.plugins.length} available`, checked: inv.plugins.length > 0 },
+        { label: 'Skills', value: 'skills', items: inv.skills, note: `${inv.skills.length} available`, checked: inv.skills.length > 0 },
+        { label: 'MCP servers', value: 'mcp', items: inv.mcp, note: `${inv.mcp.length} available`, checked: inv.mcp.length > 0 },
+      ];
+      let st;
+      let result;
+      for (;;) {
+        const res = await chooseMulti({
+          profiles,
+          mark,
+          heading: `Sync  ${color.orange(action.name)}  ${glyph.pointer}  ${color.orange(target)}`,
+          hint: 'Space to tick a kind · → to pick individual items · then → Go',
+          options: cats,
+          state: st,
+        });
+        if (res === BACK) { result = BACK; break; }
+        st = res;
+        if (res.go) { result = res; break; }
+        const cat = cats[res.drill];
+        const pre = Array.isArray(res.sub[res.drill]) ? res.sub[res.drill] : cat.items;
+        const subRes = await chooseMulti({
+          profiles,
+          mark,
+          heading: `${cat.label}  —  copy which into ${color.orange(target)}?`,
+          hint: 'Space to tick · → Go when done',
+          options: cat.items.map(name => ({ label: name, value: name, checked: pre.includes(name) })),
+        });
+        if (subRes !== BACK && subRes.go) {
+          const picks = cat.items.filter((_, i) => subRes.checked[i]);
+          st.sub[res.drill] = picks.length === cat.items.length ? null : picks;
+          st.checked[res.drill] = picks.length > 0;
+        }
+      }
+      if (result === BACK) continue;
+      const spec = {};
+      cats.forEach((cat, i) => {
+        if (result.checked[i]) spec[cat.value] = Array.isArray(result.sub[i]) ? result.sub[i] : 'all';
       });
-      if (what === BACK) continue;
-      clearScreen();
-      if (!what.length) { console.log(color.dim('Nothing selected.')); await ask('Press Enter...'); continue; }
-      try { syncProfiles(action.name, target, what); }
+      homeClear();
+      if (!Object.keys(spec).length) { console.log(color.dim('Nothing selected.')); await ask('Press Enter...'); continue; }
+      try { syncProfiles(action.name, target, spec); }
       catch (error) { console.error(color.red(`Error: ${error.message}`)); }
       await ask('Press Enter to return to the menu...');
       continue;
     }
     if (action.type === 'delete') {
-      subScreen(profiles, `Delete profile '${action.name}'`, mark);
+      subScreen(profiles, `Delete profile ${color.orange(action.name)}`, mark);
       console.log(color.red(`Everything under ${paths.profileDir(action.name)} will be removed.`));
       console.log(color.dim('That account\'s login, sessions, plugins, and settings. Cannot be undone.'));
       console.log('');
@@ -691,16 +817,18 @@ async function cockpit(args = []) {
       if (name === BACK || !name.trim()) continue;
       try {
         const profile = addProfile(name.trim());
+        leaveAlt();
         console.log(color.green(`Created '${profile.name}'. Launching Claude — run /login inside it.`));
         await launch(profile.name, [], { interactive: true });
-      } catch (error) { console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
+        enterAlt();
+      } catch (error) { enterAlt(); console.error(color.red(`Error: ${error.message}`)); await ask('Press Enter...'); }
       continue;
     }
     if (action.type === 'open') {
-      clearScreen();
-      process.stdout.write(`${color.dim(`${glyph.spark} launching Claude as '${action.name}' — exit Claude to return here`)}\n\n${color.reset}`);
+      leaveAlt(); // give Claude the real terminal (its own alt screen, scrollback)
+      process.stdout.write(`${color.dim(`${glyph.spark} launching Claude as `)}${color.orange(action.name)}${color.dim(' — exit Claude to return here')}\n\n${color.reset}`);
       await launch(action.name, [], { interactive: true });
-      // fall through: loop repaints the menu
+      enterAlt();
     }
   }
 }
@@ -808,7 +936,7 @@ async function main(argv) {
     // Unknown first arg is treated as a profile name: `claude-cockpit work`
     getProfile(command);
     return await cockpit([command, ...args]);
-  } catch (error) { console.error(color.red(`Error: ${error.message}`)); process.exitCode = 1; }
+  } catch (error) { leaveAlt(); console.error(color.red(`Error: ${error.message}`)); process.exitCode = 1; }
 }
 
 main(process.argv.slice(2));

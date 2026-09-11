@@ -61,12 +61,14 @@ ccpit sync main work            # copy plugins + skills + MCP servers
 ccpit sync main work plugins    # just one of: plugins | skills | mcp | all
 ```
 
-It copies the `plugins/` and `skills/` directories and merges the relevant
-`settings.json` keys (`enabledPlugins`, `extraKnownMarketplaces`, `mcpServers`,
-`enabledMcpjsonServers`) plus `.claude.json` `mcpServers` into the target. It is
-additive — nothing in the target is removed. Restart Claude Code in the target
-profile afterward. Run it again whenever you add a plugin or MCP server you want
-everywhere.
+In the menu, `s` on a profile opens the sync flow: pick the target account, then
+tick which kinds to copy. Press `→` on a kind to open its individual items
+(specific plugins / skills / MCP servers) and pick a subset; `→ Go` runs it.
+
+It is additive — nothing in the target is removed. Plugin enablement is merged
+into `settings.json` (`enabledPlugins`, `extraKnownMarketplaces`), skills are
+copied per-directory, MCP servers are merged by name into `settings.json` and
+`.claude.json`. Restart Claude Code in the target profile afterward.
 
 ### Do profiles share anything?
 
