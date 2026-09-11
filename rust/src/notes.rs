@@ -240,6 +240,20 @@ pub fn get_section_body(content: &str, key: &str) -> Option<String> {
     find_sections(content).into_iter().find(|s| s.key == key).map(|s| s.body)
 }
 
+/// Every project that has ever synced notes, from the master TODO/PLAN
+/// section markers (`<!-- ccpit:path=... -->`) — used to list every other
+/// project's notes alongside the current one, not just it.
+pub fn known_project_roots() -> Vec<PathBuf> {
+    let (master_todo, master_plan) = master_paths();
+    let mut set: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for path in [master_todo, master_plan] {
+        for section in find_sections(&read_safe(&path)) {
+            set.insert(PathBuf::from(section.key));
+        }
+    }
+    set.into_iter().collect()
+}
+
 pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> String {
     let block = format!("---------- {name} ------------\n<!-- ccpit:path={key} -->\n{}\n", body.trim());
     let sections = find_sections(content);

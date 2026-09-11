@@ -370,8 +370,8 @@ fn cockpit() -> Result<()> {
                 let mut at: Option<String> = None;
                 loop {
                     let (header, rows) = detail::profile_overview(&snap, &name, &profiles, m, &groups);
-                    let res = picker::scroll_screen(&header, &rows, at.as_deref())?;
-                    let Some(pick) = res else { break };
+                    let res = picker::scroll_screen(&header, &rows, at.as_deref(), None)?;
+                    let picker::ListChoice::Picked(pick) = res else { break };
                     at = Some(pick.clone());
 
                     if let Some(idx_str) = pick.strip_prefix("folder:") {
@@ -394,13 +394,13 @@ fn cockpit() -> Result<()> {
                             opts.into_iter().map(|(label, value, note)| picker::ListOption { label, value, note: Some(note) }).collect();
                         if let picker::ListChoice::Picked(v) = picker::choose_from_list(&profiles, m, heading, None, &options, None)? {
                             let (h2, r2) = detail::item_detail(&snap, &v, &profiles, m);
-                            picker::scroll_screen(&h2, &r2, None)?;
+                            picker::scroll_screen(&h2, &r2, None, None)?;
                         }
                         continue;
                     }
 
                     let (h2, r2) = detail::item_detail(&snap, &pick, &profiles, m);
-                    picker::scroll_screen(&h2, &r2, None)?;
+                    picker::scroll_screen(&h2, &r2, None, None)?;
                 }
             }
             Action::Notes => {
@@ -409,38 +409,64 @@ fn cockpit() -> Result<()> {
                 notes::ensure_project_notes(&root);
                 let (master_todo, master_plan) = notes::master_paths();
                 let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let options = [
-                    picker::ListOption { label: "TODO.md".into(), value: root.join("TODO.md").to_string_lossy().to_string(), note: Some("this project".into()) },
-                    picker::ListOption { label: "PLAN.md".into(), value: root.join("PLAN.md").to_string_lossy().to_string(), note: Some("this project".into()) },
-                    picker::ListOption { label: "Master TODO.md".into(), value: master_todo.to_string_lossy().to_string(), note: Some("every project".into()) },
-                    picker::ListOption { label: "Master PLAN.md".into(), value: master_plan.to_string_lossy().to_string(), note: Some("every project".into()) },
-                ];
-                let heading = format!("Notes for {}", ui::color::orange(&name));
-                let choice = picker::choose_from_list(
-                    &profiles,
-                    mark.map(|m| m as i64).unwrap_or(-1),
-                    &heading,
-                    Some("Enter edits it here — e for your $EDITOR instead"),
-                    &options,
-                    Some('e'),
-                )?;
-                match choice {
-                    picker::ListChoice::Back => {}
+                let m = mark.map(|m| m as i64).unwrap_or(-1);
+
+                // One screen, every project — grouped under a heading each
+                // rather than a flat "<project> — TODO.md" list, or a
+                // project-then-file drill-down.
+                let mut others: Vec<PathBuf> = notes::known_project_roots().into_iter().filter(|p| p != &root).collect();
+                others.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_string().to_lowercase()).unwrap_or_default());
+
+                let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+                let mut header = layout::account_lines(&profiles, m, &stats);
+                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Notes")));
+                header.push(ui::color::dim("   Enter edits it here"));
+                header.push(String::new());
+
+                let mut rows: Vec<picker::ScrollRow> = Vec::new();
+                let group = |rows: &mut Vec<picker::ScrollRow>, label: &str, todo: &std::path::Path, plan: &std::path::Path| {
+                    rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(label))));
+                    rows.push(picker::ScrollRow::pick("    TODO.md", todo.to_string_lossy().to_string()));
+                    rows.push(picker::ScrollRow::pick("    PLAN.md", plan.to_string_lossy().to_string()));
+                    rows.push(picker::ScrollRow::line(String::new()));
+                };
+                group(&mut rows, &format!("{name} (this project)"), &root.join("TODO.md"), &root.join("PLAN.md"));
+                group(&mut rows, "Master (every project)", &master_todo, &master_plan);
+                for other in &others {
+                    let oname = other.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    group(&mut rows, &oname, &other.join("TODO.md"), &other.join("PLAN.md"));
+                }
+
+                let choice = picker::scroll_screen(&header, &rows, None, Some('e'))?;
+                let file = match choice {
+                    picker::ListChoice::Back => continue,
                     picker::ListChoice::External(file) => {
+                        let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                            root.clone()
+                        } else {
+                            std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                        };
+                        notes::ensure_project_notes(&target_root);
                         let suspend = term.suspend();
                         launch::open_in_editor(std::path::Path::new(&file))?;
                         drop(suspend);
-                        let session = notes::Session::start(&root);
+                        let session = notes::Session::start(&target_root);
                         session.stop();
+                        continue;
                     }
-                    picker::ListChoice::Picked(file) => {
-                        let path = std::path::PathBuf::from(&file);
-                        let title = path.file_name().map(|n| n.to_string_lossy().to_string());
-                        editor::edit_file(&path, &profiles, mark.map(|m| m as i64).unwrap_or(-1), title.as_deref())?;
-                        let session = notes::Session::start(&root);
-                        session.stop();
-                    }
-                }
+                    picker::ListChoice::Picked(file) => file,
+                };
+                let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                    root.clone()
+                } else {
+                    std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                };
+                notes::ensure_project_notes(&target_root);
+                let path = std::path::PathBuf::from(&file);
+                let title = path.file_name().map(|n| n.to_string_lossy().to_string());
+                editor::edit_file(&path, &profiles, m, title.as_deref())?;
+                let session = notes::Session::start(&target_root);
+                session.stop();
             }
             Action::Import => {
                 ui::home_clear();

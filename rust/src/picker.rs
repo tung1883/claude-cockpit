@@ -234,10 +234,11 @@ impl ScrollRow {
 }
 
 /// Scrollable read-only list. ↑/↓ move the highlight over selectable rows
-/// (scrolling the viewport); Enter on a row with a value returns it; ←/Esc/q
-/// back out (None). `start` re-opens on the row whose value matches it, so
-/// returning from a sub-screen keeps your place.
-pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>) -> std::io::Result<Option<String>> {
+/// (scrolling the viewport); Enter on a row with a value picks it; ←/Esc/q
+/// back out. `start` re-opens on the row whose value matches it, so
+/// returning from a sub-screen keeps your place. If `external_key` is set,
+/// pressing it on a valued row resolves `ListChoice::External` instead.
+pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>, external_key: Option<char>) -> std::io::Result<ListChoice> {
     let selectable_idx: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
     let any_pickable = rows.iter().any(|r| r.value.is_some());
     let mut pos = start
@@ -247,11 +248,26 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>)
     let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(header.len() + 5).max(5);
     ui::hide_cursor();
 
+    // Which group header (if any) each selectable row belongs to, so
+    // scrolling back up to a group's *later* rows (not just its first)
+    // still surfaces its header instead of leaving it cut off above the
+    // viewport. A header is any non-selectable row with non-empty text; an
+    // empty non-selectable row (a blank spacer) ends the group.
+    let mut owner: Vec<Option<usize>> = vec![None; rows.len()];
+    let mut current_header: Option<usize> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if row.selectable {
+            owner[i] = current_header;
+        } else {
+            current_header = if row.text.trim().is_empty() { None } else { Some(i) };
+        }
+    }
+
     loop {
         let active = selectable_idx.get(pos).copied();
         if let Some(active) = active {
             if active < top {
-                top = active;
+                top = owner[active].unwrap_or(active);
             }
             if active >= top + viewport {
                 top = active - viewport + 1;
@@ -261,8 +277,14 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>)
 
         let mut lines = header.to_vec();
         let end = (top + viewport).min(rows.len());
-        if top > 0 {
-            lines.push(ui::color::dim(&format!("    ↑ {top} more")));
+        // Counts of *selectable* rows above/below the viewport — rows.len()
+        // includes header/blank spacer lines too, which made "N more" count
+        // rows nobody can actually scroll to (e.g. a lone trailing blank
+        // line inflating it past the one real row left).
+        let above = selectable_idx.iter().filter(|&&i| i < top).count();
+        let below = selectable_idx.iter().filter(|&&i| i >= end).count();
+        if above > 0 {
+            lines.push(ui::color::dim(&format!("    ↑ {above} more")));
         }
         for (i, row) in rows.iter().enumerate().take(end).skip(top) {
             if !row.selectable {
@@ -274,13 +296,14 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>)
             let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
             lines.push(format!(" {marker} {text}"));
         }
-        if end < rows.len() {
-            lines.push(ui::color::dim(&format!("    ↓ {} more", rows.len() - end)));
+        if below > 0 {
+            lines.push(ui::color::dim(&format!("    ↓ {below} more")));
         }
         lines.push(String::new());
         lines.push(ui::rule(None));
         let open_hint = if any_pickable { format!("    {} open", ui::color::dim("Enter")) } else { String::new() };
-        lines.push(format!(" {} move{open_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
+        let ext_hint = external_key.map(|k| format!("    {} external editor", ui::color::dim(&k.to_string()))).unwrap_or_default();
+        lines.push(format!(" {} move{open_hint}{ext_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -291,19 +314,23 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>)
         match key.code {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                 ui::show_cursor();
-                return Ok(None);
+                return Ok(ListChoice::Back);
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(i) = active {
                     if let Some(v) = &rows[i].value {
                         ui::show_cursor();
-                        return Ok(Some(v.clone()));
+                        return Ok(ListChoice::Picked(v.clone()));
                     }
                 }
                 if !any_pickable {
                     ui::show_cursor();
-                    return Ok(None);
+                    return Ok(ListChoice::Back);
                 }
+            }
+            KeyCode::Char(c) if external_key == Some(c) && active.is_some() && rows[active.unwrap()].value.is_some() => {
+                ui::show_cursor();
+                return Ok(ListChoice::External(rows[active.unwrap()].value.clone().unwrap()));
             }
             KeyCode::Up | KeyCode::Char('k') if !selectable_idx.is_empty() => {
                 pos = (pos + selectable_idx.len() - 1) % selectable_idx.len();
