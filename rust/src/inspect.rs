@@ -210,11 +210,29 @@ pub struct PluginInfo {
     pub last_updated: String,
     pub sha: String,
     pub path: String,
-    pub bytes: u64,
-    pub files: u64,
-    pub md_bytes: u64,
-    pub contents: Option<PluginContents>,
     pub enabled: bool,
+}
+
+/// Lazy: skills/commands/agents counts for one plugin, computed only when
+/// its detail screen is actually opened (see `plugin_info`'s comment).
+pub fn plugin_contents(p: &PluginInfo) -> Option<PluginContents> {
+    if p.path.is_empty() || p.path == "—" {
+        return None;
+    }
+    let dir = Path::new(&p.path);
+    Some(PluginContents { skills: count_kind(dir, "skills"), commands: count_kind(dir, "commands"), agents: count_kind(dir, "agents") })
+}
+
+/// Lazy: (bytes, files, md_bytes) for one plugin's install directory — a
+/// full tree walk, so only worth doing for a plugin row that's actually
+/// being rendered (the overview shows at most 5 at once) rather than every
+/// installed plugin just to open the screen.
+pub fn plugin_size(p: &PluginInfo) -> (u64, u64, u64) {
+    if p.path.is_empty() || p.path == "—" {
+        return (0, 0, 0);
+    }
+    let size = scan_tree(Path::new(&p.path));
+    (size.bytes, size.files, size.md_bytes)
 }
 
 pub fn plugin_info(profile_dir: &Path) -> Vec<PluginInfo> {
@@ -228,22 +246,12 @@ pub fn plugin_info(profile_dir: &Path) -> Vec<PluginInfo> {
     ids.into_iter()
         .map(|id| {
             let meta = plugins.get(&id).and_then(|v| v.as_array()).and_then(|a| a.first()).cloned().unwrap_or(Value::Null);
+            // No tree walk here at all — bytes/files/md_bytes start at 0 and
+            // are filled in lazily (see `plugin_size`) only for the plugin
+            // rows actually rendered, same reasoning as `plugin_contents`
+            // below: JSON metadata is cheap for every plugin, a disk scan
+            // isn't, so only pay for it where it's actually displayed.
             let install_path = s(&meta, "installPath");
-            let (bytes, files, md_bytes, contents) = if !install_path.is_empty() && Path::new(&install_path).exists() {
-                let size = scan_tree(Path::new(&install_path));
-                (
-                    size.bytes,
-                    size.files,
-                    size.md_bytes,
-                    Some(PluginContents {
-                        skills: count_kind(Path::new(&install_path), "skills"),
-                        commands: count_kind(Path::new(&install_path), "commands"),
-                        agents: count_kind(Path::new(&install_path), "agents"),
-                    }),
-                )
-            } else {
-                (0, 0, 0, None)
-            };
             let sha = s(&meta, "gitCommitSha");
             PluginInfo {
                 marketplace: id.split('@').nth(1).unwrap_or("—").to_string(),
@@ -253,10 +261,6 @@ pub fn plugin_info(profile_dir: &Path) -> Vec<PluginInfo> {
                 last_updated: fmt_date(meta.get("lastUpdated").and_then(|v| v.as_str())),
                 sha: if sha.is_empty() { "—".to_string() } else { sha.chars().take(12).collect() },
                 path: if install_path.is_empty() { "—".to_string() } else { install_path },
-                bytes,
-                files,
-                md_bytes,
-                contents,
                 enabled: enabled_map.get(&id).and_then(|v| v.as_bool()).unwrap_or(true),
                 id,
             }
@@ -353,7 +357,11 @@ pub fn build_inspection(profile_dir: &Path) -> Inspection {
     let plugins = plugin_info(profile_dir);
     let skills = skill_info(profile_dir);
     let mcps = mcp_info(profile_dir);
-    let extra_bytes: u64 = plugins.iter().map(|p| p.bytes).sum::<u64>() + skills.iter().map(|s| s.bytes).sum::<u64>();
+    // Plugin sizes are no longer scanned here (see plugin_info's comment —
+    // that's the tree walk that made opening this screen slow), so "disk
+    // total" below only reflects skills now, not plugins. A visible
+    // undercount, traded deliberately for the overview opening instantly.
+    let extra_bytes: u64 = skills.iter().map(|s| s.bytes).sum::<u64>();
     Inspection { account: account_info(profile_dir), activity: activity_info(profile_dir, extra_bytes), plugins, skills, mcps }
 }
 

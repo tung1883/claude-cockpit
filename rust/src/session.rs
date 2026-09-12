@@ -141,10 +141,36 @@ fn session_cwd(path: &std::path::Path) -> String {
 /// first time it's seen while scanning *is* that order — no separate sort
 /// needed.
 pub fn grouped_sessions(profile: &str) -> Vec<SessionGroup> {
+    let files = session_files(profile);
+
+    // `session_cwd` is cheap per call but this is still one file open+read
+    // per session — with a couple hundred sessions that serially adds up to
+    // real, visible latency. The reads are independent, so spread them
+    // across a small worker pool; grouping itself stays single-threaded and
+    // order-preserving, using the results once every read is back.
+    let mut cwds: Vec<String> = vec![String::new(); files.len()];
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let chunk_size = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let base = chunk_idx * chunk_size;
+                scope.spawn(move || (base, chunk.iter().map(|f| session_cwd(&f.file)).collect::<Vec<_>>()))
+            })
+            .collect();
+        for h in handles {
+            let (base, results) = h.join().unwrap();
+            for (i, r) in results.into_iter().enumerate() {
+                cwds[base + i] = r;
+            }
+        }
+    });
+
     let mut order: Vec<String> = Vec::new();
     let mut map: std::collections::HashMap<String, Vec<SessionFile>> = std::collections::HashMap::new();
-    for f in session_files(profile) {
-        let raw = session_cwd(&f.file);
+    for (f, raw) in files.into_iter().zip(cwds) {
         let folder = if raw.is_empty() { "(unknown project)".to_string() } else { raw.replace('\\', "/") };
         map.entry(folder.clone()).or_insert_with(|| { order.push(folder.clone()); Vec::new() }).push(f);
     }

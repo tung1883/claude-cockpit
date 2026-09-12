@@ -93,6 +93,11 @@ fn write_raw(s: &str) {
 pub fn clear_screen() {
     write_raw("\x1b[2J\x1b[3J\x1b[H");
 }
+
+/// Sets the terminal window/tab title via the standard OSC 0 sequence.
+pub fn set_title(title: &str) {
+    write_raw(&format!("\x1b]0;{title}\x07"));
+}
 /// Soft reset for switching between cockpit screens: home + erase below, no flash.
 pub fn home_clear() {
     write_raw("\x1b[H\x1b[0J");
@@ -139,6 +144,7 @@ impl Terminal {
         if enabled() {
             terminal::enable_raw_mode()?;
             write_raw("\x1b[?1049h\x1b[H");
+            set_title("Claude Cockpit");
         }
         Ok(Terminal { in_alt: enabled() })
     }
@@ -174,6 +180,7 @@ impl Drop for SuspendGuard {
         if self.was_in_alt {
             let _ = terminal::enable_raw_mode();
             write_raw("\x1b[?1049h\x1b[H");
+            set_title("Claude Cockpit");
         }
     }
 }

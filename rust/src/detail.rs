@@ -162,9 +162,10 @@ pub fn plugin_options(snap: &Inspection) -> Vec<(String, String, String)> {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let tok = if p.md_bytes > 0 { format!("  {}", inspect::est_tokens(p.md_bytes)) } else { String::new() };
+            let (bytes, _, md_bytes) = inspect::plugin_size(p);
+            let tok = if md_bytes > 0 { format!("  {}", inspect::est_tokens(md_bytes)) } else { String::new() };
             let status = if p.enabled { "enabled" } else { "disabled" };
-            (short_id(&p.id), format!("plugin:{i}"), format!("{}{tok}  ·  {status}", inspect::human_bytes(p.bytes as f64)))
+            (short_id(&p.id), format!("plugin:{i}"), format!("{}{tok}  ·  {status}", inspect::human_bytes(bytes as f64)))
         })
         .collect()
 }
@@ -227,9 +228,10 @@ pub fn profile_overview(snap: &Inspection, name: &str, profiles: &[Profile], mar
 
     rows.extend(capped_section("Plugins", snap.plugins.len(), "plugin-more", |i| {
         let p = &snap.plugins[i];
+        let (bytes, _, md_bytes) = inspect::plugin_size(p);
         let label = short_id(&p.id);
-        let tok = if p.md_bytes > 0 { inspect::est_tokens(p.md_bytes) } else { String::new() };
-        let size_tok = pad_to(&format!("{}{tok}", pad_to(&inspect::human_bytes(p.bytes as f64), 9)), 20);
+        let tok = if md_bytes > 0 { inspect::est_tokens(md_bytes) } else { String::new() };
+        let size_tok = pad_to(&format!("{}{tok}", pad_to(&inspect::human_bytes(bytes as f64), 9)), 20);
         let status = if p.enabled { color::green("enabled") } else { color::red("disabled") };
         let text = format!("{}{}{}", pad_to(&label, 32), color::dim(&size_tok), status);
         (format!("plugin:{i}"), text)
@@ -277,20 +279,21 @@ pub fn item_detail(snap: &Inspection, pick: &str, profiles: &[Profile], mark: i6
             rows.push(ScrollRow::line(kv("installed", &p.installed_at, 14)));
             rows.push(ScrollRow::line(kv("updated", &p.last_updated, 14)));
             rows.push(ScrollRow::line(kv("commit", &p.sha, 14)));
-            let size_val = if p.bytes > 0 {
-                format!("{}  {}", inspect::human_bytes(p.bytes as f64), color::dim(&plural(p.files as usize, "file")))
+            let (bytes, files, md_bytes) = inspect::plugin_size(p);
+            let size_val = if bytes > 0 {
+                format!("{}  {}", inspect::human_bytes(bytes as f64), color::dim(&plural(files as usize, "file")))
             } else {
                 color::dim("not on disk")
             };
             rows.push(ScrollRow::line(kv("size", &size_val, 14)));
-            if p.md_bytes > 0 {
+            if md_bytes > 0 {
                 rows.push(ScrollRow::line(kv(
                     "instructions",
-                    &format!("{} of markdown  {}", inspect::human_bytes(p.md_bytes as f64), color::dim(&format!("{} if all loaded", inspect::est_tokens(p.md_bytes)))),
+                    &format!("{} of markdown  {}", inspect::human_bytes(md_bytes as f64), color::dim(&format!("{} if all loaded", inspect::est_tokens(md_bytes)))),
                     14,
                 )));
             }
-            if let Some(c) = &p.contents {
+            if let Some(c) = inspect::plugin_contents(p) {
                 rows.push(ScrollRow::line(kv(
                     "contents",
                     &format!("{} · {} · {}", plural(c.skills, "skill"), plural(c.commands, "command"), plural(c.agents, "agent")),

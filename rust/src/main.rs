@@ -295,12 +295,37 @@ fn open_all_folders(term: &mut ui::Terminal, profiles: &[profiles::Profile], mar
     Ok(())
 }
 
+/// Detail-view data (plugin/skill/MCP scan + session grouping) keyed by
+/// profile name, filled in by a background thread started at cockpit
+/// startup so it's usually already sitting there by the time you press →
+/// instead of scanning on demand. `Action::Detail` below still falls back
+/// to computing it synchronously if you get there before the prefetch does
+/// for that profile — never a regression, just usually a head start.
+type DetailCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (inspect::Inspection, Vec<session::SessionGroup>)>>>;
+
+fn prefetch_detail_cache(profiles: &[profiles::Profile]) -> DetailCache {
+    let cache: DetailCache = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let bg_cache = cache.clone();
+    std::thread::spawn(move || {
+        for name in names {
+            let snap = inspect::build_inspection(&paths::profile_dir(&name));
+            let groups = session::grouped_sessions(&name);
+            if let Ok(mut c) = bg_cache.lock() {
+                c.insert(name, (snap, groups));
+            }
+        }
+    });
+    cache
+}
+
 fn cockpit() -> Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return dashboard();
     }
     let mut term = ui::Terminal::enter()?;
     let mut cursor: usize = 0;
+    let detail_cache = prefetch_detail_cache(&profiles::list_profiles().unwrap_or_default());
 
     loop {
         let profiles = profiles::list_profiles()?;
@@ -479,8 +504,11 @@ fn cockpit() -> Result<()> {
                 }
             }
             Action::Detail(name) => {
-                let snap = inspect::build_inspection(&paths::profile_dir(&name));
-                let groups = session::grouped_sessions(&name);
+                let (snap, groups) = detail_cache
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| c.remove(&name))
+                    .unwrap_or_else(|| (inspect::build_inspection(&paths::profile_dir(&name)), session::grouped_sessions(&name)));
                 let m = mark.map(|m| m as i64).unwrap_or(-1);
                 let mut at: Option<String> = None;
                 loop {
