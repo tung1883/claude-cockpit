@@ -5,11 +5,13 @@ mod inspect;
 mod launch;
 mod notes;
 mod layout;
+mod panels;
 mod paths;
 mod picker;
 mod profiles;
 mod quota;
 mod session;
+mod settings;
 mod statusline;
 mod sync;
 mod handoff;
@@ -378,6 +380,10 @@ fn cockpit() -> Result<()> {
     let mut term = ui::Terminal::enter()?;
     let mut cursor: usize = 0;
     let detail_cache = prefetch_detail_cache(&profiles::list_profiles().unwrap_or_default());
+    // A session detached with Ctrl+B keeps running in the background; it lives
+    // here so the cockpit can offer to resume it. Dropped (killing its panes)
+    // when the cockpit exits.
+    let mut session: Option<panels::Session> = None;
 
     loop {
         let profiles = profiles::list_profiles()?;
@@ -400,11 +406,15 @@ fn cockpit() -> Result<()> {
         }
 
         cursor = cursor.min(profiles.len() - 1);
-        let action = picker::pick_profile(&profiles, cursor)?;
+        let action = picker::pick_profile(&profiles, cursor, session.is_some())?;
         let mark = match &action {
-            Action::Open(n) | Action::Detail(n) | Action::Sync(n) | Action::Handoff(n) | Action::Delete(n) | Action::Memory(n) => {
-                profiles.iter().position(|p| &p.name == n)
-            }
+            Action::Open(n)
+            | Action::Detail(n)
+            | Action::Sync(n)
+            | Action::Handoff(n)
+            | Action::Delete(n)
+            | Action::Memory(n)
+            | Action::Settings(n) => profiles.iter().position(|p| &p.name == n),
             _ => None,
         };
         if let Some(m) = mark {
@@ -414,6 +424,9 @@ fn cockpit() -> Result<()> {
         match action {
             Action::Quit => return Ok(()),
             Action::Refresh => continue,
+            Action::Settings(_) => {
+                picker::settings_menu(&profiles, cursor as i64)?;
+            }
             Action::Shell => {
                 let suspend = term.suspend();
                 ui::clear_screen();
@@ -421,6 +434,33 @@ fn cockpit() -> Result<()> {
                 let cwd = std::env::current_dir()?;
                 launch::open_shell(&cwd)?;
                 drop(suspend);
+            }
+            Action::Panels(name) => {
+                // Unlike Shell/external-editor, cockpit stays the terminal
+                // owner here (its own raw mode + alt screen already active)
+                // — panels.rs draws the PTYs into it directly rather than
+                // handing the console away, so no term.suspend(). A Ctrl+B
+                // detach hands back a live Session we hold onto.
+                match panels::run_split(&profiles, &name) {
+                    Ok(s) => session = s,
+                    Err(e) => {
+                        ui::home_clear();
+                        eprintln!("{}", ui::color::red(&format!("Split view error: {e}")));
+                        picker::prompt_line("Press Enter...")?;
+                    }
+                }
+            }
+            Action::ResumeSession => {
+                if let Some(s) = session.take() {
+                    match panels::resume(s, &profiles) {
+                        Ok(s) => session = s,
+                        Err(e) => {
+                            ui::home_clear();
+                            eprintln!("{}", ui::color::red(&format!("Split view error: {e}")));
+                            picker::prompt_line("Press Enter...")?;
+                        }
+                    }
+                }
             }
             Action::Memory(name) => {
                 let m = mark.map(|m| m as i64).unwrap_or(-1);
@@ -605,26 +645,42 @@ fn cockpit() -> Result<()> {
                 }
             }
             Action::Open(name) => {
-                let suspend = term.suspend(); // give Claude the real terminal
-                // Hard wipe, not the soft home_clear: the primary buffer keeps
-                // scrolling across launches, so a soft clear would stack every
-                // past "launching Claude as..." line right above this one.
-                ui::clear_screen();
-                println!(
-                    "{} launching Claude as {} — exit Claude to return here\n",
-                    ui::color::dim(ui::glyph::spark()),
-                    ui::color::orange(&name),
-                );
-                launch::launch(&name, &[])?;
-                drop(suspend); // restore alt screen + raw mode before the next repaint
+                if settings::session_wrapped() {
+                    // Wrapped session: its own PTY, composited so /shell, F7
+                    // add-pane, and Ctrl+B detach work. Cockpit keeps terminal
+                    // ownership (no suspend). Detaching hands back a live
+                    // Session we hold onto.
+                    match panels::run_split_profiles(&profiles, std::slice::from_ref(&name)) {
+                        Ok(s) => session = s,
+                        Err(e) => {
+                            ui::home_clear();
+                            eprintln!("{}", ui::color::red(&format!("Session error: {e}")));
+                            picker::prompt_line("Press Enter...")?;
+                        }
+                    }
+                } else {
+                    let suspend = term.suspend(); // give Claude the real terminal
+                    // Hard wipe, not the soft home_clear: the primary buffer
+                    // keeps scrolling across launches, so a soft clear would
+                    // stack every past "launching Claude as..." line above.
+                    ui::clear_screen();
+                    println!(
+                        "{} launching Claude as {} — exit Claude to return here\n",
+                        ui::color::dim(ui::glyph::spark()),
+                        ui::color::orange(&name),
+                    );
+                    launch::launch(&name, &[])?;
+                    drop(suspend); // restore alt screen + raw mode before the next repaint
+                }
 
                 // Auto-handoff: the statusline hook cached the last quota
                 // reading it saw while Claude was running (main.rs can't see
                 // Claude's own output — stdio was inherited straight
                 // through). If that reading says this profile just ran dry,
                 // offer to copy the session that was just running onto
-                // whichever other profile has the most headroom.
-                if quota::load(&name).is_some_and(|q| quota::is_exhausted(&q)) {
+                // whichever other profile has the most headroom. Skipped while
+                // a wrapped session is only detached (still running).
+                if session.is_none() && quota::load(&name).is_some_and(|q| quota::is_exhausted(&q)) {
                     // Candidates ranked best-first (known usage data beats
                     // an untested profile with no cache at all, then lowest
                     // usage wins) — but that ranking is just the *default
@@ -774,36 +830,66 @@ fn cockpit() -> Result<()> {
                     group(&mut rows, &oname, &other.join("TODO.md"), &other.join("PLAN.md"));
                 }
 
-                let choice = picker::scroll_screen(&header, &rows, None, Some('e'))?;
-                let file = match choice {
-                    picker::ListChoice::Back => continue,
-                    picker::ListChoice::External(file) => {
-                        let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
-                            root.clone()
-                        } else {
-                            std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
-                        };
-                        notes::ensure_project_notes(&target_root);
-                        let suspend = term.suspend();
-                        launch::open_in_editor(std::path::Path::new(&file))?;
-                        drop(suspend);
-                        let session = notes::Session::start(&target_root);
-                        session.stop();
-                        continue;
-                    }
-                    picker::ListChoice::Picked(file) => file,
-                };
-                let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
-                    root.clone()
-                } else {
-                    std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
-                };
-                notes::ensure_project_notes(&target_root);
-                let path = std::path::PathBuf::from(&file);
-                let title = path.file_name().map(|n| n.to_string_lossy().to_string());
-                editor::edit_file(&path, &profiles, m, title.as_deref())?;
-                let session = notes::Session::start(&target_root);
-                session.stop();
+                // Looped so declining/backing out of the "turn off?" confirm
+                // (Esc) lands back on this list at the same row, not the
+                // main menu — only an actual Back on the list itself, or
+                // confirming the turn-off, leaves this screen.
+                let mut at: Option<String> = None;
+                loop {
+                    let choice = picker::scroll_screen_ext(&header, &rows, at.as_deref(), Some('e'), Some(('c', "turn off notes")))?;
+                    let file = match choice {
+                        picker::ListChoice::Back => break,
+                        picker::ListChoice::Command('c') => {
+                            let confirm_options = [
+                                picker::ListOption { label: "Yes, turn off Notes".into(), value: "yes".into(), note: None },
+                                picker::ListOption { label: "No, keep Notes".into(), value: "no".into(), note: None },
+                            ];
+                            if let picker::ListChoice::Picked(a) = picker::choose_from_list(
+                                &profiles,
+                                m,
+                                "Turn off Notes?",
+                                Some("Removes it from the main menu until re-enabled"),
+                                &confirm_options,
+                                None,
+                            )? {
+                                if a == "yes" {
+                                    settings::set_notes_enabled(false);
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        picker::ListChoice::Command(_) => continue,
+                        picker::ListChoice::External(file) => {
+                            at = Some(file.clone());
+                            let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                                root.clone()
+                            } else {
+                                std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                            };
+                            notes::ensure_project_notes(&target_root);
+                            let suspend = term.suspend();
+                            launch::open_in_editor(std::path::Path::new(&file))?;
+                            drop(suspend);
+                            let session = notes::Session::start(&target_root);
+                            session.stop();
+                            continue;
+                        }
+                        picker::ListChoice::Picked(file) => file,
+                    };
+                    at = Some(file.clone());
+                    let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                        root.clone()
+                    } else {
+                        std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                    };
+                    notes::ensure_project_notes(&target_root);
+                    let path = std::path::PathBuf::from(&file);
+                    let title = path.file_name().map(|n| n.to_string_lossy().to_string());
+                    editor::edit_file(&path, &profiles, m, title.as_deref())?;
+                    let session = notes::Session::start(&target_root);
+                    session.stop();
+                }
             }
             Action::Import => {
                 ui::home_clear();
@@ -1036,6 +1122,17 @@ fn main() -> Result<()> {
         Some("statusline") => {
             statusline::main();
             Ok(())
+        }
+        // Drive the split view directly with a fixed set of profiles, skipping
+        // the picker — for headless testing of the N-pane compositor.
+        Some("split-test") => {
+            let names: Vec<String> = args[1..].to_vec();
+            if names.is_empty() {
+                return Err(anyhow::anyhow!("split-test needs at least 1 profile name"));
+            }
+            let profiles = profiles::list_profiles().unwrap_or_default();
+            let _term = ui::Terminal::enter()?;
+            panels::run_split_profiles(&profiles, &names).map(|_| ())
         }
         Some(other) => Err(anyhow::anyhow!("Unknown command '{other}'.")),
     };

@@ -192,15 +192,30 @@ pub fn ensure_project_notes(root: &Path) -> Vec<String> {
 }
 
 // --- Master file section format -------------------------------------------
-// ---------- <project name> ------------
+// -------------- <project name> --------------
 // <!-- ccpit:path=<absolute project path> -->
 // <body>
 //
 // (sections separated by 2 blank lines)
 //
 // A heading is only a section boundary when a marker immediately follows it,
-// so a project's own "---------- something ------------" inside its body
-// text isn't mistaken for one.
+// so a project's own "-------------- something --------------" inside its
+// body text isn't mistaken for one.
+
+/// Every heading padded out to the same total width so they line up across
+/// projects regardless of name length, instead of a fixed dash count per
+/// side (which drifted visually for short vs. long names). Never shrinks
+/// below a few dashes per side for a name long enough to blow the budget.
+const HEADING_WIDTH: usize = 40;
+
+fn section_heading(name: &str) -> String {
+    let core = format!(" {name} ");
+    let min_dashes = 3;
+    let dash_total = HEADING_WIDTH.saturating_sub(core.chars().count()).max(min_dashes * 2);
+    let left = dash_total / 2;
+    let right = dash_total - left;
+    format!("{}{core}{}", "-".repeat(left), "-".repeat(right))
+}
 
 struct Section {
     key: String,
@@ -255,14 +270,19 @@ pub fn known_project_roots() -> Vec<PathBuf> {
 }
 
 pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> String {
-    let block = format!("---------- {name} ------------\n<!-- ccpit:path={key} -->\n{}\n", body.trim());
+    let block = format!("{}\n<!-- ccpit:path={key} -->\n{}\n", section_heading(name), body.trim());
     let sections = find_sections(content);
     if let Some(existing) = sections.iter().find(|s| s.key == key) {
+        // Force exactly 2 blank lines on both sides of the edited block,
+        // rather than trusting whatever spacing (possibly just 1 blank
+        // line, from stale content) was already there before it.
+        let prefix = content[..existing.start].trim_end_matches('\n');
+        let head = if prefix.is_empty() { String::new() } else { format!("{prefix}\n\n\n") };
         let rest = content[existing.end..].trim_start_matches('\n');
         if rest.is_empty() {
-            format!("{}{}", &content[..existing.start], block)
+            format!("{head}{block}")
         } else {
-            format!("{}{}\n\n{}", &content[..existing.start], block, rest)
+            format!("{head}{block}\n\n{rest}")
         }
     } else {
         let trimmed = content.trim_end();
@@ -274,17 +294,29 @@ pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> Strin
 
 fn reconcile_kind(root: &Path, local_path: &Path, master_path: &Path, key: &str, kind: &str, state: &mut SyncState) {
     let local = read_safe(local_path);
-    let remote = get_section_body(&read_safe(master_path), key).unwrap_or_default();
+    let master_content = read_safe(master_path);
+    let remote = get_section_body(&master_content, key).unwrap_or_default();
     let local_hash = hash(&local);
     let remote_hash = hash(&remote);
+    let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let entry = state.entry(key.to_string()).or_default();
     if local_hash == remote_hash {
         entry.insert(kind.to_string(), local_hash);
         write_state(state);
+        // Bodies match, but an old master file can still carry a stale
+        // heading (e.g. the pre-fix asymmetric dashes) that a body-only
+        // hash comparison would never catch — repair it here so it
+        // self-heals the next time this project's session syncs, even
+        // when nobody actually touched the note text.
+        if let Some(section) = find_sections(&master_content).into_iter().find(|s| s.key == key) {
+            let expected = section_heading(&name);
+            if master_content[section.start..].lines().next() != Some(expected.as_str()) {
+                let _ = write_atomic(master_path, &upsert_section(&master_content, key, &name, &local));
+            }
+        }
         return;
     }
     let last = entry.get(kind).cloned();
-    let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let use_local = if last.as_deref() == Some(local_hash.as_str()) {
         false // local unchanged since last sync, master moved -> master wins
     } else if last.as_deref() == Some(remote_hash.as_str()) {

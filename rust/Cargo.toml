@@ -2,9 +2,16 @@
 name = "claude-cockpit"
 version = "0.1.0"
 edition = "2021"
+default-run = "cpit"
 
 [[bin]]
 name = "cpit"
+path = "src/main.rs"
+
+# Same code under a second name, so a work-in-progress build can be installed
+# next to the stable one: `cargo install --path . --force --bin cpit-dev`.
+[[bin]]
+name = "cpit-dev"
 path = "src/main.rs"
 
 [dependencies]
@@ -20,6 +27,8 @@ ctrlc = "3"
 regex = "1"
 which = "6"
 wait-timeout = "0.2"
+portable-pty = "0.9"
+vt100 = "0.15"
 
 [profile.release]
 opt-level = 2

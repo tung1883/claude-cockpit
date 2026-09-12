@@ -7,10 +7,8 @@ use crate::picker::ScrollRow;
 use crate::profiles::Profile;
 use crate::session;
 use crate::ui::{self, color};
-use crossterm::terminal;
-
 fn term_width() -> usize {
-    terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(100)
+    ui::term_width()
 }
 
 /// Shorten a plain string to `max` visible chars, keeping both ends (best

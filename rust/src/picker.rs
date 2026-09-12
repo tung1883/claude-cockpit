@@ -17,12 +17,32 @@ pub enum Action {
     Refresh,
     Shell,
     Memory(String),
+    Panels(String),
+    ResumeSession,
+    Settings(String),
+}
+
+/// Explainer shown every time someone presses "n" while Notes is off.
+fn notes_onboarding(profiles: &[Profile], selected: usize, stats: &[Stat]) -> std::io::Result<bool> {
+    let mut header = layout::account_lines(profiles, selected as i64, stats);
+    header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Notes")));
+    header.push(String::new());
+    header.push(ui::color::dim("A TODO.md + PLAN.md per project. Off by default. Turn it on?"));
+    header.push(String::new());
+    let rows = vec![
+        ScrollRow::pick("  Yes, turn on Notes", "yes"),
+        ScrollRow::pick("  No, keep it off", "no"),
+    ];
+    match scroll_screen(&header, &rows, None, None)? {
+        ListChoice::Picked(v) => Ok(v == "yes"),
+        _ => Ok(false),
+    }
 }
 
 /// The main account picker. One blocking `read_key()` call per loop
 /// iteration — raw mode was already enabled once for the whole process by
 /// `ui::Terminal::enter`, so there's no per-screen mode toggling here at all.
-pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Action> {
+pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> std::io::Result<Action> {
     if profiles.is_empty() {
         return Ok(Action::Add);
     }
@@ -31,14 +51,20 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
     ui::hide_cursor();
 
     loop {
+        let notes_on = crate::settings::notes_enabled();
         let mut lines = layout::account_lines(profiles, selected as i64, &stats);
-        lines.extend(layout::hint_grid(
-            &[
-                &[("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("q", "quit")],
-                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff"), ("g", "shell"), ("m", "memory")],
-            ],
-            16,
-        ));
+        if has_session {
+            lines.push(String::new());
+            lines.push(format!("  {} a detached session is running", ui::color::orange(ui::glyph::spark())));
+        }
+        let row1: Vec<(&str, &str)> =
+            vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("h", "handoff"), ("m", "memory"), ("q", "quit")];
+        let mut row2: Vec<(&str, &str)> =
+            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings")];
+        if has_session {
+            row2.push(("^B", "resume"));
+        }
+        lines.extend(layout::hint_grid(&[&row1, &row2], 16));
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -48,6 +74,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
         if quit {
             ui::show_cursor();
             return Ok(Action::Quit);
+        }
+        if has_session && key.ctrl && key.code == KeyCode::Char('b') {
+            ui::show_cursor();
+            return Ok(Action::ResumeSession);
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -64,9 +94,20 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
                 ui::show_cursor();
                 return Ok(Action::Detail(profiles[selected].name.clone()));
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') if notes_on => {
                 ui::show_cursor();
                 return Ok(Action::Notes);
+            }
+            KeyCode::Char('n') => {
+                // Not enabled yet — re-explain and ask every time, rather
+                // than remembering a decline, so saying "no" once doesn't
+                // hide the feature forever.
+                if notes_onboarding(profiles, selected, &stats)? {
+                    crate::settings::set_notes_enabled(true);
+                    ui::show_cursor();
+                    return Ok(Action::Notes);
+                }
+                ui::hide_cursor();
             }
             KeyCode::Char('a') => {
                 ui::show_cursor();
@@ -100,6 +141,71 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
                 ui::show_cursor();
                 return Ok(Action::Memory(profiles[selected].name.clone()));
             }
+            KeyCode::Char('p') => {
+                ui::show_cursor();
+                return Ok(Action::Panels(profiles[selected].name.clone()));
+            }
+            KeyCode::Char(',') => {
+                ui::show_cursor();
+                return Ok(Action::Settings(profiles[selected].name.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The settings screen: a short list of cockpit-wide on/off toggles, drawn
+/// under the same account list as the profile picker (same selected account
+/// highlighted) so backing out returns to exactly where you left off. ↑/↓
+/// move, Enter/Space flips the highlighted one, ←/Esc/h/q returns.
+pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Result<()> {
+    let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+    let mut selected = 0usize;
+    const COUNT: usize = 2;
+    ui::hide_cursor();
+    loop {
+        let wrapped = crate::settings::session_wrapped();
+        let notes = crate::settings::notes_enabled();
+        let rows: [(&str, String); COUNT] = [
+            (
+                "Launch sessions wrapped",
+                if wrapped {
+                    format!("{}   (/shell, panels, Ctrl+B detach)", ui::color::green("on"))
+                } else {
+                    format!("{}  (native Claude — full mouse/paste fidelity)", ui::color::dim("off"))
+                },
+            ),
+            (
+                "Notes (TODO.md + PLAN.md per project)",
+                if notes { ui::color::green("on").to_string() } else { ui::color::dim("off").to_string() },
+            ),
+        ];
+        let mut lines = layout::account_lines(profiles, selected_account, &stats);
+        lines.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Settings")));
+        lines.push(String::new());
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let pointer = if i == selected { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+            lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 40)));
+        }
+        lines.push(String::new());
+        lines.push(ui::color::dim(&format!("↑/↓ move · Enter/Space toggle · {}/Esc back", ui::glyph::back())));
+        ui::repaint(&lines);
+
+        let key = read_key()?;
+        let back = matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q'))
+            || (key.ctrl && key.code == KeyCode::Char('c'));
+        if back {
+            ui::show_cursor();
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => selected = (selected + COUNT - 1) % COUNT,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => selected = (selected + 1) % COUNT,
+            KeyCode::Enter | KeyCode::Char(' ') => match selected {
+                0 => crate::settings::set_session_wrapped(!wrapped),
+                1 => crate::settings::set_notes_enabled(!notes),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -115,6 +221,7 @@ pub enum ListChoice {
     Back,
     Picked(String),
     External(String),
+    Command(char),
 }
 
 /// Arrow-key list picker: shows the account list for context, then `options`
@@ -191,12 +298,10 @@ pub fn choose_from_list_lazy(
         // terminal width — otherwise a long recap/path runs straight past
         // the divider below instead of stopping at it.
         let label_w = options.iter().map(|o| o.label.chars().count()).max().unwrap_or(0).clamp(8, 24);
-        // Match ui::rule's own cap — the divider below never renders wider
-        // than 100 cols even on a wider terminal, so the budget has to use
-        // the same cap or text can run past a rule that's shorter than the
-        // terminal actually is.
-        let term_width = (crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)).min(100) as isize;
-        let note_budget = (term_width - label_w as isize - 8).max(0) as usize;
+        // Match ui::rule's own width — the divider below is exactly the
+        // terminal width, so the budget has to use the same figure or text
+        // can run past it.
+        let note_budget = (ui::term_width() as isize - label_w as isize - 8).max(0) as usize;
         // Resolve only near the *selection*, not the whole visible slice —
         // a tall terminal can fit an entire long list on screen at once, at
         // which point "visible" is no different from "everything" and this
@@ -297,6 +402,19 @@ impl ScrollRow {
 /// returning from a sub-screen keeps your place. If `external_key` is set,
 /// pressing it on a valued row resolves `ListChoice::External` instead.
 pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>, external_key: Option<char>) -> std::io::Result<ListChoice> {
+    scroll_screen_ext(header, rows, start, external_key, None)
+}
+
+/// Like `scroll_screen`, but with a second, selection-independent key (e.g.
+/// "c" to close a feature) that returns `ListChoice::Command` regardless of
+/// which row is highlighted.
+pub fn scroll_screen_ext(
+    header: &[String],
+    rows: &[ScrollRow],
+    start: Option<&str>,
+    external_key: Option<char>,
+    command_key: Option<(char, &str)>,
+) -> std::io::Result<ListChoice> {
     let selectable_idx: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
     let any_pickable = rows.iter().any(|r| r.value.is_some());
     let mut pos = start
@@ -361,7 +479,8 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>,
         lines.push(ui::rule(None));
         let open_hint = if any_pickable { format!("    {} open", ui::color::dim("Enter")) } else { String::new() };
         let ext_hint = external_key.map(|k| format!("    {} external editor", ui::color::dim(&k.to_string()))).unwrap_or_default();
-        lines.push(format!(" {} move{open_hint}{ext_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
+        let cmd_hint = command_key.map(|(k, label)| format!("    {} {label}", ui::color::dim(&k.to_string()))).unwrap_or_default();
+        lines.push(format!(" {} move{open_hint}{ext_hint}{cmd_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -389,6 +508,10 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>,
             KeyCode::Char(c) if external_key == Some(c) && active.is_some() && rows[active.unwrap()].value.is_some() => {
                 ui::show_cursor();
                 return Ok(ListChoice::External(rows[active.unwrap()].value.clone().unwrap()));
+            }
+            KeyCode::Char(c) if command_key.map(|(k, _)| k) == Some(c) => {
+                ui::show_cursor();
+                return Ok(ListChoice::Command(c));
             }
             KeyCode::Up | KeyCode::Char('k') if !selectable_idx.is_empty() => {
                 pos = (pos + selectable_idx.len() - 1) % selectable_idx.len();

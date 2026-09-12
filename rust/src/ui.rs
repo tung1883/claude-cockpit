@@ -74,10 +74,13 @@ pub fn banner() -> String {
     format!("{} {}", color::orange_bold(glyph::spark()), color::bold("Claude Cockpit"))
 }
 
+/// Terminal width in columns, uncapped (falls back to 80 if it can't be read).
+pub fn term_width() -> usize {
+    terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
 pub fn rule(width: Option<usize>) -> String {
-    let cols = width.unwrap_or_else(|| {
-        terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(100)
-    });
+    let cols = width.unwrap_or_else(term_width);
     color::gray(&"─".repeat(cols.max(8)))
 }
 
@@ -119,12 +122,20 @@ pub fn repaint(lines: &[String]) {
         println!("{}", lines.join("\n"));
         return;
     }
-    // Home, clear+write each line, join with CR+LF, then erase below. No
-    // trailing newline — a newline on the last row scrolls the page and the
-    // next paint lands one row higher: that one-row jitter is the "flicker".
+    // Home, write each line then erase its tail, join with CR+LF, then erase
+    // below. No trailing newline — a newline on the last row scrolls the page
+    // and the next paint lands one row higher: that one-row jitter is the
+    // "flicker".
+    //
+    // Erase-to-end-of-line (`\x1b[K`) goes AFTER the content, not a whole-line
+    // erase (`\x1b[2K`) before it: on a screen that repaints continuously (the
+    // split view, where two live panes stream output), a leading `\x1b[2K`
+    // blanks each row a frame before it is redrawn, and that blank-then-draw
+    // is exactly the visible flash. Overwriting in place and only clearing the
+    // stale tail never shows a blank cell.
     let body = lines
         .iter()
-        .map(|l| format!("\x1b[2K{l}"))
+        .map(|l| format!("{l}\x1b[K"))
         .collect::<Vec<_>>()
         .join("\r\n");
     write_raw(&format!("\x1b[H{body}\x1b[0J"));

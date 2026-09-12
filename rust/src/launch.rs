@@ -11,6 +11,75 @@ struct Target {
     shell: bool,
 }
 
+/// Same resolved Claude binary as `launch()`, but as a `portable_pty`
+/// CommandBuilder instead of a `std::process::Command` — for panels.rs,
+/// which needs a PTY-attached child rather than one that simply inherits
+/// this process's own stdio. Composes the profile/project system prompts
+/// the same way `launch()` does (no per-session sidecar, since panes start
+/// fresh); returns the temp file's path alongside so the caller can delete
+/// it when the pane closes.
+pub(crate) fn claude_pty_command(profile: &str, cwd: &Path) -> (portable_pty::CommandBuilder, Option<PathBuf>) {
+    let target = claude_target();
+    let mut cmd = if target.shell {
+        let mut c = portable_pty::CommandBuilder::new("cmd");
+        c.arg("/C");
+        c.arg(&target.command);
+        c
+    } else {
+        let mut c = portable_pty::CommandBuilder::new(&target.command);
+        for p in &target.prefix {
+            c.arg(p);
+        }
+        c
+    };
+    let sysprompt = write_system_prompt_file(profile, None);
+    if let Some(path) = &sysprompt {
+        cmd.arg("--append-system-prompt-file");
+        cmd.arg(path);
+    }
+    cmd.cwd(cwd);
+    cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
+    (cmd, sysprompt)
+}
+
+/// The three cockpit-managed system-prompt levels, coarse to fine:
+/// profile-wide, then this project, then (only when resuming) this specific
+/// session. Composed into one string, in that order.
+fn compose_system_prompt(profile: &str, resume_session_id: Option<&str>) -> Vec<String> {
+    let mut pieces = Vec::new();
+    if let Some(text) = nonempty_content(&paths::profile_dir(profile).join(".cockpit-system-prompt.md")) {
+        pieces.push(text);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let project_root = notes::project_root(&cwd);
+        if let Some(text) = nonempty_content(&project_root.join(".cockpit-system-prompt.md")) {
+            pieces.push(text);
+        }
+    }
+    if let Some(session_id) = resume_session_id {
+        if let Some(session_path) = session::session_file_path(profile, session_id) {
+            if let Some(text) = nonempty_content(&session::system_prompt_sidecar(&session_path)) {
+                pieces.push(text);
+            }
+        }
+    }
+    pieces
+}
+
+/// Writes the composed system prompt to a unique temp file (or None if there
+/// is nothing to append). The caller owns cleanup. Unique per call so
+/// several panes launching at once don't clobber each other's file.
+pub(crate) fn write_system_prompt_file(profile: &str, resume_session_id: Option<&str>) -> Option<PathBuf> {
+    let pieces = compose_system_prompt(profile, resume_session_id);
+    if pieces.is_empty() {
+        return None;
+    }
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = paths::root().join(format!(".launch-system-prompt-{}-{}.md", std::process::id(), seq));
+    std::fs::write(&path, pieces.join("\n\n")).ok().map(|_| path)
+}
+
 /// Resolve how to start Claude. On Windows we avoid the `claude.cmd` shim so
 /// Ctrl+C inside Claude does not drop to cmd.exe's "Terminate batch job
 /// (Y/N)?" prompt — we run the real .exe (or `node cli.js`) that the shim
@@ -64,38 +133,16 @@ fn nonempty_content(path: &Path) -> Option<String> {
 pub fn launch(profile: &str, args: &[String]) -> Result<i32> {
     let target = claude_target();
     let mut full_args = args.to_vec();
-    // Three cockpit-managed, persisted system-prompt levels (see the Memory
-    // action and the session action menu) — Claude Code itself has no
-    // concept of any of this surviving between launches, only the
-    // --append-system-prompt* flags for one invocation. Coarse to fine:
-    // profile-wide, then this project, then this specific session (only
-    // when actually resuming one) — all three composed into a single file
-    // and appended together, since the flag only takes one path.
-    let mut pieces = Vec::new();
-    if let Some(text) = nonempty_content(&paths::profile_dir(profile).join(".cockpit-system-prompt.md")) {
-        pieces.push(text);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = notes::project_root(&cwd);
-        if let Some(text) = nonempty_content(&project_root.join(".cockpit-system-prompt.md")) {
-            pieces.push(text);
-        }
-    }
-    if let Some(session_id) = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1)) {
-        if let Some(session_path) = session::session_file_path(profile, session_id) {
-            if let Some(text) = nonempty_content(&session::system_prompt_sidecar(&session_path)) {
-                pieces.push(text);
-            }
-        }
-    }
-    let mut combined_path: Option<PathBuf> = None;
-    if !pieces.is_empty() {
-        let path = paths::root().join(format!(".launch-system-prompt-{}.md", std::process::id()));
-        if std::fs::write(&path, pieces.join("\n\n")).is_ok() {
-            full_args.push("--append-system-prompt-file".to_string());
-            full_args.push(path.to_string_lossy().to_string());
-            combined_path = Some(path);
-        }
+    // Cockpit-managed, persisted system-prompt levels (see the Memory action
+    // and the session action menu) — Claude Code itself has no concept of any
+    // of this surviving between launches, only the --append-system-prompt*
+    // flags for one invocation. Composed into a single file and appended,
+    // since the flag only takes one path.
+    let resume_id = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1)).map(|s| s.as_str());
+    let combined_path = write_system_prompt_file(profile, resume_id);
+    if let Some(path) = &combined_path {
+        full_args.push("--append-system-prompt-file".to_string());
+        full_args.push(path.to_string_lossy().to_string());
     }
     let mut cmd = if target.shell {
         let mut c = Command::new("cmd");
