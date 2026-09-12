@@ -152,6 +152,47 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
     Ok(())
 }
 
+/// A small file browser over one of Claude Code's own auto-memory
+/// directories (`<profile>/memory` or `<profile>/projects/<encoded>/memory`)
+/// — these are written by Claude itself, not user-authored like CLAUDE.md,
+/// so this just lists whatever's there (if anything) and lets you create a
+/// new file, rather than assuming/enforcing Claude's own naming scheme.
+fn browse_memory_dir(profiles: &[profiles::Profile], mark: i64, dir: &std::path::Path) -> Result<()> {
+    let mut at: Option<String> = None;
+    loop {
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| e.path().is_file()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        files.sort();
+        let mut options: Vec<picker::ListOption> = files.iter().map(|f| picker::ListOption { label: f.clone(), value: dir.join(f).to_string_lossy().to_string(), note: None }).collect();
+        options.push(picker::ListOption { label: "+ New file".into(), value: "__new__".into(), note: None });
+        let heading = format!("Memory (auto) — {}", ui::color::orange(&dir.display().to_string()));
+        let choice = picker::choose_from_list_lazy(profiles, mark, &heading, Some("these are Claude's own files, not user-authored"), &options, at.as_deref(), None, None)?;
+        let file = match choice {
+            picker::ListChoice::Back => return Ok(()),
+            picker::ListChoice::Picked(v) if v == "__new__" => {
+                let Some(input) = picker::prompt_line("New memory file name (e.g. notes.md): ")? else { continue };
+                let input = input.trim();
+                if input.is_empty() {
+                    continue;
+                }
+                let filename = if input.ends_with(".md") { input.to_string() } else { format!("{input}.md") };
+                std::fs::create_dir_all(dir)?;
+                dir.join(filename).to_string_lossy().to_string()
+            }
+            picker::ListChoice::Picked(v) => v,
+            _ => continue,
+        };
+        at = Some(file.clone());
+        if !std::path::Path::new(&file).exists() {
+            let _ = std::fs::write(&file, "");
+        }
+        let path = std::path::PathBuf::from(&file);
+        let title = path.file_name().map(|n| n.to_string_lossy().to_string());
+        editor::edit_file(&path, profiles, mark, title.as_deref())?;
+    }
+}
+
 /// Read-only detail screen for one session — the "detail first" variant of
 /// the overview's two session-row styles (see detail::session_rows).
 /// Opens one project folder's session list; picking a session opens a small
@@ -406,10 +447,20 @@ fn cockpit() -> Result<()> {
                     "    System prompt",
                     format!("global:{}", paths::profile_dir(&name).join(".cockpit-system-prompt.md").to_string_lossy()),
                 ));
+                rows.push(picker::ScrollRow::pick("    Memory (auto)", format!("memdir:{}", paths::profile_dir(&name).join("memory").to_string_lossy())));
                 rows.push(picker::ScrollRow::line(String::new()));
+                // Claude Code names a project's own dir under <profile>/projects
+                // by replacing ':' and '\' in its absolute path with '-' — this
+                // computes the same encoding so a project's memory folder is
+                // reachable even before any session has ever run there (which
+                // is the only time that directory would otherwise get created).
+                let encode_project_dir = |root: &std::path::Path| -> String { root.to_string_lossy().replace([':', '\\', '/'], "-") };
                 let project_group = |rows: &mut Vec<picker::ScrollRow>, label: &str, root: &std::path::Path| {
                     rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(label))));
+                    rows.push(picker::ScrollRow::pick("    CLAUDE.md", format!("project:{}", root.join("CLAUDE.md").to_string_lossy())));
                     rows.push(picker::ScrollRow::pick("    System prompt", format!("project:{}", root.join(".cockpit-system-prompt.md").to_string_lossy())));
+                    let mem_dir = paths::profile_dir(&name).join("projects").join(encode_project_dir(root)).join("memory");
+                    rows.push(picker::ScrollRow::pick("    Memory (auto)", format!("memdir:{}", mem_dir.to_string_lossy())));
                     rows.push(picker::ScrollRow::line(String::new()));
                 };
                 project_group(&mut rows, &format!("{project_name} (this project)"), &project_root);
@@ -426,6 +477,10 @@ fn cockpit() -> Result<()> {
                     let choice = picker::scroll_screen(&header, &rows, at.as_deref(), None)?;
                     let picker::ListChoice::Picked(pick) = choice else { break };
                     at = Some(pick.clone());
+                    if let Some(dir) = pick.strip_prefix("memdir:") {
+                        browse_memory_dir(&profiles, m, std::path::Path::new(dir))?;
+                        continue 'files;
+                    }
                     let (is_global, file) = match pick.strip_prefix("global:") {
                         Some(f) => (true, f.to_string()),
                         None => (false, pick.strip_prefix("project:").unwrap_or(&pick).to_string()),
