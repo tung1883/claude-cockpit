@@ -11,6 +11,19 @@ pub struct SessionFile {
     pub modified: SystemTime,
 }
 
+/// Locates one session's transcript by id, for callers that only have the
+/// id (e.g. a `--resume <id>` launch arg) rather than an already-loaded
+/// `SessionFile`.
+pub fn session_file_path(profile: &str, session_id: &str) -> Option<PathBuf> {
+    session_files(profile).into_iter().find(|s| s.id == session_id).map(|s| s.file)
+}
+
+/// The per-session persisted system-prompt sidecar path for a transcript —
+/// same directory, same id, different extension.
+pub fn system_prompt_sidecar(session_path: &std::path::Path) -> PathBuf {
+    session_path.with_extension("system-prompt.md")
+}
+
 /// Walks <profile>/projects recursively for .jsonl transcripts, newest first.
 pub fn session_files(profile: &str) -> Vec<SessionFile> {
     let root = paths::profile_dir(profile).join("projects");

@@ -16,6 +16,7 @@ pub enum Action {
     Delete(String),
     Refresh,
     Shell,
+    Memory(String),
 }
 
 /// The main account picker. One blocking `read_key()` call per loop
@@ -34,7 +35,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
         lines.extend(layout::hint_grid(
             &[
                 &[("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("q", "quit")],
-                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff"), ("g", "shell")],
+                &[("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("h", "handoff"), ("g", "shell"), ("m", "memory")],
             ],
             16,
         ));
@@ -95,6 +96,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize) -> std::io::Result<Actio
                 ui::show_cursor();
                 return Ok(Action::Shell);
             }
+            KeyCode::Char('m') => {
+                ui::show_cursor();
+                return Ok(Action::Memory(profiles[selected].name.clone()));
+            }
             _ => {}
         }
     }
@@ -123,7 +128,7 @@ pub fn choose_from_list(
     options: &[ListOption],
     external_key: Option<char>,
 ) -> std::io::Result<ListChoice> {
-    choose_from_list_lazy(profiles, mark, heading, hint, options, external_key, None)
+    choose_from_list_lazy(profiles, mark, heading, hint, options, None, external_key, None)
 }
 
 /// Same as `choose_from_list`, but a row whose own `label`/`note` are cheap
@@ -133,17 +138,22 @@ pub fn choose_from_list(
 /// results are cached from then on. Use this when computing a row's real
 /// content is expensive per-row (e.g. reading a file) and the list can be
 /// long enough that most rows are never actually looked at.
+///
+/// `start` re-opens on the row whose value matches it (same convention as
+/// `scroll_screen`'s `start`) — pass the value you last picked so returning
+/// from wherever it led keeps your place instead of resetting to the top.
 pub fn choose_from_list_lazy(
     profiles: &[Profile],
     mark: i64,
     heading: &str,
     hint: Option<&str>,
     options: &[ListOption],
+    start: Option<&str>,
     external_key: Option<char>,
     lazy: Option<&dyn Fn(&ListOption) -> (Option<String>, Option<String>)>,
 ) -> std::io::Result<ListChoice> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
-    let mut selected = 0usize;
+    let mut selected = start.and_then(|s| options.iter().position(|o| o.value == s)).unwrap_or(0);
     let mut top = 0usize;
     // Memoized per row index — computed at most once, the first time that
     // row is actually rendered (i.e. scrolled near), not for the whole list

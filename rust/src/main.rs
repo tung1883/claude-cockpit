@@ -190,7 +190,7 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
         (label, Some(note))
     };
     let heading = format!("Sessions in {}", ui::color::orange(&group.folder));
-    let choice = picker::choose_from_list_lazy(profiles, mark, &heading, Some("choose a session"), &options, None, Some(&resolve))?;
+    let choice = picker::choose_from_list_lazy(profiles, mark, &heading, Some("choose a session"), &options, None, None, Some(&resolve))?;
     let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
 
     loop {
@@ -198,6 +198,7 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "Resume here".into(), value: "resume".into(), note: Some(format!("continue it as '{from}'")) },
             picker::ListOption { label: "Hand off".into(), value: "handoff".into(), note: Some("copy it to another profile".into()) },
             picker::ListOption { label: "View conversation".into(), value: "view".into(), note: Some("read-only, no Claude launch".into()) },
+            picker::ListOption { label: "System prompt".into(), value: "prompt".into(), note: Some("appended only when resuming this session".into()) },
         ];
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
         let picker::ListChoice::Picked(action) = choice else { return Ok(()) };
@@ -218,6 +219,16 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
                 view_conversation(profiles, mark, group, &id)?;
                 // Back to the action menu, not the whole folder — you
                 // likely want to act on what you just read.
+            }
+            "prompt" => {
+                if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                    let path = session::system_prompt_sidecar(&file.file);
+                    if !path.exists() {
+                        let _ = std::fs::write(&path, "");
+                    }
+                    let title = format!("system prompt — {}", &id[..id.len().min(8)]);
+                    editor::edit_file(&path, profiles, mark, Some(&title))?;
+                }
             }
             _ => return Ok(()),
         }
@@ -350,7 +361,7 @@ fn cockpit() -> Result<()> {
         cursor = cursor.min(profiles.len() - 1);
         let action = picker::pick_profile(&profiles, cursor)?;
         let mark = match &action {
-            Action::Open(n) | Action::Detail(n) | Action::Sync(n) | Action::Handoff(n) | Action::Delete(n) => {
+            Action::Open(n) | Action::Detail(n) | Action::Sync(n) | Action::Handoff(n) | Action::Delete(n) | Action::Memory(n) => {
                 profiles.iter().position(|p| &p.name == n)
             }
             _ => None,
@@ -369,6 +380,134 @@ fn cockpit() -> Result<()> {
                 let cwd = std::env::current_dir()?;
                 launch::open_shell(&cwd)?;
                 drop(suspend);
+            }
+            Action::Memory(name) => {
+                let m = mark.map(|m| m as i64).unwrap_or(-1);
+                let cwd = std::env::current_dir()?;
+                let project_root = notes::project_root(&cwd);
+                let project_name = project_root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let mut others: Vec<PathBuf> = notes::known_project_roots().into_iter().filter(|p| p != &project_root).collect();
+                others.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_string().to_lowercase()).unwrap_or_default());
+
+                // "global:<path>" rows are profile-scoped (CLAUDE.md, the
+                // profile-wide system prompt) — the only ones that make
+                // sense to copy to another profile. "project:<path>" rows
+                // live in the project directory itself, so every profile
+                // launched from there already shares the same file; there's
+                // nothing to copy for those.
+                let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+                let mut header = layout::account_lines(&profiles, m, &stats);
+                header.push(format!("{} {}  {}", ui::color::orange(ui::glyph::back()), ui::color::orange(&name), ui::color::dim("— memory")));
+                header.push(String::new());
+                let mut rows: Vec<picker::ScrollRow> = Vec::new();
+                rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold("Global (profile-wide)"))));
+                rows.push(picker::ScrollRow::pick("    CLAUDE.md", format!("global:{}", paths::profile_dir(&name).join("CLAUDE.md").to_string_lossy())));
+                rows.push(picker::ScrollRow::pick(
+                    "    System prompt",
+                    format!("global:{}", paths::profile_dir(&name).join(".cockpit-system-prompt.md").to_string_lossy()),
+                ));
+                rows.push(picker::ScrollRow::line(String::new()));
+                let project_group = |rows: &mut Vec<picker::ScrollRow>, label: &str, root: &std::path::Path| {
+                    rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(label))));
+                    rows.push(picker::ScrollRow::pick("    System prompt", format!("project:{}", root.join(".cockpit-system-prompt.md").to_string_lossy())));
+                    rows.push(picker::ScrollRow::line(String::new()));
+                };
+                project_group(&mut rows, &format!("{project_name} (this project)"), &project_root);
+                for other in &others {
+                    let oname = other.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    project_group(&mut rows, &oname, other);
+                }
+
+                // Looped so returning from the action menu/editor lands back
+                // on this list, not the main menu, and `at` keeps the
+                // highlighted row put across that round trip.
+                let mut at: Option<String> = None;
+                'files: loop {
+                    let choice = picker::scroll_screen(&header, &rows, at.as_deref(), None)?;
+                    let picker::ListChoice::Picked(pick) = choice else { break };
+                    at = Some(pick.clone());
+                    let (is_global, file) = match pick.strip_prefix("global:") {
+                        Some(f) => (true, f.to_string()),
+                        None => (false, pick.strip_prefix("project:").unwrap_or(&pick).to_string()),
+                    };
+                    if !std::path::Path::new(&file).exists() {
+                        let _ = std::fs::write(&file, "");
+                    }
+
+                    let _ = is_global; // no longer gates anything — copy works from any row now
+                    let action_options = [
+                        picker::ListOption { label: "Edit here".into(), value: "edit".into(), note: None },
+                        picker::ListOption { label: "Edit in $EDITOR".into(), value: "external".into(), note: None },
+                        picker::ListOption { label: "Copy…".into(), value: "copy".into(), note: Some("into another profile's global slot, or a project's".into()) },
+                    ];
+                    let path = std::path::PathBuf::from(&file);
+                    let title = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    // Looped so returning from the editor (or a copy) lands
+                    // back on this action menu — where you actually left
+                    // off — rather than the file list a level up; only an
+                    // explicit Back on the menu itself goes back to that.
+                    loop {
+                        let action = match picker::choose_from_list(&profiles, m, &format!("{title}…"), None, &action_options, None)? {
+                            picker::ListChoice::Picked(a) => a,
+                            _ => continue 'files,
+                        };
+                        match action.as_str() {
+                            "edit" => {
+                                editor::edit_file(&path, &profiles, m, Some(&title))?;
+                            }
+                            "external" => {
+                                let suspend = term.suspend();
+                                launch::open_in_editor(&path)?;
+                                drop(suspend);
+                            }
+                            "copy" => {
+                                // Fully expanded, no drill-down: every
+                                // profile group (including this one — its
+                                // Project row is a real, useful copy:
+                                // promoting a profile-wide file into the
+                                // current project's slot; only its own
+                                // Global row can be a true self-copy, and
+                                // that's already caught below) shows its
+                                // Global and Project rows directly pickable
+                                // right here. "Project" resolves to the same
+                                // file no matter which group it's picked
+                                // from — it isn't profile-owned.
+                                let copy_stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+                                let mut copy_header = layout::account_lines(&profiles, m, &copy_stats);
+                                copy_header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Copy {title} into…"))));
+                                copy_header.push(String::new());
+                                let mut copy_rows: Vec<picker::ScrollRow> = Vec::new();
+                                for p in profiles.iter() {
+                                    let label = if p.name == name { format!("{} (this profile)", p.name) } else { p.name.clone() };
+                                    copy_rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(&label))));
+                                    copy_rows.push(picker::ScrollRow::pick("    Global", format!("global:{}", p.name)));
+                                    copy_rows.push(picker::ScrollRow::pick("    Project", "project".to_string()));
+                                    copy_rows.push(picker::ScrollRow::line(String::new()));
+                                }
+                                let copy_choice = picker::scroll_screen(&copy_header, &copy_rows, None, None)?;
+                                let picker::ListChoice::Picked(copy_pick) = copy_choice else { continue };
+                                let (dest, dest_desc) = if let Some(target_profile) = copy_pick.strip_prefix("global:") {
+                                    (paths::profile_dir(target_profile).join(path.file_name().unwrap_or_default()), format!("profile '{target_profile}'"))
+                                } else {
+                                    (project_root.join(path.file_name().unwrap_or_default()), format!("project '{project_name}'"))
+                                };
+                                if dest == path {
+                                    ui::home_clear();
+                                    println!("{}", ui::color::dim("That's the same file — nothing to copy."));
+                                    picker::prompt_line("Press Enter...")?;
+                                    continue;
+                                }
+                                ui::home_clear();
+                                match std::fs::copy(&path, &dest) {
+                                    Ok(_) => println!("{}", ui::color::green(&format!("Copied {title} to {dest_desc}."))),
+                                    Err(e) => eprintln!("{}", ui::color::red(&format!("Error: {e}"))),
+                                }
+                                picker::prompt_line("Press Enter...")?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             Action::Add => {
                 ui::home_clear();

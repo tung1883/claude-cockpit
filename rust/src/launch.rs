@@ -1,4 +1,4 @@
-use crate::{paths, ui};
+use crate::{notes, paths, session, ui};
 use anyhow::Result;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -55,20 +55,64 @@ fn claude_target() -> &'static Target {
 /// Spawn Claude with the profile's isolated config dir, inheriting stdio, and
 /// wait for it to exit. Ctrl+C is handled once, globally, at process startup
 /// (see main.rs) — nothing special needs to happen here for it.
+/// Reads a file if it exists and has actual content, else None.
+fn nonempty_content(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() { None } else { Some(text) }
+}
+
 pub fn launch(profile: &str, args: &[String]) -> Result<i32> {
     let target = claude_target();
+    let mut full_args = args.to_vec();
+    // Three cockpit-managed, persisted system-prompt levels (see the Memory
+    // action and the session action menu) — Claude Code itself has no
+    // concept of any of this surviving between launches, only the
+    // --append-system-prompt* flags for one invocation. Coarse to fine:
+    // profile-wide, then this project, then this specific session (only
+    // when actually resuming one) — all three composed into a single file
+    // and appended together, since the flag only takes one path.
+    let mut pieces = Vec::new();
+    if let Some(text) = nonempty_content(&paths::profile_dir(profile).join(".cockpit-system-prompt.md")) {
+        pieces.push(text);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let project_root = notes::project_root(&cwd);
+        if let Some(text) = nonempty_content(&project_root.join(".cockpit-system-prompt.md")) {
+            pieces.push(text);
+        }
+    }
+    if let Some(session_id) = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1)) {
+        if let Some(session_path) = session::session_file_path(profile, session_id) {
+            if let Some(text) = nonempty_content(&session::system_prompt_sidecar(&session_path)) {
+                pieces.push(text);
+            }
+        }
+    }
+    let mut combined_path: Option<PathBuf> = None;
+    if !pieces.is_empty() {
+        let path = paths::root().join(format!(".launch-system-prompt-{}.md", std::process::id()));
+        if std::fs::write(&path, pieces.join("\n\n")).is_ok() {
+            full_args.push("--append-system-prompt-file".to_string());
+            full_args.push(path.to_string_lossy().to_string());
+            combined_path = Some(path);
+        }
+    }
     let mut cmd = if target.shell {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(&target.command);
-        c.args(args);
+        c.args(&full_args);
         c
     } else {
         let mut c = Command::new(&target.command);
-        c.args(&target.prefix).args(args);
+        c.args(&target.prefix).args(&full_args);
         c
     };
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
-    match cmd.status() {
+    let result = cmd.status();
+    if let Some(path) = &combined_path {
+        let _ = std::fs::remove_file(path);
+    }
+    match result {
         Ok(status) => Ok(status.code().unwrap_or(0)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
