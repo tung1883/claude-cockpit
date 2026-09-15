@@ -1,6 +1,44 @@
 use crate::paths;
 use serde::{Deserialize, Serialize};
 
+/// Which channel `notify*.ps1` uses for a hook event — a single tri-state
+/// instead of two independent on/off toggles, since "both at once" wasn't
+/// a real use case and the pair read as two unrelated rows in Settings.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyMode {
+    Off,
+    Toast,
+    Terminal,
+}
+
+impl NotifyMode {
+    const ORDER: [NotifyMode; 3] = [NotifyMode::Off, NotifyMode::Toast, NotifyMode::Terminal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NotifyMode::Off => "off",
+            NotifyMode::Toast => "toast",
+            NotifyMode::Terminal => "terminal",
+        }
+    }
+
+    /// Wraps both directions — Left/Enter and Right cycle through the same
+    /// 3 states, just in opposite order.
+    pub fn cycle(self, forward: bool) -> NotifyMode {
+        let i = Self::ORDER.iter().position(|m| *m == self).unwrap_or(0);
+        let n = Self::ORDER.len();
+        let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+        Self::ORDER[next]
+    }
+}
+
+impl Default for NotifyMode {
+    fn default() -> Self {
+        NotifyMode::Toast
+    }
+}
+
 /// Cockpit-wide feature toggles, persisted once for the whole tool (not
 /// per-profile) — a spot to grow on/off switches into.
 #[derive(Serialize, Deserialize)]
@@ -12,6 +50,11 @@ struct Settings {
     /// plain native Claude with inherited stdio. Default on.
     #[serde(default = "default_true")]
     session_wrapped: bool,
+    /// Read by the notify*.ps1 hook scripts (not just the Rust side) — they
+    /// load the same settings.json to decide whether/how to raise a
+    /// Windows toast or terminal bell for Notification/Stop/SubagentStop.
+    #[serde(default)]
+    notify_mode: NotifyMode,
 }
 
 fn default_true() -> bool {
@@ -20,7 +63,7 @@ fn default_true() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { notes_enabled: false, session_wrapped: true }
+        Settings { notes_enabled: false, session_wrapped: true, notify_mode: NotifyMode::default() }
     }
 }
 
@@ -55,5 +98,15 @@ pub fn session_wrapped() -> bool {
 pub fn set_session_wrapped(enabled: bool) {
     let mut settings = load();
     settings.session_wrapped = enabled;
+    save(&settings);
+}
+
+pub fn notify_mode() -> NotifyMode {
+    load().notify_mode
+}
+
+pub fn set_notify_mode(mode: NotifyMode) {
+    let mut settings = load();
+    settings.notify_mode = mode;
     save(&settings);
 }

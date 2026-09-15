@@ -20,6 +20,10 @@ pub enum Action {
     Panels(String),
     ResumeSession,
     Settings(String),
+    /// TEMP: fires the notify/notify-stop/notify-subagent-stop toast
+    /// scripts so they can be eyeballed from inside the cockpit. Remove
+    /// once the toast titles/icons are confirmed good.
+    TestNotify,
 }
 
 /// Explainer shown every time someone presses "n" while Notes is off.
@@ -60,7 +64,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
         let row1: Vec<(&str, &str)> =
             vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("h", "handoff"), ("m", "memory"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
-            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings")];
+            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings"), ("t", "test notify")];
         if has_session {
             row2.push(("^B", "resume"));
         }
@@ -149,23 +153,34 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
                 ui::show_cursor();
                 return Ok(Action::Settings(profiles[selected].name.clone()));
             }
+            KeyCode::Char('t') => {
+                ui::show_cursor();
+                return Ok(Action::TestNotify);
+            }
             _ => {}
         }
     }
 }
 
-/// The settings screen: a short list of cockpit-wide on/off toggles, drawn
-/// under the same account list as the profile picker (same selected account
+/// The settings screen: a short list of cockpit-wide toggles, drawn under
+/// the same account list as the profile picker (same selected account
 /// highlighted) so backing out returns to exactly where you left off. ↑/↓
-/// move, Enter/Space flips the highlighted one, ←/Esc/h/q returns.
+/// move; Enter/Space flips a plain on/off row. The Notifications row is
+/// 3-state (off/toast/terminal) — ←/→ cycle it either way, Enter is the
+/// same as → (so Enter still "does something" there instead of only
+/// working on the boolean rows).
 pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Result<()> {
+    use crate::settings::NotifyMode;
+    const NOTIFY_ROW: usize = 2;
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut selected = 0usize;
-    const COUNT: usize = 2;
+    const COUNT: usize = 3;
     ui::hide_cursor();
     loop {
         let wrapped = crate::settings::session_wrapped();
         let notes = crate::settings::notes_enabled();
+        let mode = crate::settings::notify_mode();
+        let mode_text = if mode == NotifyMode::Off { ui::color::dim(mode.label()) } else { ui::color::green(mode.label()).to_string() };
         let rows: [(&str, String); COUNT] = [
             (
                 "Launch sessions wrapped",
@@ -179,6 +194,7 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
                 "Notes (TODO.md + PLAN.md per project)",
                 if notes { ui::color::green("on").to_string() } else { ui::color::dim("off").to_string() },
             ),
+            ("Notifications", format!("{}   (needs input / finished)", mode_text)),
         ];
         let mut lines = layout::account_lines(profiles, selected_account, &stats);
         lines.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Settings")));
@@ -188,12 +204,13 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
             lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 40)));
         }
         lines.push(String::new());
-        lines.push(ui::color::dim(&format!("↑/↓ move · Enter/Space toggle · {}/Esc back", ui::glyph::back())));
+        lines.push(ui::color::dim(&format!("↑/↓ move · ←/→/Enter/Space change · {}/Esc back", ui::glyph::back())));
         ui::repaint(&lines);
 
         let key = read_key()?;
-        let back = matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q'))
-            || (key.ctrl && key.code == KeyCode::Char('c'));
+        // Left cycles every row now instead of doubling as "back" — Esc/h/q
+        // are the only way out of this screen.
+        let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q')) || (key.ctrl && key.code == KeyCode::Char('c'));
         if back {
             ui::show_cursor();
             return Ok(());
@@ -201,9 +218,14 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         match key.code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => selected = (selected + COUNT - 1) % COUNT,
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => selected = (selected + 1) % COUNT,
+            KeyCode::Left if selected == NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(false)),
+            KeyCode::Right if selected == NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
+            KeyCode::Left | KeyCode::Right if selected == 0 => crate::settings::set_session_wrapped(!wrapped),
+            KeyCode::Left | KeyCode::Right if selected == 1 => crate::settings::set_notes_enabled(!notes),
             KeyCode::Enter | KeyCode::Char(' ') => match selected {
                 0 => crate::settings::set_session_wrapped(!wrapped),
                 1 => crate::settings::set_notes_enabled(!notes),
+                NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
                 _ => {}
             },
             _ => {}

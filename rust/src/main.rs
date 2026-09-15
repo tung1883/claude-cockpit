@@ -453,6 +453,30 @@ fn cockpit() -> Result<()> {
                 launch::open_shell(&cwd)?;
                 drop(suspend);
             }
+            // TEMP: pick one toast script and fire just that one, so each
+            // can be eyeballed on its own without waiting for a real Claude
+            // session to hit each hook. Remove Action::TestNotify (here,
+            // picker.rs, and the 't' hint) once confirmed good.
+            Action::TestNotify => {
+                let m = mark.map(|m| m as i64).unwrap_or(-1);
+                let options = [
+                    picker::ListOption { label: "Notification".into(), value: "notify.ps1".into(), note: Some("needs your input".into()) },
+                    picker::ListOption { label: "Stop".into(), value: "notify-stop.ps1".into(), note: Some("main session done".into()) },
+                    picker::ListOption { label: "SubagentStop".into(), value: "notify-subagent-stop.ps1".into(), note: Some("subagent done".into()) },
+                ];
+                if let picker::ListChoice::Picked(script) = picker::choose_from_list(&profiles, m, "Fire which toast?", None, &options, None)? {
+                    let home = std::env::var("USERPROFILE").unwrap_or_default();
+                    let path = format!("{home}\\.claude\\scripts\\{script}");
+                    // notify.ps1 does `[Console]::In.ReadToEnd()` expecting
+                    // hook JSON on stdin — without an explicit null stdin it
+                    // inherits the cockpit's own raw-mode terminal and blocks
+                    // forever waiting for EOF that never comes.
+                    let _ = std::process::Command::new("powershell")
+                        .args(["-NoProfile", "-File", &path])
+                        .stdin(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
             Action::Panels(name) => {
                 // Unlike Shell/external-editor, cockpit stays the terminal
                 // owner here (its own raw mode + alt screen already active)
