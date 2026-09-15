@@ -11,7 +11,7 @@
 // KERNELBASE!ConsoleInitialize forever, and dies with STATUS_DLL_INIT_FAILED
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
-use crate::{launch, layout, picker, profiles::Profile, quota, ui};
+use crate::{input::read_key, launch, layout, profiles::Profile, session, ui};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
@@ -257,15 +257,196 @@ fn max_panes_for(cols: u16, rows: u16) -> usize {
     best
 }
 
-/// Same "N sessions · usage %" note shown in the handoff picker — the pane
-/// pickers below built their options with `note: None`, so no profile ever
-/// showed quota info while adding a pane, even one sitting at 99% headroom.
-fn quota_note(name: &str) -> String {
-    let count = layout::account_stat(name).count;
-    let count_label = layout::pad_to(&format!("{count} sessions"), 12);
-    match quota::load(name) {
-        Some(q) => format!("{count_label}·  {:.0}% used", quota::usage(&q)),
-        None => format!("{count_label}·  usage unknown"),
+/// What picking a row in `pick_pane_target` resolves to.
+enum PaneAdd {
+    Start,
+    Pick(String, std::path::PathBuf),
+}
+
+/// One flattened, navigable row in `pick_pane_target`'s list.
+enum TargetRow {
+    Start,
+    Profile(usize),
+    /// `profile_idx`'s project at `path` — the always-shown "(current)" row
+    /// when `is_current`, else one revealed by expanding that profile.
+    Project { profile_idx: usize, path: std::path::PathBuf, is_current: bool },
+}
+
+/// Profile picker for adding a pane, with each profile expandable (→) into
+/// the projects it has sessions in — collapsed, a profile shows just one
+/// row (the cwd cockpit itself was launched from, "(current)"); expanding
+/// reveals its other recent projects (from `session::grouped_sessions`,
+/// the same source the Notes/Detail screens use) so a pane can be launched
+/// into a *different* project than the one cockpit is sitting in.
+///
+/// `start_label` shows a "Start" row first (`run_split`'s "launch with
+/// what's chosen so far") when `Some`; `None` for the mid-split "add a
+/// pane" picker (F7), which has no such concept.
+fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, start_label: Option<&str>) -> Result<Option<PaneAdd>> {
+    let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
+    // Only one profile expanded at a time — keeps "collapse" unambiguous
+    // (see the Left/Esc handling below) instead of needing to track which
+    // of several expanded profiles a given key press should affect.
+    let mut expanded: Option<usize> = None;
+    // Fetched once per profile, only on first expand — grouped_sessions
+    // scans every session file's cwd, not worth paying for a profile
+    // that's never expanded.
+    let mut projects_cache: std::collections::HashMap<usize, Vec<session::SessionGroup>> = std::collections::HashMap::new();
+    let mut selected = 0usize;
+    let mut top = 0usize;
+    // Set on collapse, resolved against the freshly-rebuilt row list at
+    // the top of the next iteration — restores the highlight to the
+    // profile row itself, instead of leaving `selected` at whatever
+    // numeric position it was at among the expanded project rows, which
+    // could now land on a completely different (and shorter) profile
+    // after the list shrinks back down.
+    let mut refocus_profile: Option<usize> = None;
+    // Computed once, not per frame — this used to call `account_stat`
+    // (a full directory walk per profile) on every single keystroke via
+    // `quota_note`/`account_lines`, which is what made the screen laggy.
+    let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+
+    ui::hide_cursor();
+    loop {
+        // Rebuilt every frame from `expanded` — cheap (a handful of
+        // profiles/projects), and simplest way to keep the flattened
+        // row list in sync with expand state without a parallel index.
+        let mut rows: Vec<TargetRow> = Vec::new();
+        if start_label.is_some() {
+            rows.push(TargetRow::Start);
+        }
+        for i in 0..profiles.len() {
+            rows.push(TargetRow::Profile(i));
+            rows.push(TargetRow::Project { profile_idx: i, path: cwd.to_path_buf(), is_current: true });
+            if expanded == Some(i) {
+                if let Some(groups) = projects_cache.get(&i) {
+                    for g in groups {
+                        if g.folder.replace('\\', "/") == cwd_norm {
+                            continue; // already shown as the "(current)" row
+                        }
+                        rows.push(TargetRow::Project { profile_idx: i, path: std::path::PathBuf::from(&g.folder), is_current: false });
+                    }
+                }
+            }
+        }
+        // The always-shown "(current)" row under each profile is display
+        // only, not a distinct pick from the profile row itself (Enter on
+        // the profile already means "use current project") — excluded
+        // from ↑/↓ so a profile moves straight to the next one instead of
+        // stopping on a line that duplicates its own default action.
+        let selectable_idx: Vec<usize> =
+            rows.iter().enumerate().filter(|(_, r)| !matches!(r, TargetRow::Project { is_current: true, .. })).map(|(i, _)| i).collect();
+        if let Some(pi) = refocus_profile.take() {
+            if let Some(pos) = selectable_idx.iter().position(|&i| matches!(rows[i], TargetRow::Profile(p) if p == pi)) {
+                selected = pos;
+            }
+        }
+        selected = selected.min(selectable_idx.len().saturating_sub(1));
+        let active_row = selectable_idx[selected];
+
+        let mut header = layout::account_lines(profiles, -1, &stats);
+        header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(heading)));
+        header.push(ui::color::dim("   Enter select · → on a profile shows its other projects"));
+        header.push(String::new());
+
+        // Same viewport-paging pattern as every other scrollable list here
+        // (e.g. `choose_from_list_lazy`) — without it, expanding a profile
+        // with several projects can push later rows off the bottom of a
+        // short terminal with no way to see them: the selection still
+        // moves there on ↓, it's just invisible, which looked like
+        // "arrow keys don't work."
+        let chrome = header.len() + 4;
+        let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(chrome).max(3);
+        if active_row < top {
+            top = active_row;
+        }
+        if active_row >= top + viewport {
+            top = active_row - viewport + 1;
+        }
+        top = top.min(rows.len().saturating_sub(viewport));
+        let end = (top + viewport).min(rows.len());
+
+        let mut lines = header;
+        if top > 0 {
+            lines.push(ui::color::dim(&format!("    ↑ {top} more")));
+        }
+        for (i, row) in rows.iter().enumerate().take(end).skip(top) {
+            let on = i == active_row;
+            let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+            let text = match row {
+                TargetRow::Start => {
+                    let label = start_label.unwrap_or("Start");
+                    if on { ui::color::orange_bold(label) } else { label.to_string() }
+                }
+                TargetRow::Profile(pi) => {
+                    let name = &profiles[*pi].name;
+                    if on { ui::color::orange_bold(name) } else { name.clone() }
+                }
+                TargetRow::Project { path, is_current, .. } => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let tag = if *is_current { ui::color::dim("(current)") } else { String::new() };
+                    let text = format!("    {name} {tag}");
+                    if on { ui::color::orange_bold(&text) } else { ui::color::dim(&text) }
+                }
+            };
+            lines.push(format!(" {marker} {text}"));
+        }
+        if end < rows.len() {
+            lines.push(ui::color::dim(&format!("    ↓ {} more", rows.len() - end)));
+        }
+        lines.push(String::new());
+        lines.push(ui::rule(None));
+        lines.push(format!(
+            " {} move   {} select   {} expand   {} {}",
+            ui::color::dim("↑/↓"),
+            ui::color::dim("Enter"),
+            ui::color::dim("→"),
+            ui::color::dim(&format!("{}/Esc", ui::glyph::back())),
+            if expanded.is_some() { "collapse" } else { "back" },
+        ));
+        ui::repaint(&lines);
+
+        let key = read_key()?;
+        if key.ctrl && key.code == KeyCode::Char('c') {
+            ui::show_cursor();
+            std::process::exit(130);
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+                // First press collapses whichever profile is expanded and
+                // stays on this screen; only actually backs out once
+                // nothing is expanded — matches every other drill-down
+                // list in the cockpit, where Back unwinds one level.
+                if let Some(pi) = expanded.take() {
+                    refocus_profile = Some(pi);
+                } else {
+                    ui::show_cursor();
+                    return Ok(None);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                selected = (selected + selectable_idx.len() - 1) % selectable_idx.len();
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                selected = (selected + 1) % selectable_idx.len();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let TargetRow::Profile(pi) = &rows[active_row] {
+                    let pi = *pi;
+                    projects_cache.entry(pi).or_insert_with(|| session::grouped_sessions(&profiles[pi].name));
+                    expanded = Some(pi);
+                }
+            }
+            KeyCode::Enter => {
+                ui::show_cursor();
+                return Ok(Some(match &rows[active_row] {
+                    TargetRow::Start => PaneAdd::Start,
+                    TargetRow::Profile(pi) => PaneAdd::Pick(profiles[*pi].name.clone(), cwd.to_path_buf()),
+                    TargetRow::Project { profile_idx, path, .. } => PaneAdd::Pick(profiles[*profile_idx].name.clone(), path.clone()),
+                }));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -275,51 +456,63 @@ fn quota_note(name: &str) -> String {
 /// only when the last pane is gone (or Ctrl+Q). v1 scope: no system-prompt
 /// composition for the panes (plain launches only).
 pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
-    const START: &str = "\0start"; // sentinel row value; no profile can be named this
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let cap = max_panes_for(cols, rows);
+    let cwd = std::env::current_dir()?;
 
-    let mut chosen: Vec<String> = vec![first.to_string()];
+    let mut chosen: Vec<(String, std::path::PathBuf)> = vec![(first.to_string(), cwd.clone())];
     while chosen.len() < cap {
         // A "Start" row launches with whatever's chosen so far (one pane =
-        // a solo session, two or more = a split); picking a profile adds
-        // another pane; Esc cancels the whole thing.
+        // a solo session, two or more = a split); picking a profile (or one
+        // of its other projects, via →) adds another pane; Esc cancels the
+        // whole thing.
         let n = chosen.len();
         let start_label = if n == 1 { "Start (solo session)".to_string() } else { format!("Start ({n} panes)") };
-        let mut options = vec![picker::ListOption { label: start_label, value: START.to_string(), note: None }];
-        options.extend(
-            profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(quota_note(&p.name)) }),
-        );
-        let heading = format!("Panes so far: {}", chosen.join(", "));
-        match picker::choose_from_list(profiles, -1, &heading, Some("Enter to add a pane · pick Start to launch · Esc to cancel"), &options, None)? {
-            picker::ListChoice::Picked(v) if v == START => break,
-            picker::ListChoice::Picked(v) => chosen.push(v),
-            _ => return Ok(None),
+        let names: Vec<&str> = chosen.iter().map(|(name, _)| name.as_str()).collect();
+        let heading = format!("Panes so far: {}", names.join(", "));
+        match pick_pane_target(profiles, &cwd, &heading, Some(&start_label))? {
+            Some(PaneAdd::Start) => break,
+            Some(PaneAdd::Pick(name, project)) => chosen.push((name, project)),
+            None => return Ok(None),
         }
     }
-    run_split_profiles(profiles, &chosen)
+    run_split_targets(profiles, &chosen)
 }
 
-/// Run a split of exactly the given profiles (one pane each, in order).
-/// `profiles` is the full account list, used only to offer choices when a
-/// pane is added mid-split. Split out from the picker so it can be driven
-/// directly (tests, a CLI entry).
+/// Run a split of exactly the given profiles (one pane each, in order), all
+/// in the current directory. `profiles` is the full account list, used only
+/// to offer choices when a pane is added mid-split. Split out from the
+/// picker so it can be driven directly (tests, a CLI entry).
 ///
 /// Returns `Some(Session)` if the user detached (Ctrl+B) — the panes keep
 /// running in the background and the cockpit can `resume` them later — or
 /// `None` if they quit (Ctrl+Q) or the last pane exited.
 pub fn run_split_profiles(profiles: &[Profile], profile_names: &[String]) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (pane_cols, pane_rows) = pane_geometry(cols, rows, profile_names.len());
+    let targets: Vec<(String, std::path::PathBuf)> = profile_names.iter().map(|n| (n.clone(), cwd.clone())).collect();
+    run_split_targets(profiles, &targets)
+}
 
-    let mut panes: Vec<Pane> = Vec::with_capacity(profile_names.len());
-    for name in profile_names {
-        panes.push(spawn_pane(name, name.clone(), &cwd, pane_cols, pane_rows)?);
+/// Same as `run_split_profiles`, but each pane can launch into its own
+/// project directory instead of all sharing the caller's cwd — what the
+/// interactive picker (`pick_pane_target`, → to pick another project)
+/// needs underneath.
+fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBuf)]) -> Result<Option<Session>> {
+    let cwd = std::env::current_dir()?;
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (pane_cols, pane_rows) = pane_geometry(cols, rows, targets.len());
+
+    let mut panes: Vec<Pane> = Vec::with_capacity(targets.len());
+    for (name, project) in targets {
+        panes.push(spawn_pane(name, name.clone(), project, pane_cols, pane_rows)?);
     }
     let mut focus = 0usize;
 
     ui::hide_cursor();
+    // The shared `cwd` here (not each pane's own project) is what F9/`
+    // shell`'s drop-to-shell and F7's "add a pane" default to — cockpit's
+    // own launch directory, not whichever project a given pane happens to
+    // be running in.
     let exit = run_loop(&mut panes, &mut focus, profiles, &cwd);
     ui::show_cursor();
     finish(panes, focus, cwd, exit)
@@ -393,17 +586,25 @@ pub fn resume(mut session: Session, profiles: &[Profile]) -> Result<Option<Sessi
     }
 }
 
+/// Resizes one pane's real PTY and vt100 mirror together — both have to
+/// agree, or the child's own auto-wrap point (governed by the real PTY
+/// size) and our cursor/render math (governed by the vt100 size) drift
+/// apart.
+fn resize_pane(pane: &Pane, rows: u16, cols: u16) {
+    let _ = pane.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+    if let Ok(mut p) = pane.parser.lock() {
+        p.set_size(rows, cols);
+    }
+    pane.dirty.store(true, Ordering::Relaxed);
+}
+
 /// Re-lays every pane for the current pane count and terminal size, and marks
 /// them dirty so the next tick repaints. Call after a pane is added, closed,
 /// or the terminal is resized.
 fn reflow(panes: &[Pane], cols: u16, rows: u16) {
     let (pc, pr) = pane_geometry(cols, rows, panes.len());
     for pane in panes {
-        let _ = pane.master.resize(PtySize { rows: pr, cols: pc, pixel_width: 0, pixel_height: 0 });
-        if let Ok(mut p) = pane.parser.lock() {
-            p.set_size(pr, pc);
-        }
-        pane.dirty.store(true, Ordering::Relaxed);
+        resize_pane(pane, pr, pc);
     }
 }
 
@@ -414,18 +615,13 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     if panes.len() >= max_panes_for(cols, rows) {
         return Ok(()); // no room for another usable pane
     }
-    let options: Vec<picker::ListOption> =
-        profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(quota_note(&p.name)) }).collect();
-    let choice = picker::choose_from_list(profiles, -1, "Add a pane — which profile?", Some("Enter to add · Esc to cancel"), &options, None)?;
+    let choice = pick_pane_target(profiles, cwd, "Add a pane — which profile?", None)?;
     ui::hide_cursor(); // the picker shows it again
-    if let picker::ListChoice::Picked(name) = choice {
+    if let Some(PaneAdd::Pick(name, project)) = choice {
         let (pc, pr) = pane_geometry(cols, rows, panes.len() + 1);
-        let pane = spawn_pane(&name, name.clone(), cwd, pc, pr)?;
+        let pane = spawn_pane(&name, name.clone(), &project, pc, pr)?;
         for p in panes.iter() {
-            let _ = p.master.resize(PtySize { rows: pr, cols: pc, pixel_width: 0, pixel_height: 0 });
-            if let Ok(mut parser) = p.parser.lock() {
-                parser.set_size(pr, pc);
-            }
+            resize_pane(p, pr, pc);
         }
         panes.push(pane);
         *focus = panes.len() - 1;
@@ -464,9 +660,15 @@ fn close_focused(panes: &mut Vec<Pane>, focus: &mut usize, cols: u16, rows: u16)
 /// (see the comment on `ui::repaint_body` for why that matters: separate
 /// flushed writes for hide/content/reposition is what produced a fast
 /// blink instead of one clean cursor move per frame).
-fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16) -> String {
-    let (_, gcols) = grid_dims(panes.len());
-    let (gr, gc) = ((focus / gcols) as u16, (focus % gcols) as u16);
+fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16, zoomed: bool) -> String {
+    // Zoomed, the focused pane is drawn alone at grid cell (0, 0) — its
+    // real index among `panes` doesn't matter for layout math anymore.
+    let (gr, gc) = if zoomed {
+        (0u16, 0u16)
+    } else {
+        let (_, gcols) = grid_dims(panes.len());
+        ((focus / gcols) as u16, (focus % gcols) as u16)
+    };
     let Ok(p) = panes[focus].parser.lock() else { return String::new() };
     let screen = p.screen();
     if screen.hide_cursor() {
@@ -519,20 +721,27 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     // so a lone "/shell"+Enter can be recognised. Reset whenever focus moves
     // or a non-text key is pressed.
     let mut typed = String::new();
+    // Pane zoom: the focused pane alone, resized to fill the terminal; the
+    // rest keep running (their reader threads still drain output, their
+    // dirty flags still get set) but aren't drawn or resized until unzoomed
+    // — same idea as tmux's zoom, not a separate mode with its own state
+    // machine, just a different `n` for layout math.
+    let mut zoomed = false;
     loop {
         // Swap every dirty flag (not short-circuiting) so one repaint clears
         // all of them and picks up every pane that changed this tick.
         let dirty = panes.iter().fold(false, |acc, p| acc | p.dirty.swap(false, Ordering::Relaxed));
         if dirty {
-            let n = panes.len();
+            let n = if zoomed { 1 } else { panes.len() };
             let (grows, gcols) = grid_dims(n);
-            let guards: Vec<_> = panes.iter().map(|p| p.parser.lock().unwrap()).collect();
+            let guards: Vec<_> =
+                if zoomed { vec![panes[*focus].parser.lock().unwrap()] } else { panes.iter().map(|p| p.parser.lock().unwrap()).collect() };
             let (pane_rows, pane_cols) = guards[0].screen().size();
-            let labels: Vec<String> = panes
-                .iter()
-                .enumerate()
-                .map(|(i, p)| if i == *focus { ui::color::orange_bold(&p.label) } else { p.label.clone() })
-                .collect();
+            let labels: Vec<String> = if zoomed {
+                vec![format!("{} {}", ui::color::orange_bold(&panes[*focus].label), ui::color::dim("(zoomed)"))]
+            } else {
+                panes.iter().enumerate().map(|(i, p)| if i == *focus { ui::color::orange_bold(&p.label) } else { p.label.clone() }).collect()
+            };
             let total_w = gcols * pane_cols as usize + (gcols - 1) * SEP_COLS as usize;
             let blank_cell = " ".repeat(pane_cols as usize);
             let mut lines = Vec::with_capacity(grows * (pane_rows as usize + 1) + 3);
@@ -556,15 +765,20 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                 }
             }
             lines.push(String::new());
-            lines.push(format!(
-                " {} switch   {} add   {} close   {} shell   {} back   {} quit",
-                ui::color::dim("F6"),
-                ui::color::dim("F7"),
-                ui::color::dim("F8"),
-                ui::color::dim("F9"),
-                ui::color::dim("Ctrl+B"),
-                ui::color::dim("Ctrl+Q"),
-            ));
+            lines.push(if zoomed {
+                format!(" {} unzoom   {} shell   {} back   {} quit", ui::color::dim("F10"), ui::color::dim("F9"), ui::color::dim("Ctrl+B"), ui::color::dim("Ctrl+Q"))
+            } else {
+                format!(
+                    " {} switch   {} add   {} close   {} zoom   {} shell   {} back   {} quit",
+                    ui::color::dim("F6"),
+                    ui::color::dim("F7"),
+                    ui::color::dim("F8"),
+                    ui::color::dim("F10"),
+                    ui::color::dim("F9"),
+                    ui::color::dim("Ctrl+B"),
+                    ui::color::dim("Ctrl+Q"),
+                )
+            });
             // One write+flush for hide+content+reposition+show together —
             // hiding the cursor before the content overwrite (so the
             // redraw can't drag a visible cursor across it) used to be a
@@ -573,7 +787,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
             // gap between "cursor off" and "back on" to look like a fast
             // blink instead of one clean frame.
             drop(guards); // cursor_escape below re-locks the focused pane's parser
-            let cursor = cursor_escape(panes, *focus, pane_rows, pane_cols);
+            let cursor = cursor_escape(panes, *focus, pane_rows, pane_cols, zoomed);
             let frame = format!("\x1b[?25l{}{cursor}", ui::repaint_body(&lines));
             let mut out = std::io::stdout();
             let _ = out.write_all(frame.as_bytes());
@@ -594,6 +808,35 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     // cockpit can resume it, also with Ctrl+B.
                     if ctrl && k.code == KeyCode::Char('b') {
                         return Ok(LoopExit::Detach);
+                    }
+                    // F10 toggles zoom: the focused pane alone, resized to
+                    // fill the terminal; the others keep running untouched
+                    // (still draining output, still marked dirty) but stay
+                    // undrawn and unresized until unzoomed.
+                    if k.code == KeyCode::F(10) {
+                        typed.clear();
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        zoomed = !zoomed;
+                        if zoomed {
+                            let (pc, pr) = pane_geometry(cols, rows, 1);
+                            resize_pane(&panes[*focus], pr, pc);
+                        } else {
+                            // Back to the shared grid size for every pane —
+                            // the others were never resized while zoomed, so
+                            // this is what brings them back in sync with the
+                            // one that was.
+                            reflow(panes, cols, rows);
+                        }
+                        for pane in panes.iter() {
+                            pane.dirty.store(true, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    // Switch/add/close would need to reconcile with a
+                    // single resized-to-fill pane mid-zoom — simpler to
+                    // just require F10 first, same as tmux.
+                    if zoomed && matches!(k.code, KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8)) {
+                        continue;
                     }
                     // F6 cycles focus forward, Shift+F6 backward. (Tab/BackTab
                     // are deliberately left for the focused pane — Claude uses
@@ -661,14 +904,16 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     }
                 }
                 Event::Resize(mut cols, mut rows) => {
-                    // A mouse-wheel/Ctrl+scroll zoom fires a burst of Resize
-                    // events in quick succession, one per intermediate size
-                    // — reflow-ing on every single one means every pane's
-                    // real PTY and vt100 buffer get resized many times a
-                    // second, and Claude's own TUI (inside that inner PTY)
-                    // racing to repaint for each intermediate size is what
-                    // made zoom feel broken. Drain whatever's already
-                    // queued and reflow once, at the final size only.
+                    // A mouse-wheel/Ctrl+scroll *font* zoom (unrelated to
+                    // pane zoom above — same word, different feature) fires
+                    // a burst of Resize events in quick succession, one per
+                    // intermediate size — reflow-ing on every single one
+                    // means every pane's real PTY and vt100 buffer get
+                    // resized many times a second, and Claude's own TUI
+                    // (inside that inner PTY) racing to repaint for each
+                    // intermediate size is what made it feel broken. Drain
+                    // whatever's already queued and reflow once, at the
+                    // final size only.
                     while event::poll(Duration::ZERO)? {
                         match event::read()? {
                             Event::Resize(c, r) => {
@@ -692,7 +937,12 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                             _ => {}
                         }
                     }
-                    reflow(panes, cols, rows);
+                    if zoomed {
+                        let (pc, pr) = pane_geometry(cols, rows, 1);
+                        resize_pane(&panes[*focus], pr, pc);
+                    } else {
+                        reflow(panes, cols, rows);
+                    }
                 }
                 _ => {}
             }
@@ -719,7 +969,15 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                 *focus = panes.len() - 1;
             }
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            reflow(panes, cols, rows);
+            if zoomed {
+                // The exited pane may have been the zoomed one — resize
+                // whichever pane is focused now to fill the screen rather
+                // than the shared grid size.
+                let (pc, pr) = pane_geometry(cols, rows, 1);
+                resize_pane(&panes[*focus], pr, pc);
+            } else {
+                reflow(panes, cols, rows);
+            }
         }
     }
 }
