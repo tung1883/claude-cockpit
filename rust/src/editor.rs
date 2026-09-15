@@ -40,7 +40,15 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
 
     let mut save = |lines: &[String], dirty: &mut bool, save_error: &mut Option<String>| -> bool {
-        let content = lines.join("\n") + "\n";
+        // `join` alone round-trips exactly what `read_safe_lines` split out
+        // (its trailing empty element already stands for the file's final
+        // newline) — unconditionally appending another "\n" on top double-
+        // counted it, so every edit/save cycle grew one more blank line at
+        // the end. Only add one when the buffer truly has none.
+        let mut content = lines.join("\n");
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
         match std::fs::write(file, content) {
             Ok(()) => {
                 *dirty = false;
