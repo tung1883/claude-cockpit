@@ -66,6 +66,85 @@ fn word_right(chars: &[char], col: usize) -> usize {
     c
 }
 
+/// Runs of space / non-space, alternating, covering the whole line — the
+/// unit `wrap_points` packs so a wrap never lands inside a word.
+fn tokenize(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        let is_space = chars[i] == ' ';
+        while i < chars.len() && (chars[i] == ' ') == is_space {
+            i += 1;
+        }
+        tokens.push((start, i));
+    }
+    tokens
+}
+
+/// Soft-wrap points (start char-index of each visual segment, always
+/// starting with 0) for one line, shared by the renderer (building each
+/// visual row's char range) and cursor placement (which visual row `col`
+/// falls on) so the two can never disagree. Wraps on a space boundary —
+/// never splitting a word mid-way — unless a single word alone is longer
+/// than `width`, which has no choice but a hard split. This is what every
+/// real editor does, instead of horizontally scrolling or letting the
+/// terminal hard-wrap at a raw column count (which both desyncs
+/// row/cursor math that assumes one buffer line = one screen row, and —
+/// worse — chops words apart at whatever column the wrap happens to land
+/// on, e.g. "short" becoming "s" / "hort").
+fn wrap_points(chars: &[char], width: usize) -> Vec<usize> {
+    if chars.is_empty() {
+        return vec![0];
+    }
+    let mut starts = vec![0usize];
+    let mut col = 0usize;
+    for (t_start, t_end) in tokenize(chars) {
+        let mut remaining = t_end - t_start;
+        if col > 0 && col + remaining > width {
+            starts.push(t_start);
+            col = 0;
+        }
+        if remaining > width {
+            let mut pos = t_start;
+            while remaining > 0 {
+                let take = width.min(remaining);
+                pos += take;
+                remaining -= take;
+                col = take;
+                if remaining > 0 {
+                    starts.push(pos);
+                    col = 0;
+                }
+            }
+        } else {
+            col += remaining;
+        }
+    }
+    starts
+}
+
+/// Which segment (0-based) of `wrap_points(chars, ..)` a given `col`
+/// falls on — the last segment when `col` is at or past the line's end,
+/// so the cursor sits right after the last typed character rather than
+/// implying a not-yet-existing extra wrapped row.
+fn seg_index_for_col(points: &[usize], len: usize, col: usize) -> usize {
+    if col >= len {
+        return points.len() - 1;
+    }
+    match points.binary_search(&col) {
+        Ok(k) => k,
+        Err(k) => k.saturating_sub(1),
+    }
+}
+
+/// [start, end) char range shown on segment `seg`, given its wrap points.
+fn seg_range(points: &[usize], len: usize, seg: usize) -> (usize, usize) {
+    let start = points[seg];
+    let end = points.get(seg + 1).copied().unwrap_or(len);
+    (start, end)
+}
+
 fn read_safe_lines(file: &Path) -> Vec<String> {
     let content = std::fs::read_to_string(file).unwrap_or_default();
     let lines: Vec<String> = content.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
@@ -84,6 +163,8 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
     let mut lines = read_safe_lines(file);
     let mut row: usize = 0;
     let mut col: usize = 0;
+    // A *visual*-row index now, not a buffer-line index — see the
+    // `display_rows`/soft-wrap comment below.
     let mut top: usize = 0;
     let mut dirty = false;
     let mut save_error: Option<String> = None;
@@ -128,24 +209,53 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
 
         let rows_avail = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
         let viewport = (rows_avail.saturating_sub(header.len() + 5)).max(5);
-        if row < top {
-            top = row;
+        let gutter = 4; // "NNN " line-number column
+        let cols_avail = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).saturating_sub(gutter).max(1);
+
+        // Every buffer line's char length turned into (line_idx, start,
+        // end) segments of at most `cols_avail` chars — a long line splits
+        // into several consecutive entries instead of one that would
+        // either get cut off (`ui::repaint_body`'s own clip) or hard-wrap
+        // in a way that desyncs this scroll/cursor math, which treats each
+        // entry as exactly one screen row.
+        let mut display_rows: Vec<(usize, usize, usize)> = Vec::new();
+        let mut cursor_display_row = 0usize;
+        let mut cursor_seg_start = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            let len = chars.len();
+            let points = wrap_points(&chars, cols_avail);
+            if i == row {
+                let seg = seg_index_for_col(&points, len, col);
+                cursor_display_row = display_rows.len() + seg;
+                cursor_seg_start = points[seg];
+            }
+            for seg in 0..points.len() {
+                let (s, e) = seg_range(&points, len, seg);
+                display_rows.push((i, s, e));
+            }
         }
-        if row >= top + viewport {
-            top = row - viewport + 1;
+
+        if cursor_display_row < top {
+            top = cursor_display_row;
         }
-        top = top.min(lines.len().saturating_sub(viewport));
+        if cursor_display_row >= top + viewport {
+            top = cursor_display_row - viewport + 1;
+        }
+        top = top.min(display_rows.len().saturating_sub(viewport));
 
         let mut out = header.clone();
-        let end = (top + viewport).min(lines.len());
+        let end = (top + viewport).min(display_rows.len());
         if top > 0 {
             out.push(ui::color::dim(&format!("    ↑ {top} more")));
         }
-        for (i, line) in lines.iter().enumerate().take(end).skip(top) {
-            out.push(format!("{} {line}", ui::color::dim(&format!("{:>3}", i + 1))));
+        for &(i, start, seg_end) in display_rows.iter().take(end).skip(top) {
+            let seg_text = &lines[i][byte_at(&lines[i], start)..byte_at(&lines[i], seg_end)];
+            let num = if start == 0 { format!("{:>3}", i + 1) } else { "   ".to_string() };
+            out.push(format!("{} {seg_text}", ui::color::dim(&num)));
         }
-        if end < lines.len() {
-            out.push(ui::color::dim(&format!("    ↓ {} more", lines.len() - end)));
+        if end < display_rows.len() {
+            out.push(ui::color::dim(&format!("    ↓ {} more", display_rows.len() - end)));
         }
         out.push(String::new());
         out.push(ui::rule(None));
@@ -159,9 +269,8 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
             ui::color::dim("Ctrl+C"),
         ));
         ui::repaint(&out);
-        let gutter = 4; // "NNN " line-number column
-        let term_row = header.len() + 1 + (row - top) + usize::from(top > 0);
-        let term_col = 1 + gutter + col;
+        let term_row = header.len() + 1 + (cursor_display_row - top) + usize::from(top > 0);
+        let term_col = 1 + gutter + (col - cursor_seg_start);
         print!("\x1b[{term_row};{term_col}H");
         std::io::stdout().flush()?;
 

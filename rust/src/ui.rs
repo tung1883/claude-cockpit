@@ -112,11 +112,40 @@ pub fn show_cursor() {
     write_raw("\x1b[?25h");
 }
 
-/// Repaint a block of lines anchored to the top of the screen: home the
-/// cursor, overwrite each line, then erase anything below. No full-screen
-/// wipe, so there's no flash — not between keystrokes and not between
-/// screens. Every cockpit screen paints from row 1, so switching screens just
-/// overwrites in place.
+/// Cuts `s` down to `max` visible columns, passing every ANSI SGR escape
+/// (`\x1b...m`) through untouched (so a color/reset code past the cutoff —
+/// e.g. a trailing reset) still survives) but dropping plain characters
+/// once the visible count is reached. Every screen renders through this
+/// before `repaint`, so a line longer than the terminal is never left for
+/// the terminal itself to hard-wrap: that auto-wrap is what turned one
+/// logical row into two on screen while every row/scroll/cursor
+/// calculation in the caller still assumed one row per line — the
+/// "renders as 2 lines" bug, and the same root cause behind "zoom sucks"
+/// (shrinking the terminal made existing lines newly wrap that hadn't
+/// before).
+fn clip_visible(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut visible = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible < max {
+            out.push(c);
+            visible += 1;
+        }
+    }
+    out
+}
+
 /// Builds the escape sequence `repaint` writes, without writing it — lets a
 /// caller (the panel compositor) fold it into one larger write+flush along
 /// with its own trailing escapes (e.g. cursor positioning), instead of each
@@ -125,10 +154,10 @@ pub fn show_cursor() {
 /// is enough visible latency between "cursor off" and "cursor back on" to
 /// read as a fast blink instead of one clean frame.
 pub fn repaint_body(lines: &[String]) -> String {
-    // Home, write each line then erase its tail, join with CR+LF, then erase
-    // below. No trailing newline — a newline on the last row scrolls the page
-    // and the next paint lands one row higher: that one-row jitter is the
-    // "flicker".
+    // Home, write each line (clipped to the terminal width, then erase its
+    // tail), join with CR+LF, then erase below. No trailing newline — a
+    // newline on the last row scrolls the page and the next paint lands one
+    // row higher: that one-row jitter is the "flicker".
     //
     // Erase-to-end-of-line (`\x1b[K`) goes AFTER the content, not a whole-line
     // erase (`\x1b[2K`) before it: on a screen that repaints continuously (the
@@ -136,9 +165,10 @@ pub fn repaint_body(lines: &[String]) -> String {
     // blanks each row a frame before it is redrawn, and that blank-then-draw
     // is exactly the visible flash. Overwriting in place and only clearing the
     // stale tail never shows a blank cell.
+    let width = term_width();
     let body = lines
         .iter()
-        .map(|l| format!("{l}\x1b[K"))
+        .map(|l| format!("{}\x1b[K", clip_visible(l, width)))
         .collect::<Vec<_>>()
         .join("\r\n");
     format!("\x1b[H{body}\x1b[0J")
