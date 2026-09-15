@@ -11,7 +11,7 @@
 // KERNELBASE!ConsoleInitialize forever, and dies with STATUS_DLL_INIT_FAILED
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
-use crate::{launch, picker, profiles::Profile, ui};
+use crate::{launch, layout, picker, profiles::Profile, quota, ui};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
@@ -257,6 +257,18 @@ fn max_panes_for(cols: u16, rows: u16) -> usize {
     best
 }
 
+/// Same "N sessions · usage %" note shown in the handoff picker — the pane
+/// pickers below built their options with `note: None`, so no profile ever
+/// showed quota info while adding a pane, even one sitting at 99% headroom.
+fn quota_note(name: &str) -> String {
+    let count = layout::account_stat(name).count;
+    let count_label = layout::pad_to(&format!("{count} sessions"), 12);
+    match quota::load(name) {
+        Some(q) => format!("{count_label}·  {:.0}% used", quota::usage(&q)),
+        None => format!("{count_label}·  usage unknown"),
+    }
+}
+
 /// N Claude sessions side by side, `first` plus profiles chosen here. Panes
 /// can be added (F7) and closed (F8) while running, and a pane whose session
 /// exits on its own is dropped without disturbing the others; the split ends
@@ -276,7 +288,7 @@ pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
         let start_label = if n == 1 { "Start (solo session)".to_string() } else { format!("Start ({n} panes)") };
         let mut options = vec![picker::ListOption { label: start_label, value: START.to_string(), note: None }];
         options.extend(
-            profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: None }),
+            profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(quota_note(&p.name)) }),
         );
         let heading = format!("Panes so far: {}", chosen.join(", "));
         match picker::choose_from_list(profiles, -1, &heading, Some("Enter to add a pane · pick Start to launch · Esc to cancel"), &options, None)? {
@@ -403,7 +415,7 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
         return Ok(()); // no room for another usable pane
     }
     let options: Vec<picker::ListOption> =
-        profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: None }).collect();
+        profiles.iter().map(|p| picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(quota_note(&p.name)) }).collect();
     let choice = picker::choose_from_list(profiles, -1, "Add a pane — which profile?", Some("Enter to add · Esc to cancel"), &options, None)?;
     ui::hide_cursor(); // the picker shows it again
     if let picker::ListChoice::Picked(name) = choice {
@@ -543,6 +555,12 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                 ui::color::dim("Ctrl+Q"),
             ));
             drop(guards);
+            // Hidden before the rewrite, not just after — draw_cursor's
+            // last call may have left the real cursor shown (a visible
+            // pane cursor), and repaint's home+overwrite would otherwise
+            // drag that visible cursor across the redrawn content on every
+            // dirty tick, which is what the flicker was.
+            ui::hide_cursor();
             ui::repaint(&lines);
             draw_cursor(panes, *focus, pane_rows, pane_cols);
         }

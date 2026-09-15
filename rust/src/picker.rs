@@ -157,10 +157,9 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
 /// The settings screen: a short list of cockpit-wide toggles, drawn under
 /// the same account list as the profile picker (same selected account
 /// highlighted) so backing out returns to exactly where you left off. ↑/↓
-/// move; Enter/Space flips a plain on/off row. The Notifications row is
-/// 3-state (off/toast/terminal) — ←/→ cycle it either way, Enter is the
-/// same as → (so Enter still "does something" there instead of only
-/// working on the boolean rows).
+/// move; Enter/Space changes the highlighted row — flips a plain on/off row,
+/// or advances the Notifications row's 3-state (off/toast/terminal) by one.
+/// Left still means "back" here, same as everywhere else in the cockpit.
 pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Result<()> {
     use crate::settings::NotifyMode;
     const NOTIFY_ROW: usize = 2;
@@ -196,13 +195,11 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
             lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 40)));
         }
         lines.push(String::new());
-        lines.push(ui::color::dim(&format!("↑/↓ move · ←/→/Enter/Space change · {}/Esc back", ui::glyph::back())));
+        lines.push(ui::color::dim(&format!("↑/↓ move · Enter/Space change · {}/Esc back", ui::glyph::back())));
         ui::repaint(&lines);
 
         let key = read_key()?;
-        // Left cycles every row now instead of doubling as "back" — Esc/h/q
-        // are the only way out of this screen.
-        let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q')) || (key.ctrl && key.code == KeyCode::Char('c'));
+        let back = matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q')) || (key.ctrl && key.code == KeyCode::Char('c'));
         if back {
             ui::show_cursor();
             return Ok(());
@@ -210,10 +207,6 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         match key.code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => selected = (selected + COUNT - 1) % COUNT,
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => selected = (selected + 1) % COUNT,
-            KeyCode::Left if selected == NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(false)),
-            KeyCode::Right if selected == NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
-            KeyCode::Left | KeyCode::Right if selected == 0 => crate::settings::set_session_wrapped(!wrapped),
-            KeyCode::Left | KeyCode::Right if selected == 1 => crate::settings::set_notes_enabled(!notes),
             KeyCode::Enter | KeyCode::Char(' ') => match selected {
                 0 => crate::settings::set_session_wrapped(!wrapped),
                 1 => crate::settings::set_notes_enabled(!notes),
