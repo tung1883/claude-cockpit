@@ -453,30 +453,6 @@ fn cockpit() -> Result<()> {
                 launch::open_shell(&cwd)?;
                 drop(suspend);
             }
-            // TEMP: pick one toast script and fire just that one, so each
-            // can be eyeballed on its own without waiting for a real Claude
-            // session to hit each hook. Remove Action::TestNotify (here,
-            // picker.rs, and the 't' hint) once confirmed good.
-            Action::TestNotify => {
-                let m = mark.map(|m| m as i64).unwrap_or(-1);
-                let options = [
-                    picker::ListOption { label: "Notification".into(), value: "notify.ps1".into(), note: Some("needs your input".into()) },
-                    picker::ListOption { label: "Stop".into(), value: "notify-stop.ps1".into(), note: Some("main session done".into()) },
-                    picker::ListOption { label: "SubagentStop".into(), value: "notify-subagent-stop.ps1".into(), note: Some("subagent done".into()) },
-                ];
-                if let picker::ListChoice::Picked(script) = picker::choose_from_list(&profiles, m, "Fire which toast?", None, &options, None)? {
-                    let home = std::env::var("USERPROFILE").unwrap_or_default();
-                    let path = format!("{home}\\.claude\\scripts\\{script}");
-                    // notify.ps1 does `[Console]::In.ReadToEnd()` expecting
-                    // hook JSON on stdin — without an explicit null stdin it
-                    // inherits the cockpit's own raw-mode terminal and blocks
-                    // forever waiting for EOF that never comes.
-                    let _ = std::process::Command::new("powershell")
-                        .args(["-NoProfile", "-File", &path])
-                        .stdin(std::process::Stdio::null())
-                        .spawn();
-                }
-            }
             Action::Panels(name) => {
                 // Unlike Shell/external-editor, cockpit stays the terminal
                 // owner here (its own raw mode + alt screen already active)
@@ -848,89 +824,136 @@ fn cockpit() -> Result<()> {
 
                 // One screen, every project — grouped under a heading each
                 // rather than a flat "<project> — TODO.md" list, or a
-                // project-then-file drill-down.
-                let mut others: Vec<PathBuf> = notes::known_project_roots().into_iter().filter(|p| p != &root).collect();
-                others.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_string().to_lowercase()).unwrap_or_default());
-
+                // project-then-file drill-down. Hidden ones (see
+                // notes::hide) are filtered out here only — their files and
+                // master section are untouched, so they resurface on their
+                // own once a session opens there again.
                 let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
-                let mut header = layout::account_lines(&profiles, m, &stats);
-                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Notes")));
-                header.push(ui::color::dim("   Enter edits it here"));
-                header.push(String::new());
 
-                let mut rows: Vec<picker::ScrollRow> = Vec::new();
-                let group = |rows: &mut Vec<picker::ScrollRow>, label: &str, todo: &std::path::Path, plan: &std::path::Path| {
-                    rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(label))));
-                    rows.push(picker::ScrollRow::pick("    TODO.md", todo.to_string_lossy().to_string()));
-                    rows.push(picker::ScrollRow::pick("    PLAN.md", plan.to_string_lossy().to_string()));
-                    rows.push(picker::ScrollRow::line(String::new()));
-                };
-                group(&mut rows, &format!("{name} (this project)"), &root.join("TODO.md"), &root.join("PLAN.md"));
-                group(&mut rows, "Master (every project)", &master_todo, &master_plan);
-                for other in &others {
-                    let oname = other.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    group(&mut rows, &oname, &other.join("TODO.md"), &other.join("PLAN.md"));
-                }
+                // Outer loop rebuilds the project list from scratch — needed
+                // after a hide, since that removes a group from the screen
+                // entirely. `continue 'screen` (fresh `at` of None) is what
+                // gives "hide" the requested "back to top" landing; a plain
+                // `continue` on the inner loop is what gives "no"/back its
+                // "stay exactly where you were" landing.
+                'screen: loop {
+                    let mut others: Vec<PathBuf> =
+                        notes::known_project_roots().into_iter().filter(|p| p != &root && !notes::is_hidden(p)).collect();
+                    others.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_string().to_lowercase()).unwrap_or_default());
+                    let this_hidden = notes::is_hidden(&root);
 
-                // Looped so declining/backing out of the "turn off?" confirm
-                // (Esc) lands back on this list at the same row, not the
-                // main menu — only an actual Back on the list itself, or
-                // confirming the turn-off, leaves this screen.
-                let mut at: Option<String> = None;
-                loop {
-                    let choice = picker::scroll_screen_ext(&header, &rows, at.as_deref(), Some('e'), Some(('c', "turn off notes")))?;
-                    let file = match choice {
-                        picker::ListChoice::Back => break,
-                        picker::ListChoice::Command('c') => {
-                            let confirm_options = [
-                                picker::ListOption { label: "Yes, turn off Notes".into(), value: "yes".into(), note: None },
-                                picker::ListOption { label: "No, keep Notes".into(), value: "no".into(), note: None },
-                            ];
-                            if let picker::ListChoice::Picked(a) = picker::choose_from_list(
-                                &profiles,
-                                m,
-                                "Turn off Notes?",
-                                Some("Removes it from the main menu until re-enabled"),
-                                &confirm_options,
-                                None,
-                            )? {
-                                if a == "yes" {
-                                    settings::set_notes_enabled(false);
-                                    break;
+                    let mut header = layout::account_lines(&profiles, m, &stats);
+                    header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Notes")));
+                    header.push(ui::color::dim("   Enter edits it here"));
+                    header.push(String::new());
+
+                    let mut rows: Vec<picker::ScrollRow> = Vec::new();
+                    let group = |rows: &mut Vec<picker::ScrollRow>, label: &str, todo: &std::path::Path, plan: &std::path::Path| {
+                        rows.push(picker::ScrollRow::line(format!("  {}", ui::color::orange_bold(label))));
+                        rows.push(picker::ScrollRow::pick("    TODO.md", todo.to_string_lossy().to_string()));
+                        rows.push(picker::ScrollRow::pick("    PLAN.md", plan.to_string_lossy().to_string()));
+                        rows.push(picker::ScrollRow::line(String::new()));
+                    };
+                    if !this_hidden {
+                        group(&mut rows, &format!("{name} (this project)"), &root.join("TODO.md"), &root.join("PLAN.md"));
+                    }
+                    group(&mut rows, "Master (every project)", &master_todo, &master_plan);
+                    for other in &others {
+                        let oname = other.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        group(&mut rows, &oname, &other.join("TODO.md"), &other.join("PLAN.md"));
+                    }
+
+                    // Looped so declining/backing out of a confirm (Esc)
+                    // lands back on this list at the same row, not the main
+                    // menu — only an actual Back on the list itself, or
+                    // confirming turn-off/hide, leaves this screen.
+                    let mut at: Option<String> = None;
+                    loop {
+                        let choice = picker::scroll_screen_ext(&header, &rows, at.as_deref(), Some('e'), Some(('c', "turn off notes")), Some(('h', "hide project")))?;
+                        let file = match choice {
+                            picker::ListChoice::Back => break 'screen,
+                            picker::ListChoice::Command('c') => {
+                                let confirm_options = [
+                                    picker::ListOption { label: "Yes, turn off Notes".into(), value: "yes".into(), note: None },
+                                    picker::ListOption { label: "No, keep Notes".into(), value: "no".into(), note: None },
+                                ];
+                                if let picker::ListChoice::Picked(a) = picker::choose_from_list(
+                                    &profiles,
+                                    m,
+                                    "Turn off Notes?",
+                                    Some("Removes it from the main menu until re-enabled"),
+                                    &confirm_options,
+                                    None,
+                                )? {
+                                    if a == "yes" {
+                                        settings::set_notes_enabled(false);
+                                        break 'screen;
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
-                        }
-                        picker::ListChoice::Command(_) => continue,
-                        picker::ListChoice::External(file) => {
-                            at = Some(file.clone());
-                            let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
-                                root.clone()
-                            } else {
-                                std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
-                            };
-                            notes::ensure_project_notes(&target_root);
-                            let suspend = term.suspend();
-                            launch::open_in_editor(std::path::Path::new(&file))?;
-                            drop(suspend);
-                            let session = notes::Session::start(&target_root);
-                            session.stop();
-                            continue;
-                        }
-                        picker::ListChoice::Picked(file) => file,
-                    };
-                    at = Some(file.clone());
-                    let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
-                        root.clone()
-                    } else {
-                        std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
-                    };
-                    notes::ensure_project_notes(&target_root);
-                    let path = std::path::PathBuf::from(&file);
-                    let title = path.file_name().map(|n| n.to_string_lossy().to_string());
-                    editor::edit_file(&path, &profiles, m, title.as_deref())?;
-                    let session = notes::Session::start(&target_root);
-                    session.stop();
+                            picker::ListChoice::Command(_) => continue,
+                            picker::ListChoice::External(file) => {
+                                at = Some(file.clone());
+                                let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                                    root.clone()
+                                } else {
+                                    std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                                };
+                                notes::ensure_project_notes(&target_root);
+                                let suspend = term.suspend();
+                                launch::open_in_editor(std::path::Path::new(&file))?;
+                                drop(suspend);
+                                let session = notes::Session::start(&target_root);
+                                session.stop();
+                                continue;
+                            }
+                            picker::ListChoice::RowAction('h', file) => {
+                                // TODO.md/PLAN.md → its project root; Master's
+                                // own rows aren't a project, so 'h' on those
+                                // is a no-op rather than hiding `root`.
+                                if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                                    at = Some(file);
+                                    continue;
+                                }
+                                let hide_root = std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone());
+                                let hide_name = hide_root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                at = Some(file);
+                                let confirm_options = [
+                                    picker::ListOption { label: "Yes, hide it".into(), value: "yes".into(), note: None },
+                                    picker::ListOption { label: "No, keep it".into(), value: "no".into(), note: None },
+                                ];
+                                if let picker::ListChoice::Picked(a) = picker::choose_from_list(
+                                    &profiles,
+                                    m,
+                                    &format!("Hide '{hide_name}' from Notes?"),
+                                    Some("Its TODO.md/PLAN.md stay put — reappears once a session opens there again"),
+                                    &confirm_options,
+                                    None,
+                                )? {
+                                    if a == "yes" {
+                                        notes::hide(&hide_root);
+                                        continue 'screen;
+                                    }
+                                }
+                                continue;
+                            }
+                            picker::ListChoice::RowAction(_, _) => continue,
+                            picker::ListChoice::Picked(file) => file,
+                        };
+                        at = Some(file.clone());
+                        let target_root = if file == master_todo.to_string_lossy() || file == master_plan.to_string_lossy() {
+                            root.clone()
+                        } else {
+                            std::path::Path::new(&file).parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                        };
+                        notes::ensure_project_notes(&target_root);
+                        let path = std::path::PathBuf::from(&file);
+                        let title = path.file_name().map(|n| n.to_string_lossy().to_string());
+                        editor::edit_file(&path, &profiles, m, title.as_deref())?;
+                        let session = notes::Session::start(&target_root);
+                        session.stop();
+                    }
                 }
             }
             Action::Import => {

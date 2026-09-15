@@ -55,6 +55,13 @@ struct Settings {
     /// Windows toast or terminal bell for Notification/Stop/SubagentStop.
     #[serde(default)]
     notify_mode: NotifyMode,
+    /// Projects hidden from the Notes screen (their TODO.md/PLAN.md and
+    /// master-file section are untouched — this only filters the listing).
+    /// `notes::Session::start` clears a root from this set automatically,
+    /// so hiding one is undone the next time a session actually opens
+    /// there rather than needing an explicit unhide action.
+    #[serde(default)]
+    hidden_notes_projects: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -63,7 +70,7 @@ fn default_true() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { notes_enabled: false, session_wrapped: true, notify_mode: NotifyMode::default() }
+        Settings { notes_enabled: false, session_wrapped: true, notify_mode: NotifyMode::default(), hidden_notes_projects: Vec::new() }
     }
 }
 
@@ -109,4 +116,27 @@ pub fn set_notify_mode(mode: NotifyMode) {
     let mut settings = load();
     settings.notify_mode = mode;
     save(&settings);
+}
+
+pub fn hidden_notes_projects() -> Vec<String> {
+    load().hidden_notes_projects
+}
+
+pub fn hide_notes_project(path: &str) {
+    let mut settings = load();
+    if !settings.hidden_notes_projects.iter().any(|p| p == path) {
+        settings.hidden_notes_projects.push(path.to_string());
+        save(&settings);
+    }
+}
+
+/// No-op (skips the write) when `path` wasn't hidden — called on every
+/// `notes::Session::start`, so it needs to be cheap in the common case.
+pub fn unhide_notes_project(path: &str) {
+    let mut settings = load();
+    let before = settings.hidden_notes_projects.len();
+    settings.hidden_notes_projects.retain(|p| p != path);
+    if settings.hidden_notes_projects.len() != before {
+        save(&settings);
+    }
 }

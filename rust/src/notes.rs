@@ -269,6 +269,23 @@ pub fn known_project_roots() -> Vec<PathBuf> {
     set.into_iter().collect()
 }
 
+/// Whether `root` is hidden from the Notes screen — a display-only filter,
+/// never touches TODO.md/PLAN.md or the master file's section for it.
+pub fn is_hidden(root: &Path) -> bool {
+    let key = root.to_string_lossy();
+    crate::settings::hidden_notes_projects().iter().any(|p| p == key.as_ref())
+}
+
+/// Hides `root` from the Notes screen. Local files and the master section
+/// are left untouched — deliberately not removed from the master file,
+/// since that section is also what `reconcile_kind` diffs against to
+/// decide which side changed; deleting it would read as "master cleared
+/// this project" and could pull that (now-missing) content back down over
+/// the local file on the next sync.
+pub fn hide(root: &Path) {
+    crate::settings::hide_notes_project(&root.to_string_lossy());
+}
+
 pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> String {
     let block = format!("{}\n<!-- ccpit:path={key} -->\n{}\n", section_heading(name), body.trim());
     let sections = find_sections(content);
@@ -367,6 +384,11 @@ impl Session {
         ensure_file(&master_todo, "");
         ensure_file(&master_plan, "");
         reconcile_project(root);
+        // A project hidden from the Notes screen un-hides itself the moment
+        // a session actually opens there again — matches "it'll show up
+        // again when a new session in that folder opened" rather than
+        // needing a separate unhide action.
+        crate::settings::unhide_notes_project(&root.to_string_lossy());
 
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();

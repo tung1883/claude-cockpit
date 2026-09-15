@@ -20,10 +20,6 @@ pub enum Action {
     Panels(String),
     ResumeSession,
     Settings(String),
-    /// TEMP: fires the notify/notify-stop/notify-subagent-stop toast
-    /// scripts so they can be eyeballed from inside the cockpit. Remove
-    /// once the toast titles/icons are confirmed good.
-    TestNotify,
 }
 
 /// Explainer shown every time someone presses "n" while Notes is off.
@@ -64,7 +60,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
         let row1: Vec<(&str, &str)> =
             vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("h", "handoff"), ("m", "memory"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
-            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings"), ("t", "test notify")];
+            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings")];
         if has_session {
             row2.push(("^B", "resume"));
         }
@@ -153,10 +149,6 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
                 ui::show_cursor();
                 return Ok(Action::Settings(profiles[selected].name.clone()));
             }
-            KeyCode::Char('t') => {
-                ui::show_cursor();
-                return Ok(Action::TestNotify);
-            }
             _ => {}
         }
     }
@@ -244,6 +236,10 @@ pub enum ListChoice {
     Picked(String),
     External(String),
     Command(char),
+    /// A row-scoped key (see `scroll_screen_ext`'s `row_action_key`) pressed
+    /// on the currently highlighted row — carries that row's value, same as
+    /// `External` does for `external_key`.
+    RowAction(char, String),
 }
 
 /// Arrow-key list picker: shows the account list for context, then `options`
@@ -424,18 +420,22 @@ impl ScrollRow {
 /// returning from a sub-screen keeps your place. If `external_key` is set,
 /// pressing it on a valued row resolves `ListChoice::External` instead.
 pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>, external_key: Option<char>) -> std::io::Result<ListChoice> {
-    scroll_screen_ext(header, rows, start, external_key, None)
+    scroll_screen_ext(header, rows, start, external_key, None, None)
 }
 
 /// Like `scroll_screen`, but with a second, selection-independent key (e.g.
 /// "c" to close a feature) that returns `ListChoice::Command` regardless of
-/// which row is highlighted.
+/// which row is highlighted, and/or a third, row-scoped key (e.g. "h" to
+/// hide the highlighted row's project) that returns `ListChoice::RowAction`
+/// carrying that row's value — same idea as `external_key`, just under a
+/// different key/label so a screen can offer both.
 pub fn scroll_screen_ext(
     header: &[String],
     rows: &[ScrollRow],
     start: Option<&str>,
     external_key: Option<char>,
     command_key: Option<(char, &str)>,
+    row_action_key: Option<(char, &str)>,
 ) -> std::io::Result<ListChoice> {
     let selectable_idx: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
     let any_pickable = rows.iter().any(|r| r.value.is_some());
@@ -502,7 +502,11 @@ pub fn scroll_screen_ext(
         let open_hint = if any_pickable { format!("    {} open", ui::color::dim("Enter")) } else { String::new() };
         let ext_hint = external_key.map(|k| format!("    {} external editor", ui::color::dim(&k.to_string()))).unwrap_or_default();
         let cmd_hint = command_key.map(|(k, label)| format!("    {} {label}", ui::color::dim(&k.to_string()))).unwrap_or_default();
-        lines.push(format!(" {} move{open_hint}{ext_hint}{cmd_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
+        let row_hint = row_action_key
+            .filter(|_| active.is_some() && rows[active.unwrap()].value.is_some())
+            .map(|(k, label)| format!("    {} {label}", ui::color::dim(&k.to_string())))
+            .unwrap_or_default();
+        lines.push(format!(" {} move{open_hint}{ext_hint}{cmd_hint}{row_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -511,6 +515,13 @@ pub fn scroll_screen_ext(
             std::process::exit(130);
         }
         match key.code {
+            // Checked ahead of the Esc/Left/h/q back arm so a row_action_key
+            // of 'h' (hide) wins over h's usual meaning of "back" while a
+            // row with a value is highlighted.
+            KeyCode::Char(c) if row_action_key.map(|(k, _)| k) == Some(c) && active.is_some() && rows[active.unwrap()].value.is_some() => {
+                ui::show_cursor();
+                return Ok(ListChoice::RowAction(c, rows[active.unwrap()].value.clone().unwrap()));
+            }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                 ui::show_cursor();
                 return Ok(ListChoice::Back);
