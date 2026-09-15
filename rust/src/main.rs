@@ -331,18 +331,19 @@ fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
 
 /// Full folder list (beyond the overview's first 5), sorted by each
 /// folder's most recent session — picking one drills into its sessions.
+/// Rows share `detail::folder_rows`' formatting so this reads as a plain
+/// continuation of the Sessions section in the overview (view/session),
+/// not a differently-aligned screen.
 fn open_all_folders(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, groups: &[session::SessionGroup]) -> Result<()> {
-    let options: Vec<picker::ListOption> = groups
-        .iter()
-        .map(|g| {
-            let n = g.sessions.len();
-            let latest_age = g.sessions.first().map(|s| session::relative_age(Some(s.modified))).unwrap_or_default();
-            let count_label = layout::pad_to(&format!("{n} session{}", if n == 1 { "" } else { "s" }), 14);
-            picker::ListOption { label: g.folder.clone(), value: g.folder.clone(), note: Some(format!("{count_label}·  {latest_age}")) }
-        })
-        .collect();
-    if let picker::ListChoice::Picked(folder) = picker::choose_from_list(profiles, mark, "All project folders…", None, &options, None)? {
-        if let Some(group) = groups.iter().find(|g| g.folder == folder) {
+    let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+    let mut header = layout::account_lines(profiles, mark, &stats);
+    header.push(format!("{} {}  {}", ui::color::orange(ui::glyph::back()), ui::color::orange(from), ui::color::dim("— all sessions")));
+    header.push(String::new());
+    let rows = detail::all_folder_rows(groups);
+    let choice = picker::scroll_screen(&header, &rows, None, None)?;
+    let picker::ListChoice::Picked(pick) = choice else { return Ok(()) };
+    if let Some(idx_str) = pick.strip_prefix("folder:") {
+        if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
             open_folder_sessions(term, profiles, mark, from, group)?;
         }
     }

@@ -137,20 +137,27 @@ fn capped_section(header_label: &str, count: usize, more_value: &str, mut item: 
 /// recent session (`groups` comes in already in that order — see
 /// `session::grouped_sessions`). Picking a folder row (or "more") opens that
 /// folder's session list, straight into the handoff flow.
+fn folder_row_text(g: &session::SessionGroup) -> String {
+    let n = g.sessions.len();
+    let latest_age = g.sessions.first().map(|s| session::relative_age(Some(s.modified))).unwrap_or_default();
+    // Clip one char short of the pad width so a truncated path still
+    // lands under it with a gap — clip_mid can return exactly `max`
+    // chars, and pad_to only adds space when strictly shorter. The
+    // count itself is padded too, so the "·" lines up regardless of
+    // how many digits "N sessions" runs to.
+    let count = pad_to(&format!("{n} session{}", if n == 1 { "" } else { "s" }), 14);
+    format!("{}  {}", pad_to(&clip_mid(&g.folder, 39), 40), color::dim(&format!("{count}·  {latest_age}")))
+}
+
 pub fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
-    capped_section("Sessions", groups.len(), "sessions-more", |i| {
-        let g = &groups[i];
-        let n = g.sessions.len();
-        let latest_age = g.sessions.first().map(|s| session::relative_age(Some(s.modified))).unwrap_or_default();
-        // Clip one char short of the pad width so a truncated path still
-        // lands under it with a gap — clip_mid can return exactly `max`
-        // chars, and pad_to only adds space when strictly shorter. The
-        // count itself is padded too, so the "·" lines up regardless of
-        // how many digits "N sessions" runs to.
-        let count = pad_to(&format!("{n} session{}", if n == 1 { "" } else { "s" }), 14);
-        let text = format!("{}  {}", pad_to(&clip_mid(&g.folder, 39), 40), color::dim(&format!("{count}·  {latest_age}")));
-        (format!("folder:{i}"), text)
-    })
+    capped_section("Sessions", groups.len(), "sessions-more", |i| (format!("folder:{i}"), folder_row_text(&groups[i])))
+}
+
+/// Every folder, same row formatting as `folder_rows` (no 5-row cap) — the
+/// "(N more…)" popup, so it reads as a continuation of that list rather than
+/// a differently-aligned screen.
+pub fn all_folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
+    groups.iter().enumerate().map(|(i, g)| ScrollRow::pick(format!("  {}", folder_row_text(g)), format!("folder:{i}"))).collect()
 }
 
 /// Plugin/skill/MCP list options for the "N more…" full-list popup —
