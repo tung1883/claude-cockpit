@@ -16,6 +16,56 @@ fn byte_at(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
 }
 
+/// 3 classes instead of just whitespace/non-whitespace — matches how every
+/// real editor draws word boundaries for Ctrl+Left/Right/Backspace, so
+/// `foo(bar)` stops at `(` instead of `foo(` being eaten as one "word".
+#[derive(PartialEq)]
+enum CharClass {
+    Space,
+    Word,
+    Punct,
+}
+fn class_of(c: char) -> CharClass {
+    if c.is_whitespace() {
+        CharClass::Space
+    } else if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punct
+    }
+}
+
+/// Where Ctrl+Left / the left side of a Ctrl+Backspace deletion lands:
+/// skip trailing whitespace, then skip one run of a single char class.
+fn word_left(chars: &[char], col: usize) -> usize {
+    let mut c = col;
+    while c > 0 && class_of(chars[c - 1]) == CharClass::Space {
+        c -= 1;
+    }
+    if c > 0 {
+        let class = class_of(chars[c - 1]);
+        while c > 0 && class_of(chars[c - 1]) == class {
+            c -= 1;
+        }
+    }
+    c
+}
+
+/// Mirror of `word_left` for Ctrl+Right.
+fn word_right(chars: &[char], col: usize) -> usize {
+    let mut c = col;
+    while c < chars.len() && class_of(chars[c]) == CharClass::Space {
+        c += 1;
+    }
+    if c < chars.len() {
+        let class = class_of(chars[c]);
+        while c < chars.len() && class_of(chars[c]) == class {
+            c += 1;
+        }
+    }
+    c
+}
+
 fn read_safe_lines(file: &Path) -> Vec<String> {
     let content = std::fs::read_to_string(file).unwrap_or_default();
     let lines: Vec<String> = content.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
@@ -184,14 +234,7 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                     }
                 } else {
                     let chars: Vec<char> = lines[row].chars().collect();
-                    let mut c = col;
-                    while c > 0 && chars[c - 1].is_whitespace() {
-                        c -= 1;
-                    }
-                    while c > 0 && !chars[c - 1].is_whitespace() {
-                        c -= 1;
-                    }
-                    col = c;
+                    col = word_left(&chars, col);
                 }
             }
             KeyCode::Right if key.ctrl => {
@@ -202,14 +245,7 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                         col = 0;
                     }
                 } else {
-                    let mut c = col;
-                    while c < chars.len() && chars[c].is_whitespace() {
-                        c += 1;
-                    }
-                    while c < chars.len() && !chars[c].is_whitespace() {
-                        c += 1;
-                    }
-                    col = c;
+                    col = word_right(&chars, col);
                 }
             }
             KeyCode::Up => row = row.saturating_sub(1),
@@ -257,13 +293,7 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                     }
                 } else {
                     let chars: Vec<char> = lines[row].chars().collect();
-                    let mut start = col;
-                    while start > 0 && chars[start - 1].is_whitespace() {
-                        start -= 1;
-                    }
-                    while start > 0 && !chars[start - 1].is_whitespace() {
-                        start -= 1;
-                    }
+                    let start = word_left(&chars, col);
                     let b_start = byte_at(&lines[row], start);
                     let b_end = byte_at(&lines[row], col);
                     lines[row].replace_range(b_start..b_end, "");
