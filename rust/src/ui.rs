@@ -117,11 +117,14 @@ pub fn show_cursor() {
 /// wipe, so there's no flash — not between keystrokes and not between
 /// screens. Every cockpit screen paints from row 1, so switching screens just
 /// overwrites in place.
-pub fn repaint(lines: &[String]) {
-    if !enabled() {
-        println!("{}", lines.join("\n"));
-        return;
-    }
+/// Builds the escape sequence `repaint` writes, without writing it — lets a
+/// caller (the panel compositor) fold it into one larger write+flush along
+/// with its own trailing escapes (e.g. cursor positioning), instead of each
+/// piece being its own separate flushed write. Every extra flush is a real
+/// syscall round trip; three of them per frame (hide, content, reposition)
+/// is enough visible latency between "cursor off" and "cursor back on" to
+/// read as a fast blink instead of one clean frame.
+pub fn repaint_body(lines: &[String]) -> String {
     // Home, write each line then erase its tail, join with CR+LF, then erase
     // below. No trailing newline — a newline on the last row scrolls the page
     // and the next paint lands one row higher: that one-row jitter is the
@@ -138,7 +141,15 @@ pub fn repaint(lines: &[String]) {
         .map(|l| format!("{l}\x1b[K"))
         .collect::<Vec<_>>()
         .join("\r\n");
-    write_raw(&format!("\x1b[H{body}\x1b[0J"));
+    format!("\x1b[H{body}\x1b[0J")
+}
+
+pub fn repaint(lines: &[String]) {
+    if !enabled() {
+        println!("{}", lines.join("\n"));
+        return;
+    }
+    write_raw(&repaint_body(lines));
 }
 
 /// RAII guard: enables raw mode + the alternate screen buffer on creation,

@@ -459,22 +459,33 @@ fn close_focused(panes: &mut Vec<Pane>, focus: &mut usize, cols: u16, rows: u16)
 /// line; a pane at grid cell (gr, gc) starts at column
 /// `gc*(pane_cols+SEP_COLS)` and line `1 + gr*(pane_rows+1)` (all 1-based
 /// for the CUP escape).
-fn draw_cursor(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16) {
+/// Builds the cursor-positioning escape sequence without writing it — the
+/// caller folds it into the same single write+flush as the frame's content
+/// (see the comment on `ui::repaint_body` for why that matters: separate
+/// flushed writes for hide/content/reposition is what produced a fast
+/// blink instead of one clean cursor move per frame).
+fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16) -> String {
     let (_, gcols) = grid_dims(panes.len());
     let (gr, gc) = ((focus / gcols) as u16, (focus % gcols) as u16);
-    let mut out = std::io::stdout();
-    if let Ok(p) = panes[focus].parser.lock() {
-        let screen = p.screen();
-        if screen.hide_cursor() {
-            let _ = out.write_all(b"\x1b[?25l");
-        } else {
-            let (cr, cc) = screen.cursor_position();
-            let term_row = 1 + gr * (pane_rows + 1) + cr + 1;
-            let term_col = gc * (pane_cols + SEP_COLS) + cc + 1;
-            let _ = write!(out, "\x1b[{term_row};{term_col}H\x1b[?25h");
-        }
+    let Ok(p) = panes[focus].parser.lock() else { return String::new() };
+    let screen = p.screen();
+    if screen.hide_cursor() {
+        "\x1b[?25l".to_string()
+    } else {
+        // Clamped defensively: a resize (zoom) mid-frame can have this
+        // pane's vt100 buffer resized to pane_rows/pane_cols while
+        // cursor_position() still briefly reports the pre-resize spot (or
+        // vice versa, if a caller ever passes stale geometry). An
+        // unclamped value here computes a CUP escape that lands outside
+        // this pane's cell entirely — into another pane, the chrome
+        // lines, or off-screen — which is what "cursor error" was.
+        let (cr, cc) = screen.cursor_position();
+        let cr = cr.min(pane_rows.saturating_sub(1));
+        let cc = cc.min(pane_cols.saturating_sub(1));
+        let term_row = 1 + gr * (pane_rows + 1) + cr + 1;
+        let term_col = gc * (pane_cols + SEP_COLS) + cc + 1;
+        format!("\x1b[{term_row};{term_col}H\x1b[?25h")
     }
-    let _ = out.flush();
 }
 
 /// Drops into a real interactive shell in `cwd`, then returns. Leaves the
@@ -554,15 +565,19 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                 ui::color::dim("Ctrl+B"),
                 ui::color::dim("Ctrl+Q"),
             ));
-            drop(guards);
-            // Hidden before the rewrite, not just after — draw_cursor's
-            // last call may have left the real cursor shown (a visible
-            // pane cursor), and repaint's home+overwrite would otherwise
-            // drag that visible cursor across the redrawn content on every
-            // dirty tick, which is what the flicker was.
-            ui::hide_cursor();
-            ui::repaint(&lines);
-            draw_cursor(panes, *focus, pane_rows, pane_cols);
+            // One write+flush for hide+content+reposition+show together —
+            // hiding the cursor before the content overwrite (so the
+            // redraw can't drag a visible cursor across it) used to be a
+            // separate flushed write from the content and from the
+            // reposition/show after it; three flushes a frame was enough
+            // gap between "cursor off" and "back on" to look like a fast
+            // blink instead of one clean frame.
+            drop(guards); // cursor_escape below re-locks the focused pane's parser
+            let cursor = cursor_escape(panes, *focus, pane_rows, pane_cols);
+            let frame = format!("\x1b[?25l{}{cursor}", ui::repaint_body(&lines));
+            let mut out = std::io::stdout();
+            let _ = out.write_all(frame.as_bytes());
+            let _ = out.flush();
         }
 
         if event::poll(Duration::from_millis(30))? {
@@ -645,7 +660,40 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                         }
                     }
                 }
-                Event::Resize(new_cols, new_rows) => reflow(panes, new_cols, new_rows),
+                Event::Resize(mut cols, mut rows) => {
+                    // A mouse-wheel/Ctrl+scroll zoom fires a burst of Resize
+                    // events in quick succession, one per intermediate size
+                    // — reflow-ing on every single one means every pane's
+                    // real PTY and vt100 buffer get resized many times a
+                    // second, and Claude's own TUI (inside that inner PTY)
+                    // racing to repaint for each intermediate size is what
+                    // made zoom feel broken. Drain whatever's already
+                    // queued and reflow once, at the final size only.
+                    while event::poll(Duration::ZERO)? {
+                        match event::read()? {
+                            Event::Resize(c, r) => {
+                                cols = c;
+                                rows = r;
+                            }
+                            // crossterm has no "peek" — a keystroke that
+                            // lands mid-burst is already consumed by the
+                            // read() above, so forward it here instead of
+                            // dropping it (unlikely to happen — scrolling
+                            // to zoom and typing at the same time — but
+                            // free to handle).
+                            Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                                if let Some(bytes) = key_bytes(k.code, k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT)) {
+                                    if let Ok(mut w) = panes[*focus].writer.lock() {
+                                        let _ = w.write_all(&bytes);
+                                        let _ = w.flush();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    reflow(panes, cols, rows);
+                }
                 _ => {}
             }
         }
