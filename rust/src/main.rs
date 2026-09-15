@@ -201,39 +201,56 @@ fn browse_memory_dir(profiles: &[profiles::Profile], mark: i64, dir: &std::path:
 /// action menu (resume here / hand off / view conversation) rather than
 /// jumping straight into any one of them.
 fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup) -> Result<()> {
-    // Cheap up front: just the id and age, no file reads — a folder can
-    // hold transcripts tens of MB each, and session_details() (recap, real
-    // name) has to read/scan the whole file. Computing that eagerly for
-    // every row was the actual cost of opening this screen; deferring it to
-    // `choose_from_list_lazy` means only rows you actually scroll to ever
-    // pay for it.
+    // session_preview() reads/scans each transcript (a folder can hold ones
+    // tens of MB each), so rows used to fill in lazily on cursor approach —
+    // but that made the 3rd column visibly pop in as you scrolled. Resolving
+    // every row up front instead, spread across a worker pool the same way
+    // `grouped_sessions`' cwd scan is, so opening a folder with hundreds of
+    // sessions doesn't serialize into one long stall.
+    let previews: Vec<(String, String)> = {
+        let mut out = vec![(String::new(), String::new()); group.sessions.len()];
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+        let chunk_size = group.sessions.len().div_ceil(workers).max(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .sessions
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let base = chunk_idx * chunk_size;
+                    scope.spawn(move || (base, chunk.iter().map(|s| session::session_preview(&s.file)).collect::<Vec<_>>()))
+                })
+                .collect();
+            for h in handles {
+                let (base, results) = h.join().unwrap();
+                for (i, r) in results.into_iter().enumerate() {
+                    out[base + i] = r;
+                }
+            }
+        });
+        out
+    };
     let options: Vec<picker::ListOption> = group
         .sessions
         .iter()
-        .map(|s| {
-            let label = s.id.chars().take(8).collect::<String>();
-            let note = session::relative_age(Some(s.modified));
+        .zip(previews.iter())
+        .map(|(s, (session_name, summary))| {
+            let label = if !session_name.is_empty() { session_name.clone() } else { s.id.chars().take(8).collect::<String>() };
+            let age = session::relative_age(Some(s.modified));
+            let note = if summary.is_empty() {
+                age
+            } else {
+                let flat: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+                // Age is padded so the "·" lands on the same column no matter
+                // how many digits/characters the age runs to ("7d ago" vs "10d
+                // ago" vs "just now").
+                format!("{}·  {}", layout::pad_to(&age, 10), flat.chars().take(80).collect::<String>())
+            };
             picker::ListOption { label, value: s.id.clone(), note: Some(note) }
         })
         .collect();
-    let resolve = |opt: &picker::ListOption| -> (Option<String>, Option<String>) {
-        let Some(file) = group.sessions.iter().find(|s| s.id == opt.value) else { return (None, None) };
-        let (session_name, summary) = session::session_preview(&file.file);
-        let label = if !session_name.is_empty() { Some(session_name) } else { None };
-        let age = session::relative_age(Some(file.modified));
-        let note = if summary.is_empty() {
-            age
-        } else {
-            let flat: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-            // Age is padded so the "·" lands on the same column no matter
-            // how many digits/characters the age runs to ("7d ago" vs "10d
-            // ago" vs "just now").
-            format!("{}·  {}", layout::pad_to(&age, 10), flat.chars().take(80).collect::<String>())
-        };
-        (label, Some(note))
-    };
     let heading = format!("Sessions in {}", ui::color::orange(&group.folder));
-    let choice = picker::choose_from_list_lazy(profiles, mark, &heading, Some("choose a session"), &options, None, None, Some(&resolve))?;
+    let choice = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)?;
     let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
 
     loop {
