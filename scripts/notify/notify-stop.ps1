@@ -1,6 +1,13 @@
 try { $p = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch {}
-$top = git rev-parse --show-toplevel 2>$null
-$dir = if ($top) { Split-Path -Leaf $top } else { Split-Path -Leaf (Get-Location) }
+# The hook's own JSON payload carries the *actual* cwd for this exact
+# invocation ("current working directory when the hook is invoked", per
+# Claude Code's hook docs) — independently querying Get-Location/git in
+# this script's own process instead used to show the wrong project when
+# multiple sessions/panes were running, since this process's cwd doesn't
+# necessarily match the session that actually fired the hook.
+$hookCwd = if ($p -and $p.cwd) { $p.cwd } else { (Get-Location).Path }
+$top = git -C $hookCwd rev-parse --show-toplevel 2>$null
+$dir = if ($top) { Split-Path -Leaf $top } else { Split-Path -Leaf $hookCwd }
 . "$PSScriptRoot\claude-settings.ps1"
 $settings = Get-NotifySettings
 
