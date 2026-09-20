@@ -357,8 +357,26 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
                     col = word_right(&chars, col);
                 }
             }
-            KeyCode::Up => row = row.saturating_sub(1),
-            KeyCode::Down => row += 1,
+            // Plain Up/Down must move by *visual* row, not buffer line —
+            // otherwise a wrapped line's later segments get skipped
+            // entirely (jumping straight to the next buffer line), which is
+            // what desyncs the drawn cursor from the line the user lands on.
+            KeyCode::Up => {
+                if cursor_display_row > 0 {
+                    let offset = col - cursor_seg_start;
+                    let (i, s, e) = display_rows[cursor_display_row - 1];
+                    row = i;
+                    col = s + offset.min(e - s);
+                }
+            }
+            KeyCode::Down => {
+                if cursor_display_row + 1 < display_rows.len() {
+                    let offset = col - cursor_seg_start;
+                    let (i, s, e) = display_rows[cursor_display_row + 1];
+                    row = i;
+                    col = s + offset.min(e - s);
+                }
+            }
             KeyCode::Left => {
                 if col > 0 {
                     col -= 1;
