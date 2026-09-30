@@ -120,6 +120,12 @@ fn git(args: &[&str], cwd: &Path) -> String {
     }
 }
 
+/// `git rev-parse --show-toplevel` prints forward slashes even on Windows,
+/// which then mix with the backslashes `join` adds ("C:/a/repo\TODO.md").
+fn normalize_sep(p: &str) -> String {
+    if cfg!(windows) { p.replace('/', "\\") } else { p.to_string() }
+}
+
 static PROJECT_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
 /// The project root is the git top-level if `cwd` is inside a repo, so one
@@ -132,7 +138,7 @@ pub fn project_root(cwd: &Path) -> PathBuf {
         return root.clone();
     }
     let out = git(&["rev-parse", "--show-toplevel"], cwd);
-    let root = if out.is_empty() { cwd.to_path_buf() } else { PathBuf::from(out) };
+    let root = if out.is_empty() { cwd.to_path_buf() } else { PathBuf::from(normalize_sep(&out)) };
     cache.insert(cwd.to_path_buf(), root.clone());
     root
 }
@@ -228,7 +234,7 @@ fn find_sections(content: &str) -> Vec<Section> {
     static MARKER_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = MARKER_RE.get_or_init(|| regex::Regex::new(r"<!-- ccpit:path=(.*?) -->").unwrap());
     let markers: Vec<(usize, usize, String)> =
-        re.captures_iter(content).map(|c| { let m = c.get(0).unwrap(); (m.start(), m.end(), c[1].to_string()) }).collect();
+        re.captures_iter(content).map(|c| { let m = c.get(0).unwrap(); (m.start(), m.end(), normalize_sep(&c[1])) }).collect();
     let heading_starts: Vec<usize> = markers
         .iter()
         .map(|(start, _, _)| {
