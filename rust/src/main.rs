@@ -250,6 +250,9 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
         })
         .collect();
     let heading = format!("Sessions in {}", ui::color::orange(&group.folder));
+    // Outer loop: backing out of a session's action menu lands on this
+    // sessions list, not the account screen above it.
+    'list: loop {
     let choice = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)?;
     let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
 
@@ -261,7 +264,7 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "System prompt".into(), value: "prompt".into(), note: Some("appended only when resuming this session".into()) },
         ];
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
-        let picker::ListChoice::Picked(action) = choice else { return Ok(()) };
+        let picker::ListChoice::Picked(action) = choice else { continue 'list };
         match action.as_str() {
             "resume" => {
                 let suspend = term.suspend();
@@ -290,8 +293,9 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
                     editor::edit_file(&path, profiles, mark, Some(&title))?;
                 }
             }
-            _ => return Ok(()),
+            _ => continue 'list,
         }
+    }
     }
 }
 

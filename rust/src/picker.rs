@@ -374,7 +374,7 @@ pub fn choose_from_list_lazy(
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 selected = (selected + 1) % options.len();
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 ui::show_cursor();
                 return Ok(ListChoice::Picked(options[selected].value.clone()));
             }
