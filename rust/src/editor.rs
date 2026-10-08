@@ -145,6 +145,16 @@ fn seg_range(points: &[usize], len: usize, seg: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Column for `offset` chars into visual row `idx`. A non-final segment's
+/// end index is also the next segment's start, so it must stop one short —
+/// otherwise the cursor lands on (and types into) the row below.
+fn col_on_display_row(rows: &[(usize, usize, usize)], idx: usize, offset: usize) -> usize {
+    let (i, s, e) = rows[idx];
+    let is_last_seg = rows.get(idx + 1).map_or(true, |r| r.0 != i);
+    let max = if is_last_seg { e - s } else { (e - s).saturating_sub(1) };
+    s + offset.min(max)
+}
+
 fn read_safe_lines(file: &Path) -> Vec<String> {
     let content = std::fs::read_to_string(file).unwrap_or_default();
     let lines: Vec<String> = content.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
@@ -364,17 +374,15 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
             KeyCode::Up => {
                 if cursor_display_row > 0 {
                     let offset = col - cursor_seg_start;
-                    let (i, s, e) = display_rows[cursor_display_row - 1];
-                    row = i;
-                    col = s + offset.min(e - s);
+                    row = display_rows[cursor_display_row - 1].0;
+                    col = col_on_display_row(&display_rows, cursor_display_row - 1, offset);
                 }
             }
             KeyCode::Down => {
                 if cursor_display_row + 1 < display_rows.len() {
                     let offset = col - cursor_seg_start;
-                    let (i, s, e) = display_rows[cursor_display_row + 1];
-                    row = i;
-                    col = s + offset.min(e - s);
+                    row = display_rows[cursor_display_row + 1].0;
+                    col = col_on_display_row(&display_rows, cursor_display_row + 1, offset);
                 }
             }
             KeyCode::Left => {
