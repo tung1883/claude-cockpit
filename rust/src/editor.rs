@@ -278,10 +278,12 @@ pub fn edit_file(file: &Path, profiles: &[Profile], mark: i64, title: Option<&st
             ui::color::dim("Esc"),
             ui::color::dim("Ctrl+C"),
         ));
-        ui::repaint(&out);
         let term_row = header.len() + 1 + (cursor_display_row - top) + usize::from(top > 0);
         let term_col = 1 + gutter + (col - cursor_seg_start);
-        print!("\x1b[{term_row};{term_col}H");
+        // One write: hide cursor, paint, move, show. Painting then moving in
+        // two flushes let the terminal render a frame with the cursor parked
+        // at the end of the footer line.
+        print!("\x1b[?25l{}\x1b[{term_row};{term_col}H\x1b[?25h", ui::repaint_body(&out));
         std::io::stdout().flush()?;
 
         let key = read_key()?;
