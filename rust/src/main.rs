@@ -200,7 +200,20 @@ fn browse_memory_dir(profiles: &[profiles::Profile], mark: i64, dir: &std::path:
 /// Opens one project folder's session list; picking a session opens a small
 /// action menu (resume here / hand off / view conversation) rather than
 /// jumping straight into any one of them.
-fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup) -> Result<()> {
+/// Row label for a session: its terminal title, else a clipped first-resort
+/// summary, else the short id.
+fn session_label(s: &session::SessionFile, title: &str, summary: &str) -> String {
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    let flat: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !flat.is_empty() {
+        return flat.chars().take(60).collect();
+    }
+    s.id.chars().take(8).collect()
+}
+
+fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup, preselect: Option<&str>) -> Result<()> {
     // session_preview() reads/scans each transcript (a folder can hold ones
     // tens of MB each), so rows used to fill in lazily on cursor approach —
     // but that made the 3rd column visibly pop in as you scrolled. Resolving
@@ -235,26 +248,23 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
         .iter()
         .zip(previews.iter())
         .map(|(s, (session_name, summary))| {
-            let label = if !session_name.is_empty() { session_name.clone() } else { s.id.chars().take(8).collect::<String>() };
-            let age = session::relative_age(Some(s.modified));
-            let note = if summary.is_empty() {
-                age
-            } else {
-                let flat: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-                // Age is padded so the "·" lands on the same column no matter
-                // how many digits/characters the age runs to ("7d ago" vs "10d
-                // ago" vs "just now").
-                format!("{}·  {}", layout::pad_to(&age, 10), flat.chars().take(80).collect::<String>())
-            };
-            picker::ListOption { label, value: s.id.clone(), note: Some(note) }
+            let label = session_label(s, session_name, summary);
+            picker::ListOption { label, value: s.id.clone(), note: Some(session::relative_age(Some(s.modified))) }
         })
         .collect();
     let heading = format!("Sessions in {}", ui::color::orange(&group.folder));
     // Outer loop: backing out of a session's action menu lands on this
     // sessions list, not the account screen above it.
+    let mut direct = preselect.map(str::to_string);
     'list: loop {
-    let choice = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)?;
-    let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
+    let id = match direct.take() {
+        Some(id) => id,
+        None => {
+            let choice = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)?;
+            let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
+            id
+        }
+    };
 
     loop {
         let action_options = [
@@ -264,7 +274,13 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "System prompt".into(), value: "prompt".into(), note: Some("appended only when resuming this session".into()) },
         ];
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
-        let picker::ListChoice::Picked(action) = choice else { continue 'list };
+        let picker::ListChoice::Picked(action) = choice else {
+            // Opened straight onto one session: back leaves, no list to land on.
+            if preselect.is_some() {
+                return Ok(());
+            }
+            continue 'list;
+        };
         match action.as_str() {
             "resume" => {
                 let suspend = term.suspend();
@@ -365,7 +381,7 @@ fn open_all_folders(term: &mut ui::Terminal, profiles: &[profiles::Profile], mar
     let picker::ListChoice::Picked(pick) = choice else { return Ok(()) };
     if let Some(idx_str) = pick.strip_prefix("folder:") {
         if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-            open_folder_sessions(term, profiles, mark, from, group)?;
+            open_folder_sessions(term, profiles, mark, from, group, None)?;
         }
     }
     Ok(())
@@ -791,7 +807,16 @@ fn cockpit() -> Result<()> {
 
                     if let Some(idx_str) = pick.strip_prefix("folder:") {
                         if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-                            open_folder_sessions(&mut term, &profiles, m, &name, group)?;
+                            open_folder_sessions(&mut term, &profiles, m, &name, group, None)?;
+                        }
+                        continue;
+                    }
+                    if let Some(rest) = pick.strip_prefix("recent:") {
+                        let loc = rest.split_once(':').and_then(|(g, s)| Some((groups.get(g.parse::<usize>().ok()?)?, s.parse::<usize>().ok()?)));
+                        if let Some((group, si)) = loc {
+                            if let Some(s) = group.sessions.get(si) {
+                                open_folder_sessions(&mut term, &profiles, m, &name, group, Some(&s.id))?;
+                            }
                         }
                         continue;
                     }
@@ -1065,15 +1090,24 @@ fn cockpit() -> Result<()> {
                 let mut header = layout::account_lines(&profiles, m, &stats);
                 header.push(format!("{} {}  {}", ui::color::orange(ui::glyph::back()), ui::color::orange(&name), ui::color::dim("— hand off a session")));
                 header.push(String::new());
-                let rows = detail::folder_rows(&groups);
+                let mut rows = detail::recent_rows(&groups);
+                rows.push(picker::ScrollRow::line(String::new()));
+                rows.extend(detail::folder_rows(&groups));
                 let mut at: Option<String> = None;
                 loop {
                     let choice = picker::scroll_screen(&header, &rows, at.as_deref(), None)?;
                     let picker::ListChoice::Picked(pick) = choice else { break };
                     at = Some(pick.clone());
-                    if let Some(idx_str) = pick.strip_prefix("folder:") {
+                    if let Some(rest) = pick.strip_prefix("recent:") {
+                        let loc = rest.split_once(':').and_then(|(g, s)| Some((groups.get(g.parse::<usize>().ok()?)?, s.parse::<usize>().ok()?)));
+                        if let Some((group, si)) = loc {
+                            if let Some(s) = group.sessions.get(si) {
+                                open_folder_sessions(&mut term, &profiles, m, &name, group, Some(&s.id))?;
+                            }
+                        }
+                    } else if let Some(idx_str) = pick.strip_prefix("folder:") {
                         if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-                            open_folder_sessions(&mut term, &profiles, m, &name, group)?;
+                            open_folder_sessions(&mut term, &profiles, m, &name, group, None)?;
                         }
                     } else if pick == "sessions-more" {
                         open_all_folders(&mut term, &profiles, m, &name, &groups)?;

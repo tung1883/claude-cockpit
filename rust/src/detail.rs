@@ -149,6 +149,27 @@ fn folder_row_text(g: &session::SessionGroup) -> String {
     format!("{}  {}", pad_to(&clip_mid(&g.folder, 39), 40), color::dim(&format!("{count}·  {latest_age}")))
 }
 
+/// The 5 most recently active sessions across all folders, labelled by their
+/// terminal title. Pick value is "recent:group:session".
+pub fn recent_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
+    let recent = session::recent_sessions(groups, 5);
+    capped_section("Recent sessions", recent.len(), "", |i| {
+        let (gi, si) = recent[i];
+        let s = &groups[gi].sessions[si];
+        let (title, summary) = session::session_preview(&s.file);
+        let label = if !title.is_empty() { title } else { summary.split_whitespace().collect::<Vec<_>>().join(" ") };
+        let label = if label.is_empty() { s.id.chars().take(8).collect() } else { label };
+        let folder = groups[gi].folder.rsplit('/').next().unwrap_or(&groups[gi].folder).to_string();
+        let age = session::relative_age(Some(s.modified));
+        let text = format!(
+            "{}  {}",
+            pad_to(&label.chars().take(39).collect::<String>(), 40),
+            color::dim(&format!("{}·  {}", pad_to(&age, 14), folder))
+        );
+        (format!("recent:{gi}:{si}"), text)
+    })
+}
+
 pub fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
     capped_section("Sessions", groups.len(), "sessions-more", |i| (format!("folder:{i}"), folder_row_text(&groups[i])))
 }
@@ -256,6 +277,9 @@ pub fn profile_overview(snap: &Inspection, name: &str, profiles: &[Profile], mar
         let text = format!("{}{}", pad_to(&m.name, 24), color::dim(&m.kind));
         (format!("mcp:{i}"), text)
     }));
+    rows.push(ScrollRow::line(String::new()));
+
+    rows.extend(recent_rows(groups));
     rows.push(ScrollRow::line(String::new()));
 
     rows.extend(folder_rows(groups));

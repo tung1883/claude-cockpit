@@ -99,16 +99,32 @@ pub fn session_preview(path: &std::path::Path) -> (String, String) {
             let text = String::from_utf8_lossy(&buf);
             let mut recap = String::new();
             let mut last_prompt = String::new();
+            let mut custom_title = String::new();
+            let mut ai_title = String::new();
             for (i, line) in text.lines().enumerate() {
                 if start > 0 && i == 0 {
                     continue; // likely a partial line left over from the seek
                 }
-                let relevant = line.contains("\"type\":\"summary\"") || line.contains("\"type\":\"compact_summary\"") || line.contains("\"type\":\"user\"");
+                let relevant = line.contains("\"type\":\"summary\"")
+                    || line.contains("\"type\":\"compact_summary\"")
+                    || line.contains("\"type\":\"user\"")
+                    || line.contains("\"type\":\"custom-title\"")
+                    || line.contains("\"type\":\"ai-title\"");
                 if !relevant {
                     continue;
                 }
                 let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if entry_type == "custom-title" {
+                    if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
+                        custom_title = t.to_string();
+                    }
+                }
+                if entry_type == "ai-title" {
+                    if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str()) {
+                        ai_title = t.to_string();
+                    }
+                }
                 if entry_type == "summary" || entry_type == "compact_summary" {
                     if let Some(s) = entry.get("summary").and_then(|v| v.as_str()).or_else(|| entry.get("content").and_then(|v| v.as_str())) {
                         recap = s.to_string();
@@ -121,9 +137,28 @@ pub fn session_preview(path: &std::path::Path) -> (String, String) {
                 }
             }
             summary = if !recap.is_empty() { recap } else { last_prompt };
+            // The terminal title Claude Code shows: a user rename wins over
+            // the auto-generated one.
+            if !custom_title.is_empty() {
+                session_name = custom_title;
+            } else if !ai_title.is_empty() {
+                session_name = ai_title;
+            }
         }
     }
     (session_name, summary)
+}
+
+/// Locations (group index, session index) of the `n` most recently modified
+/// sessions across all folders, newest first.
+pub fn recent_sessions(groups: &[SessionGroup], n: usize) -> Vec<(usize, usize)> {
+    let mut all: Vec<(usize, usize, SystemTime)> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(gi, g)| g.sessions.iter().enumerate().map(move |(si, s)| (gi, si, s.modified)))
+        .collect();
+    all.sort_by(|a, b| b.2.cmp(&a.2));
+    all.into_iter().take(n).map(|(gi, si, _)| (gi, si)).collect()
 }
 
 /// Just the `cwd` (or workspace.current_dir), stopping as soon as it's
