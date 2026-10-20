@@ -174,6 +174,31 @@ pub fn repaint_body(lines: &[String]) -> String {
     format!("\x1b[H{body}\x1b[0J")
 }
 
+/// Like `repaint_body`, but writes only the rows that differ from `prev` (the
+/// previous frame's lines), addressing each by absolute row — the panel view
+/// redraws every ~30 ms while Claude streams, and re-sending every cell of
+/// every pane each time is what made multi-pane startup crawl. Falls back to
+/// a full repaint when the line count changed or `prev` is empty (first frame,
+/// or the screen was overwritten by a picker/prompt). Always erases below the
+/// last line so a shrunken layout leaves nothing behind.
+pub fn repaint_diff(prev: &[String], lines: &[String]) -> String {
+    if prev.len() != lines.len() || prev.is_empty() {
+        return repaint_body(lines);
+    }
+    let width = term_width();
+    let mut out = String::new();
+    for (i, (old, new)) in prev.iter().zip(lines).enumerate() {
+        if old != new {
+            out.push_str(&format!("\x1b[{};1H{}\x1b[K", i + 1, clip_visible(new, width)));
+        }
+    }
+    if out.is_empty() {
+        return out;
+    }
+    out.push_str(&format!("\x1b[{};1H\x1b[0J", lines.len() + 1));
+    out
+}
+
 pub fn repaint(lines: &[String]) {
     if !enabled() {
         println!("{}", lines.join("\n"));

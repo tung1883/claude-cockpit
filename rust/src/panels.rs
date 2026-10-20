@@ -147,6 +147,10 @@ fn color_code(c: vt100::Color, fg: bool) -> String {
 
 fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
     let mut out = String::new();
+    // The SGR currently in effect; a new escape is emitted only when a cell's
+    // style differs from the previous one, so a mostly-plain row costs a
+    // handful of escapes instead of one per cell.
+    let mut current = String::new();
     for col in 0..width {
         let Some(cell) = screen.cell(row, col) else {
             out.push(' ');
@@ -167,9 +171,17 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
         }
         codes.push(color_code(cell.fgcolor(), true));
         codes.push(color_code(cell.bgcolor(), false));
+        let sgr = codes.join(";");
+        if sgr != current {
+            out.push_str(&format!("\x1b[0;{sgr}m"));
+            current = sgr;
+        }
         let contents = cell.contents();
-        let ch = if contents.is_empty() { " ".to_string() } else { contents };
-        out.push_str(&format!("\x1b[0;{}m{ch}", codes.join(";")));
+        if contents.is_empty() {
+            out.push(' ');
+        } else {
+            out.push_str(&contents);
+        }
     }
     out.push_str("\x1b[0m");
     out
@@ -647,9 +659,26 @@ fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBu
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let (pane_cols, pane_rows) = pane_geometry(cols, rows, targets.len());
 
+    // Each spawn opens a ConPTY and starts a process — noticeable serially
+    // with several panes, so do them concurrently (order is preserved).
+    let spawned: Vec<Result<Pane>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(name, project)| scope.spawn(move || spawn_pane(name, name.clone(), project, pane_cols, pane_rows)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("pane spawn panicked")))).collect()
+    });
     let mut panes: Vec<Pane> = Vec::with_capacity(targets.len());
-    for (name, project) in targets {
-        panes.push(spawn_pane(name, name.clone(), project, pane_cols, pane_rows)?);
+    for pane in spawned {
+        match pane {
+            Ok(p) => panes.push(p),
+            Err(e) => {
+                for p in &mut panes {
+                    let _ = p.child.kill();
+                }
+                return Err(e);
+            }
+        }
     }
     let mut focus = 0usize;
 
@@ -921,6 +950,10 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     // — same idea as tmux's zoom, not a separate mode with its own state
     // machine, just a different `n` for layout math.
     let mut zoomed = false;
+    // Last frame's lines, so only changed rows are rewritten. Cleared
+    // whenever something else drew over the screen (picker, prompt) or the
+    // layout changed, which forces one full repaint.
+    let mut prev: Vec<String> = Vec::new();
     loop {
         // Swap every dirty flag (not short-circuiting) so one repaint clears
         // all of them and picks up every pane that changed this tick.
@@ -982,7 +1015,9 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
             // blink instead of one clean frame.
             drop(guards); // cursor_escape below re-locks the focused pane's parser
             let cursor = cursor_escape(panes, *focus, pane_rows, pane_cols, zoomed);
-            let frame = format!("\x1b[?25l{}{cursor}", ui::repaint_body(&lines));
+            let body = ui::repaint_diff(&prev, &lines);
+            prev = lines;
+            let frame = format!("\x1b[?25l{body}{cursor}");
             let mut out = std::io::stdout();
             let _ = out.write_all(frame.as_bytes());
             let _ = out.flush();
@@ -1011,6 +1046,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                         typed.clear();
                         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                         zoomed = !zoomed;
+                        prev.clear();
                         if zoomed {
                             let (pc, pr) = pane_geometry(cols, rows, 1);
                             resize_pane(&panes[*focus], pr, pc);
@@ -1047,6 +1083,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     if k.code == KeyCode::F(7) {
                         typed.clear();
                         add_pane(panes, focus, profiles, cwd)?;
+                        prev.clear();
                         continue;
                     }
                     if k.code == KeyCode::F(8) {
@@ -1075,6 +1112,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                         }
                         typed.clear();
                         add_shell_pane(panes, focus, cwd)?;
+                        prev.clear();
                         continue;
                     }
                     // Track the current line so the "/shell" command above can
@@ -1128,6 +1166,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                             _ => {}
                         }
                     }
+                    prev.clear();
                     if zoomed {
                         let (pc, pr) = pane_geometry(cols, rows, 1);
                         resize_pane(&panes[*focus], pr, pc);
