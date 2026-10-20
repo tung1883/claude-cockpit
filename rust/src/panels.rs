@@ -272,6 +272,44 @@ fn max_panes_for(cols: u16, rows: u16) -> usize {
     best
 }
 
+/// Queue box on the right of the pane picker: narrowest terminal that gets it,
+/// and its width.
+const QUEUE_BOX_MIN_COLS: u16 = 100;
+const QUEUE_BOX_W: usize = 36;
+
+/// The right-hand queue box, fully framed: one entry per queued pane
+/// (profile + path), the next free slot, and a key hint. The frame turns
+/// orange while the box has focus.
+fn render_queue_box(queue: &[(String, std::path::PathBuf)], cap: usize, focused: bool, sel: usize) -> Vec<String> {
+    let frame = |t: &str| if focused { ui::color::orange(t) } else { ui::color::dim(t) };
+    let inner = QUEUE_BOX_W - 4; // two border columns + a space of padding each side
+    let row = |content: &str| format!("{} {} {}", frame("│"), layout::pad_to(content, inner), frame("│"));
+    let hint = if focused { "↑/↓ · Enter dir · x remove" } else { "Tab → focus queue" };
+    let mut out = vec![
+        frame(&format!("┌{}┐", "─".repeat(QUEUE_BOX_W - 2))),
+        row(&ui::color::orange_bold(&format!("Queue {}/{cap}", queue.len()))),
+        row(&ui::color::dim(hint)),
+        row(""),
+    ];
+    for (i, (name, dir)) in queue.iter().enumerate() {
+        let on = focused && i == sel;
+        let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+        let first = if i == 0 { ui::color::dim(" (first)") } else { String::new() };
+        let title = format!("{} {name}", i + 1);
+        out.push(row(&format!("{marker} {}{first}", if on { ui::color::orange_bold(&title) } else { title })));
+        let path = dir.display().to_string();
+        let max = inner - 2;
+        let n = path.chars().count();
+        let shown = if n > max { format!("…{}", path.chars().skip(n - (max - 1)).collect::<String>()) } else { path };
+        out.push(row(&format!("  {}", ui::color::dim(&shown))));
+    }
+    if queue.len() < cap {
+        out.push(row(&format!("  {}", ui::color::dim(&format!("{} next…", queue.len() + 1)))));
+    }
+    out.push(frame(&format!("└{}┘", "─".repeat(QUEUE_BOX_W - 2))));
+    out
+}
+
 /// What picking a row in `pick_pane_target` resolves to.
 enum PaneAdd {
     Start,
@@ -285,6 +323,8 @@ enum TargetRow {
     /// `profile_idx`'s project at `path` — the always-shown "(current)" row
     /// when `is_current`, else one revealed by expanding that profile.
     Project { profile_idx: usize, path: std::path::PathBuf, is_current: bool },
+    /// "Choose path" — type any directory for `profile_idx`'s pane.
+    ChoosePath(usize),
 }
 
 /// Profile picker for adding a pane, with each profile expandable (→) into
@@ -294,10 +334,18 @@ enum TargetRow {
 /// the same source the Notes/Detail screens use) so a pane can be launched
 /// into a *different* project than the one cockpit is sitting in.
 ///
-/// `start_label` shows a "Start" row first (`run_split`'s "launch with
-/// what's chosen so far") when `Some`; `None` for the mid-split "add a
-/// pane" picker (F7), which has no such concept.
-fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, start_label: Option<&str>) -> Result<Option<PaneAdd>> {
+/// `queue` is `run_split`'s list of panes chosen so far: when `Some`, a
+/// "Start" row appears first, picks are pushed onto the queue (the picker
+/// stays open until Start or the cap), and the queue is shown — as a box on
+/// the right when the terminal is wide enough, else as a header list — where
+/// Tab moves into it to re-path (Enter) or remove (x) a pane. `None` is the
+/// mid-split "add a pane" picker (F7): one pick, returned directly.
+fn pick_pane_target(
+    profiles: &[Profile],
+    cwd: &std::path::Path,
+    heading: &str,
+    mut queue: Option<&mut Vec<(String, std::path::PathBuf)>>,
+) -> Result<Option<PaneAdd>> {
     let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
     // Only one profile expanded at a time — keeps "collapse" unambiguous
     // (see the Left/Esc handling below) instead of needing to track which
@@ -316,6 +364,9 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
     // could now land on a completely different (and shorter) profile
     // after the list shrinks back down.
     let mut refocus_profile: Option<usize> = None;
+    // Queue-box focus (Tab) and its highlighted pane.
+    let mut focus_q = false;
+    let mut qsel = 0usize;
     // Computed once, not per frame — this used to call `account_stat`
     // (a full directory walk per profile) on every single keystroke via
     // `quota_note`/`account_lines`, which is what made the screen laggy.
@@ -327,7 +378,7 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
         // profiles/projects), and simplest way to keep the flattened
         // row list in sync with expand state without a parallel index.
         let mut rows: Vec<TargetRow> = Vec::new();
-        if start_label.is_some() {
+        if queue.is_some() {
             rows.push(TargetRow::Start);
         }
         for i in 0..profiles.len() {
@@ -342,6 +393,7 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
                         rows.push(TargetRow::Project { profile_idx: i, path: std::path::PathBuf::from(&g.folder), is_current: false });
                     }
                 }
+                rows.push(TargetRow::ChoosePath(i));
             }
         }
         // The always-shown "(current)" row under each profile is display
@@ -359,10 +411,28 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
         selected = selected.min(selectable_idx.len().saturating_sub(1));
         let active_row = selectable_idx[selected];
 
+        let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let cap = max_panes_for(term_cols, term_rows);
+        let show_box = queue.is_some() && term_cols >= QUEUE_BOX_MIN_COLS;
+        if let Some(q) = queue.as_deref() {
+            qsel = qsel.min(q.len().saturating_sub(1));
+        }
         let mut header = layout::account_lines(profiles, -1, &stats);
-        header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(heading)));
-        header.push(ui::color::dim("   Enter select · → on a profile shows its other projects"));
+        match queue.as_deref() {
+            Some(q) if show_box => {
+                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Add pane {}", q.len() + 1))));
+            }
+            Some(q) => {
+                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Panes so far ({}/{cap})", q.len()))));
+                for (i, (name, dir)) in q.iter().enumerate() {
+                    header.push(format!("   {} {name}  {}", ui::color::orange(&(i + 1).to_string()), ui::color::dim(&dir.display().to_string())));
+                }
+            }
+            None => header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(heading))),
+        }
+        header.push(ui::color::dim("   Enter select · → on a profile: recent projects & Choose path"));
         header.push(String::new());
+        let body_start = header.len();
 
         // Same viewport-paging pattern as every other scrollable list here
         // (e.g. `choose_from_list_lazy`) — without it, expanding a profile
@@ -390,12 +460,17 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
             let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
             let text = match row {
                 TargetRow::Start => {
-                    let label = start_label.unwrap_or("Start");
-                    if on { ui::color::orange_bold(label) } else { label.to_string() }
+                    let n = queue.as_deref().map_or(0, |q| q.len());
+                    let label = if n <= 1 { "Start (solo session)".to_string() } else { format!("Start ({n} panes)") };
+                    if on { ui::color::orange_bold(&label) } else { label }
                 }
                 TargetRow::Profile(pi) => {
                     let name = &profiles[*pi].name;
                     if on { ui::color::orange_bold(name) } else { name.clone() }
+                }
+                TargetRow::ChoosePath(_) => {
+                    let text = "    Choose path…";
+                    if on { ui::color::orange_bold(text) } else { ui::color::dim(text) }
                 }
                 TargetRow::Project { path, is_current, .. } => {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -409,6 +484,19 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
         if end < rows.len() {
             lines.push(ui::color::dim(&format!("    ↓ {} more", rows.len() - end)));
         }
+        if show_box {
+            let box_lines = render_queue_box(queue.as_deref().unwrap(), cap, focus_q, qsel);
+            // Keep the box off the terminal's last column — a glyph written there is
+            // eaten by the pending-wrap state, which is what hid the right border.
+            let left_w = term_cols as usize - QUEUE_BOX_W - 4;
+            for (k, bl) in box_lines.into_iter().enumerate() {
+                let at = body_start + k;
+                if at >= lines.len() {
+                    lines.push(String::new());
+                }
+                lines[at] = format!("{}  {bl}", layout::pad_to(&lines[at], left_w));
+            }
+        }
         lines.push(String::new());
         lines.push(ui::rule(None));
         lines.push(format!(
@@ -418,7 +506,7 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
             ui::color::dim("→"),
             ui::color::dim(&format!("{}/Esc", ui::glyph::back())),
             if expanded.is_some() { "collapse" } else { "back" },
-        ));
+        ) + &if show_box { format!("   {} queue", ui::color::dim("Tab")) } else { String::new() });
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -426,7 +514,30 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
             ui::show_cursor();
             std::process::exit(130);
         }
+        if focus_q {
+            if let Some(q) = queue.as_deref_mut() {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Esc | KeyCode::Left => focus_q = false,
+                    KeyCode::Up | KeyCode::Char('k') => qsel = (qsel + q.len() - 1) % q.len(),
+                    KeyCode::Down | KeyCode::Char('j') => qsel = (qsel + 1) % q.len(),
+                    // Pane 1 is the profile cockpit was launched from; the
+                    // start needs at least one pane, so it can't be removed.
+                    KeyCode::Char('x') | KeyCode::Delete if qsel > 0 => {
+                        q.remove(qsel);
+                        qsel = qsel.min(q.len() - 1);
+                    }
+                    KeyCode::Enter => {
+                        if let Some(dir) = prompt_dir(&format!("Pane {} — which directory?", qsel + 1), &q[qsel].1)? {
+                            q[qsel].1 = dir;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
         match key.code {
+            KeyCode::Tab if show_box => focus_q = true,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                 // First press collapses whichever profile is expanded and
                 // stays on this screen; only actually backs out once
@@ -453,12 +564,38 @@ fn pick_pane_target(profiles: &[Profile], cwd: &std::path::Path, heading: &str, 
                 }
             }
             KeyCode::Enter => {
-                ui::show_cursor();
-                return Ok(Some(match &rows[active_row] {
-                    TargetRow::Start => PaneAdd::Start,
-                    TargetRow::Profile(pi) => PaneAdd::Pick(profiles[*pi].name.clone(), cwd.to_path_buf()),
-                    TargetRow::Project { profile_idx, path, .. } => PaneAdd::Pick(profiles[*profile_idx].name.clone(), path.clone()),
-                }));
+                let pick: (String, std::path::PathBuf) = match &rows[active_row] {
+                    TargetRow::Start => {
+                        ui::show_cursor();
+                        return Ok(Some(PaneAdd::Start));
+                    }
+                    TargetRow::Profile(pi) => (profiles[*pi].name.clone(), cwd.to_path_buf()),
+                    TargetRow::Project { profile_idx, path, .. } => (profiles[*profile_idx].name.clone(), path.clone()),
+                    TargetRow::ChoosePath(pi) => {
+                        let title = format!("{} — which directory?", profiles[*pi].name);
+                        // Esc in the prompt just returns to this list.
+                        match prompt_dir(&title, cwd)? {
+                            Some(dir) => (profiles[*pi].name.clone(), dir),
+                            None => continue,
+                        }
+                    }
+                };
+                match queue.as_deref_mut() {
+                    Some(q) => {
+                        if q.len() < cap {
+                            q.push(pick);
+                        }
+                        // Full: nothing more to add, so launch.
+                        if q.len() >= cap {
+                            ui::show_cursor();
+                            return Ok(Some(PaneAdd::Start));
+                        }
+                    }
+                    None => {
+                        ui::show_cursor();
+                        return Ok(Some(PaneAdd::Pick(pick.0, pick.1)));
+                    }
+                }
             }
             _ => {}
         }
@@ -476,19 +613,12 @@ pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
 
     let mut chosen: Vec<(String, std::path::PathBuf)> = vec![(first.to_string(), cwd.clone())];
-    while chosen.len() < cap {
-        // A "Start" row launches with whatever's chosen so far (one pane =
-        // a solo session, two or more = a split); picking a profile (or one
-        // of its other projects, via →) adds another pane; Esc cancels the
+    if chosen.len() < cap {
+        // The picker keeps adding to `chosen` until "Start" (one pane = a
+        // solo session, two or more = a split) or the cap; Esc cancels the
         // whole thing.
-        let n = chosen.len();
-        let start_label = if n == 1 { "Start (solo session)".to_string() } else { format!("Start ({n} panes)") };
-        let names: Vec<&str> = chosen.iter().map(|(name, _)| name.as_str()).collect();
-        let heading = format!("Panes so far: {}", names.join(", "));
-        match pick_pane_target(profiles, &cwd, &heading, Some(&start_label))? {
-            Some(PaneAdd::Start) => break,
-            Some(PaneAdd::Pick(name, project)) => chosen.push((name, project)),
-            None => return Ok(None),
+        if pick_pane_target(profiles, &cwd, "", Some(&mut chosen))?.is_none() {
+            return Ok(None);
         }
     }
     run_split_targets(profiles, &chosen)
@@ -645,6 +775,56 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
         p.dirty.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Asks which directory a new shell pane should start in. Empty input means
+/// `cwd`; a relative path is taken against `cwd`. Esc cancels (None); a path
+/// that isn't a directory keeps the prompt open with an error.
+fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    let mut buf = String::new();
+    let mut error = String::new();
+    ui::show_cursor();
+    let result = loop {
+        let lines = vec![
+            format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(title)),
+            ui::color::dim(&format!("   Enter = {}   Esc cancel", cwd.display())),
+            String::new(),
+            format!("   > {buf}"),
+            if error.is_empty() { String::new() } else { ui::color::red(&format!("   {error}")) },
+        ];
+        ui::repaint(&lines);
+        let key = read_key()?;
+        match key.code {
+            KeyCode::Esc => break None,
+            KeyCode::Enter => {
+                let input = buf.trim().trim_matches('"');
+                if input.is_empty() {
+                    break Some(cwd.to_path_buf());
+                }
+                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+                let expanded = match input.strip_prefix('~') {
+                    Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("{home}{rest}"),
+                    _ => input.to_string(),
+                };
+                let path = cwd.join(expanded); // absolute input replaces cwd
+                if path.is_dir() {
+                    break Some(path);
+                }
+                error = format!("not a directory: {}", path.display());
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                error.clear();
+            }
+            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                buf.push(c);
+                error.clear();
+            }
+            _ => {}
+        }
+    };
+    ui::hide_cursor();
+    Ok(result)
 }
 
 /// Spawns a shell in `cwd` as a new pane appended to the grid and focused.
