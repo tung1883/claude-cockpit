@@ -30,7 +30,21 @@ struct Pane {
     /// Temp file holding this pane's composed system prompt (if any); removed
     /// when the pane is dropped. Killing the child stays explicit elsewhere.
     sysprompt_tmp: Option<std::path::PathBuf>,
+    /// Whether this pane runs Claude (vs. a plain shell).
+    claude: bool,
+    /// When set, a Ctrl+L is due to be sent to this (Claude) pane — see
+    /// `RESIZE_NUDGE`.
+    nudge_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long after a Claude pane's last resize it gets a Ctrl+L (screen
+/// redraw). After a column resize the inner ConPTY and Claude disagree by one
+/// column about where the prompt cursor is, so the first typed character lands
+/// one cell left (over the space after `❯`) and later ones leave a gap; the
+/// stray character then survives backspacing. Reproduced with a headless
+/// probe (examples/probe.rs) at several widths; a Ctrl+L once the resize has
+/// settled makes Claude redraw cleanly and the glitch does not occur.
+const RESIZE_NUDGE: Duration = Duration::from_millis(800);
 
 impl Drop for Pane {
     fn drop(&mut self) {
@@ -93,17 +107,18 @@ fn process_output(carry: &mut Vec<u8>, chunk: &[u8], parser: &Mutex<vt100::Parse
 
 fn spawn_pane(profile: &str, label: String, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
     let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, cwd);
-    spawn_pane_cmd(cmd, sysprompt_tmp, label, cols, rows)
+    spawn_pane_cmd(cmd, sysprompt_tmp, true, label, cols, rows)
 }
 
 /// A pane running a plain interactive shell instead of Claude.
 fn spawn_shell_pane(cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
-    spawn_pane_cmd(launch::shell_pty_command(cwd), None, "shell".to_string(), cols, rows)
+    spawn_pane_cmd(launch::shell_pty_command(cwd), None, false, "shell".to_string(), cols, rows)
 }
 
 fn spawn_pane_cmd(
     cmd: portable_pty::CommandBuilder,
     sysprompt_tmp: Option<std::path::PathBuf>,
+    claude: bool,
     label: String,
     cols: u16,
     rows: u16,
@@ -132,7 +147,7 @@ fn spawn_pane_cmd(
             }
         }
     });
-    Ok(Pane { label, parser, writer, master: pair.master, child, dirty, sysprompt_tmp })
+    Ok(Pane { label, parser, writer, master: pair.master, child, dirty, sysprompt_tmp, claude, nudge_at: Mutex::new(None) })
 }
 
 fn color_code(c: vt100::Color, fg: bool) -> String {
@@ -156,6 +171,13 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
             out.push(' ');
             continue;
         };
+        // The right half of a double-width glyph: the terminal already
+        // advances two columns for the glyph itself, so printing a filler
+        // here would push the rest of the row (and every pane to its right)
+        // one column out of place.
+        if cell.is_wide_continuation() {
+            continue;
+        }
         let mut codes = Vec::new();
         if cell.bold() {
             codes.push("1".to_string());
@@ -765,6 +787,12 @@ pub fn resume(mut session: Session, profiles: &[Profile]) -> Result<Option<Sessi
 /// size) and our cursor/render math (governed by the vt100 size) drift
 /// apart.
 fn resize_pane(pane: &Pane, rows: u16, cols: u16) {
+    let changed = pane.parser.lock().map(|p| p.screen().size() != (rows, cols)).unwrap_or(false);
+    if changed && pane.claude {
+        if let Ok(mut t) = pane.nudge_at.lock() {
+            *t = Some(std::time::Instant::now() + RESIZE_NUDGE);
+        }
+    }
     let _ = pane.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
     if let Ok(mut p) = pane.parser.lock() {
         p.set_size(rows, cols);
@@ -955,6 +983,18 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     // layout changed, which forces one full repaint.
     let mut prev: Vec<String> = Vec::new();
     loop {
+        // Send the post-resize Ctrl+L to any Claude pane whose resize has
+        // settled (see `RESIZE_NUDGE`).
+        let now = std::time::Instant::now();
+        for pane in panes.iter() {
+            let due = pane.nudge_at.lock().map(|mut t| if t.is_some_and(|at| now >= at) { t.take().is_some() } else { false }).unwrap_or(false);
+            if due {
+                if let Ok(mut w) = pane.writer.lock() {
+                    let _ = w.write_all(&[0x0c]);
+                    let _ = w.flush();
+                }
+            }
+        }
         // Swap every dirty flag (not short-circuiting) so one repaint clears
         // all of them and picks up every pane that changed this tick.
         let dirty = panes.iter().fold(false, |acc, p| acc | p.dirty.swap(false, Ordering::Relaxed));
