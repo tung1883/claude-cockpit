@@ -42,6 +42,25 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path) -> (portable_pty::Co
     (cmd, sysprompt)
 }
 
+/// PTY command for a plain interactive shell in `cwd` (same shell choice as
+/// `open_shell`), for hosting in a split pane.
+pub(crate) fn shell_pty_command(cwd: &Path) -> portable_pty::CommandBuilder {
+    let program = if cfg!(windows) {
+        if which::which("pwsh").is_ok() {
+            "pwsh".to_string()
+        } else if which::which("powershell").is_ok() {
+            "powershell".to_string()
+        } else {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+        }
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    };
+    let mut cmd = portable_pty::CommandBuilder::new(program);
+    cmd.cwd(cwd);
+    cmd
+}
+
 /// The three cockpit-managed system-prompt levels, coarse to fine:
 /// profile-wide, then this project, then (only when resuming) this specific
 /// session. Composed into one string, in that order.

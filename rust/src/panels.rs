@@ -92,9 +92,24 @@ fn process_output(carry: &mut Vec<u8>, chunk: &[u8], parser: &Mutex<vt100::Parse
 }
 
 fn spawn_pane(profile: &str, label: String, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
+    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, cwd);
+    spawn_pane_cmd(cmd, sysprompt_tmp, label, cols, rows)
+}
+
+/// A pane running a plain interactive shell instead of Claude.
+fn spawn_shell_pane(cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
+    spawn_pane_cmd(launch::shell_pty_command(cwd), None, "shell".to_string(), cols, rows)
+}
+
+fn spawn_pane_cmd(
+    cmd: portable_pty::CommandBuilder,
+    sysprompt_tmp: Option<std::path::PathBuf>,
+    label: String,
+    cols: u16,
+    rows: u16,
+) -> Result<Pane> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, cwd);
     let child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader()?;
@@ -632,6 +647,26 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     Ok(())
 }
 
+/// Spawns a shell in `cwd` as a new pane appended to the grid and focused.
+/// No-op if already at the size-based cap.
+fn add_shell_pane(panes: &mut Vec<Pane>, focus: &mut usize, cwd: &std::path::Path) -> Result<()> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    if panes.len() >= max_panes_for(cols, rows) {
+        return Ok(());
+    }
+    let (pc, pr) = pane_geometry(cols, rows, panes.len() + 1);
+    let pane = spawn_shell_pane(cwd, pc, pr)?;
+    for p in panes.iter() {
+        resize_pane(p, pr, pc);
+    }
+    panes.push(pane);
+    *focus = panes.len() - 1;
+    for p in panes.iter() {
+        p.dirty.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Kills the focused pane's child and drops it from the split, reflowing the
 /// rest. The other panes' sessions keep running untouched. Returns true when
 /// no panes are left (the caller then exits the split).
@@ -690,29 +725,8 @@ fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16, z
     }
 }
 
-/// Drops into a real interactive shell in `cwd`, then returns. Leaves the
-/// compositor's raw mode + alternate screen so the shell gets a normal
-/// cooked console on the primary buffer, and restores both on the way back.
-/// Callers repaint afterward (the alt buffer's contents are discarded on
-/// re-entry).
-fn drop_to_shell(cwd: &std::path::Path) -> Result<()> {
-    let mut out = std::io::stdout();
-    // Back to the primary buffer, cursor shown, cooked input — a plain shell.
-    let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
-    let _ = out.flush();
-    let _ = crossterm::terminal::disable_raw_mode();
-
-    println!("{} shell — type 'exit' to return to your session", ui::color::dim(ui::glyph::spark()));
-    let result = launch::open_shell(cwd);
-
-    let _ = crossterm::terminal::enable_raw_mode();
-    let _ = out.write_all(b"\x1b[?1049h\x1b[H\x1b[?25l");
-    let _ = out.flush();
-    result
-}
-
 /// The command that, typed on its own line into a focused pane and followed
-/// by Enter, drops to a shell — the same as pressing F9. cockpit can't see
+/// by Enter, opens a shell pane — the same as pressing F9. cockpit can't see
 /// text once it's inside Claude, so it watches the keystrokes it forwards.
 const SHELL_CMD: &str = "/shell";
 
@@ -880,10 +894,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                             }
                         }
                         typed.clear();
-                        drop_to_shell(cwd)?;
-                        for pane in panes.iter() {
-                            pane.dirty.store(true, Ordering::Relaxed);
-                        }
+                        add_shell_pane(panes, focus, cwd)?;
                         continue;
                     }
                     // Track the current line so the "/shell" command above can

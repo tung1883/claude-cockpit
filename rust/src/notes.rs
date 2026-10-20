@@ -258,6 +258,7 @@ fn find_sections(content: &str) -> Vec<Section> {
 }
 
 pub fn get_section_body(content: &str, key: &str) -> Option<String> {
+    let key = normalize_sep(key);
     find_sections(content).into_iter().find(|s| s.key == key).map(|s| s.body)
 }
 
@@ -295,7 +296,8 @@ pub fn hide(root: &Path) {
 pub fn upsert_section(content: &str, key: &str, name: &str, body: &str) -> String {
     let block = format!("{}\n<!-- ccpit:path={key} -->\n{}\n", section_heading(name), body.trim());
     let sections = find_sections(content);
-    if let Some(existing) = sections.iter().find(|s| s.key == key) {
+    let norm_key = normalize_sep(key);
+    if let Some(existing) = sections.iter().find(|s| s.key == norm_key) {
         // Force exactly 2 blank lines on both sides of the edited block,
         // rather than trusting whatever spacing (possibly just 1 blank
         // line, from stale content) was already there before it.
