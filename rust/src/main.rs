@@ -1,3 +1,4 @@
+mod clipboard;
 mod conpty;
 mod detail;
 mod editor;

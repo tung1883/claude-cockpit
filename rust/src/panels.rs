@@ -11,13 +11,14 @@
 // KERNELBASE!ConsoleInitialize forever, and dies with STATUS_DLL_INIT_FAILED
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
+use crate::clipboard;
 use crate::conpty;
 use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status};
 use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -73,6 +74,13 @@ const IDLE_NUDGE: Duration = Duration::from_secs(3);
 /// Writes `bytes` to the pane's PTY as one write, preceded by a Ctrl+L when
 /// it is a Claude pane that has been idle past `IDLE_NUDGE` (see above).
 fn send_to_pane(pane: &Pane, bytes: &[u8]) {
+    // Typing returns a scrolled-back pane to the live screen.
+    if let Ok(mut p) = pane.parser.lock() {
+        if p.screen().scrollback() > 0 {
+            p.set_scrollback(0);
+            pane.dirty.store(true, Ordering::Relaxed);
+        }
+    }
     let now = std::time::Instant::now();
     let idle = match pane.last_input.lock() {
         Ok(mut t) => {
@@ -250,7 +258,7 @@ fn color_code(c: vt100::Color, fg: bool) -> String {
     }
 }
 
-fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
+fn render_row(screen: &vt100::Screen, row: u16, width: u16, selected: Option<(u16, u16)>) -> String {
     let mut out = String::new();
     // The SGR currently in effect; a new escape is emitted only when a cell's
     // style differs from the previous one, so a mostly-plain row costs a
@@ -278,7 +286,9 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
         if cell.underline() {
             codes.push("4".to_string());
         }
-        if cell.inverse() {
+        // The mouse selection is drawn as reverse video (toggled, so already
+        // inverse text stays visible).
+        if cell.inverse() != selected.is_some_and(|(a, b)| col >= a && col <= b) {
             codes.push("7".to_string());
         }
         codes.push(color_code(cell.fgcolor(), true));
@@ -1235,8 +1245,11 @@ fn side_key(code: KeyCode, panes: &mut Vec<Pane>, focus: &mut usize, side: &mut 
     (toast, quit)
 }
 
-fn pane_label(p: &Pane, width: usize, focused: bool, full: bool) -> String {
-    let suffix = if full { "  (full)" } else { "" };
+fn pane_label(p: &Pane, width: usize, focused: bool, full: bool, scrolled: usize) -> String {
+    let mut suffix = if full { "  (full)".to_string() } else { String::new() };
+    if scrolled > 0 {
+        suffix.push_str(&format!("  ↑{scrolled} lines back"));
+    }
     let badge = sidebar::status_badge(p.meta.status);
     let badge_w = badge.map_or(0, |(t, _)| t.chars().count() + 1);
     let mut text = format!(" {} · {}{suffix}", p.meta.title, sidebar::project_name(&p.meta.project));
@@ -1256,7 +1269,7 @@ fn key_hints(pairs: &[(&str, &str)]) -> String {
 
 /// Builds one full frame (every screen line) plus the cursor escape: header,
 /// pane list beside the grid (labels + pane rows), rule and key hints.
-fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut SideState, toast: Option<&str>, leader: bool) -> (Vec<String>, String) {
+fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut SideState, toast: Option<&str>, leader: bool, sel: Option<Sel>) -> (Vec<String>, String) {
     let drawn = sidebar::drawn(panes);
     let full = sidebar::full_index(panes).is_some();
     let lay = make_layout(cols, rows, drawn.len().max(1));
@@ -1269,12 +1282,19 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
 
     let mut main: Vec<String> = Vec::with_capacity(body_h);
     {
-        let guards: Vec<_> = drawn.iter().map(|&i| panes[i].parser.lock().unwrap()).collect();
+        let mut guards: Vec<_> = drawn.iter().map(|&i| panes[i].parser.lock().unwrap()).collect();
+        // The selected pane's position in the grid, its history length and how
+        // far it is scrolled, to turn view rows into buffer lines.
+        let sel_view = sel.and_then(|s| {
+            let pos = drawn.iter().position(|&i| i == s.pane)?;
+            let off = guards[pos].screen().scrollback();
+            Some((s, pos, history_len(&mut guards[pos]), off))
+        });
         for grow in 0..lay.grows {
             let labels: Vec<String> = (0..lay.gcols)
                 .map(|gc| {
                     let pos = grow * lay.gcols + gc;
-                    if pos < n { pane_label(&panes[drawn[pos]], pc, drawn[pos] == focus, full) } else { blank.clone() }
+                    if pos < n { pane_label(&panes[drawn[pos]], pc, drawn[pos] == focus, full, guards[pos].screen().scrollback()) } else { blank.clone() }
                 })
                 .collect();
             main.push(labels.join(SEP));
@@ -1282,7 +1302,7 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
                 let cells: Vec<String> = (0..lay.gcols)
                     .map(|gc| {
                         let pos = grow * lay.gcols + gc;
-                        if pos < n { render_row(guards[pos].screen(), row, lay.pane_cols) } else { blank.clone() }
+                        if pos < n { render_row(guards[pos].screen(), row, lay.pane_cols, sel_view.and_then(|(s, spos, len, off)| if spos == pos { s.cols_on_row(len - off + row as usize, lay.pane_cols) } else { None })) } else { blank.clone() }
                     })
                     .collect();
                 main.push(cells.join(SEP));
@@ -1374,6 +1394,137 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
     (lines, cursor)
 }
 
+/// A mouse selection inside one pane. Rows count lines of the pane's whole
+/// buffer (history first, then the screen), not rows of the current view, so
+/// the selection stays on its text when the pane scrolls or new output arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sel {
+    pane: usize,
+    anchor: (usize, u16),
+    head: (usize, u16),
+}
+
+impl Sel {
+    /// (start, end) in reading order.
+    fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
+    }
+
+    /// Inclusive column range selected on `row`, for a pane `width` wide.
+    fn cols_on_row(&self, row: usize, width: u16) -> Option<(u16, u16)> {
+        let (s, e) = self.ordered();
+        if row < s.0 || row > e.0 {
+            return None;
+        }
+        let from = if row == s.0 { s.1 } else { 0 };
+        let to = if row == e.0 { e.1 } else { width.saturating_sub(1) };
+        Some((from, to))
+    }
+}
+
+/// Lines of history above the screen (how far back the pane can scroll).
+fn history_len(p: &mut vt100::Parser) -> usize {
+    let cur = p.screen().scrollback();
+    p.set_scrollback(usize::MAX);
+    let len = p.screen().scrollback();
+    p.set_scrollback(cur);
+    len
+}
+
+/// Buffer line shown at row `view_row` of the pane's current view.
+fn abs_row(pane: &Pane, view_row: u16) -> usize {
+    match pane.parser.lock() {
+        Ok(mut p) => {
+            let off = p.screen().scrollback();
+            history_len(&mut p) - off + view_row as usize
+        }
+        Err(_) => view_row as usize,
+    }
+}
+
+/// The selected text, trailing blanks stripped from each line. Rows outside
+/// the current view are brought into view one at a time; the pane's scroll
+/// position is put back afterwards.
+fn selection_text(pane: &Pane, sel: &Sel) -> String {
+    match pane.parser.lock() {
+        Ok(mut p) => extract_selection(&mut p, sel),
+        Err(_) => String::new(),
+    }
+}
+
+fn extract_selection(p: &mut vt100::Parser, sel: &Sel) -> String {
+    let ((sr, sc), (er, ec)) = sel.ordered();
+    let keep = p.screen().scrollback();
+    let len = history_len(p);
+    let (rows, cols) = p.screen().size();
+    let mut lines = Vec::new();
+    for a in sr..=er {
+        let top = len - p.screen().scrollback();
+        if a < top || a >= top + rows as usize {
+            p.set_scrollback(len.saturating_sub(a));
+        }
+        let top = len - p.screen().scrollback();
+        let c0 = if a == sr { sc } else { 0 };
+        let c1 = if a == er { ec } else { cols.saturating_sub(1) };
+        let text = p.screen().rows(c0, c1.saturating_sub(c0) + 1).nth(a - top).unwrap_or_default();
+        lines.push(text.trim_end().to_string());
+    }
+    p.set_scrollback(keep);
+    lines.join("\n").trim_end().to_string()
+}
+
+/// Which drawn pane covers terminal cell (`col`, `row`), both 0-based, with the
+/// row and column inside that pane (`None` row = its label or rule row).
+/// Mirrors the geometry `compose_frame` draws: a header row, then per grid row
+/// a label row, `pane_rows` pane rows and a rule row; panes are `SEP_COLS` apart.
+fn pane_cell(lay: &Layout, drawn: &[usize], col: u16, row: u16) -> Option<(usize, Option<u16>, u16)> {
+    let x = col.checked_sub(lay.main_x)?;
+    let cell_w = lay.pane_cols + SEP_COLS;
+    let gc = (x / cell_w) as usize;
+    if gc >= lay.gcols || x % cell_w >= lay.pane_cols {
+        return None;
+    }
+    let y = row.checked_sub(1)?;
+    let cell_h = lay.pane_rows + 2;
+    let gr = (y / cell_h) as usize;
+    if gr >= lay.grows {
+        return None;
+    }
+    let inner = y % cell_h;
+    let in_pane = if inner >= 1 && inner <= lay.pane_rows { Some(inner - 1) } else { None };
+    drawn.get(gr * lay.gcols + gc).map(|&i| (i, in_pane, x % cell_w))
+}
+
+#[cfg(test)]
+fn pane_at(lay: &Layout, drawn: &[usize], col: u16, row: u16) -> Option<usize> {
+    pane_cell(lay, drawn, col, row).map(|c| c.0)
+}
+
+/// Terminal (column, row) of the pane's top-left content cell.
+fn pane_origin(lay: &Layout, drawn: &[usize], idx: usize) -> Option<(u16, u16)> {
+    let pos = drawn.iter().position(|&i| i == idx)?;
+    let (gr, gc) = ((pos / lay.gcols) as u16, (pos % lay.gcols) as u16);
+    Some((lay.main_x + gc * (lay.pane_cols + SEP_COLS), 2 + gr * (lay.pane_rows + 2)))
+}
+
+/// Mouse-wheel step, in lines.
+const WHEEL_LINES: usize = 3;
+
+/// Pause between auto-scroll steps while a selection is dragged past the
+/// pane's top or bottom edge.
+const AUTOSCROLL_EVERY: Duration = Duration::from_millis(50);
+
+/// Scrolls `pane`'s history by `delta` lines (positive = back in time), clamped
+/// to what the vt100 buffer holds.
+fn scroll_pane(pane: &Pane, delta: isize) {
+    if let Ok(mut p) = pane.parser.lock() {
+        let cur = p.screen().scrollback();
+        let next = if delta >= 0 { cur.saturating_add(delta as usize) } else { cur.saturating_sub(delta.unsigned_abs()) };
+        p.set_scrollback(next);
+        pane.dirty.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Places the real terminal cursor at the focused pane's own cursor (so
 /// typing shows a caret where Claude expects one), or hides it if that pane
 /// has the cursor hidden. The pane at drawn position `pos` sits in grid cell
@@ -1390,7 +1541,7 @@ fn cursor_escape(panes: &[Pane], focus: usize, lay: &Layout, drawn: &[usize]) ->
     let (gr, gc) = ((pos / lay.gcols) as u16, (pos % lay.gcols) as u16);
     let Ok(p) = panes[focus].parser.lock() else { return String::new() };
     let screen = p.screen();
-    if screen.hide_cursor() {
+    if screen.hide_cursor() || screen.scrollback() > 0 {
         "\x1b[?25l".to_string()
     } else {
         // Clamped defensively: a resize mid-frame can have this pane's vt100
@@ -1508,6 +1659,14 @@ struct Ctl {
     /// Whether the terminal window has focus (focus reports); assumed true
     /// until the terminal says otherwise.
     window_focused: bool,
+    /// The mouse selection being made or just copied.
+    sel: Option<Sel>,
+    /// The left button is held down and extending `sel`.
+    dragging: bool,
+    /// Last pointer position while dragging, to keep scrolling when it rests
+    /// outside the pane.
+    pointer: (u16, u16),
+    last_autoscroll: std::time::Instant,
 }
 
 impl Ctl {
@@ -1624,7 +1783,11 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
 /// window is actually in front.
 fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
     focus_reports(true);
+    // Without mouse capture the terminal turns the wheel into Up/Down keys (in
+    // the alternate screen), which scrolled through Claude's input history.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run_loop_inner(panes, focus, profiles, cwd);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     focus_reports(false);
     result
 }
@@ -1644,6 +1807,10 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         prev: Vec::new(),
         leader: false,
         window_focused: true,
+        sel: None,
+        dragging: false,
+        pointer: (0, 0),
+        last_autoscroll: std::time::Instant::now(),
     };
     loop {
         // Send the post-resize Ctrl+L to any Claude pane whose resize has
@@ -1700,7 +1867,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
             // gap between "cursor off" and "back on" to look like a fast
             // blink instead of one clean frame.
             let toast = ctl.toast.as_ref().map(|(m, _)| m.clone());
-            let (lines, cursor) = compose_frame(panes, *focus, cols, rows, &mut ctl.side, toast.as_deref(), ctl.leader);
+            let (lines, cursor) = compose_frame(panes, *focus, cols, rows, &mut ctl.side, toast.as_deref(), ctl.leader, ctl.sel);
             let body = ui::repaint_diff(&ctl.prev, &lines);
             ctl.prev = lines;
             let frame = format!("\x1b[?25l{body}{cursor}");
@@ -1709,9 +1876,34 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
             let _ = out.flush();
         }
 
+        // Holding the button above or below the pane keeps scrolling it and
+        // extending the selection, even without mouse movement.
+        if ctl.dragging && ctl.last_autoscroll.elapsed() >= AUTOSCROLL_EVERY {
+            if let Some(sel) = ctl.sel.as_mut() {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let drawn = sidebar::drawn(panes);
+                let lay = make_layout(cols, rows, drawn.len().max(1));
+                if let Some((c0, r0)) = pane_origin(&lay, &drawn, sel.pane) {
+                    let (px, py) = ctl.pointer;
+                    let dir: isize = if py < r0 { 1 } else if py >= r0 + lay.pane_rows { -1 } else { 0 };
+                    if dir != 0 {
+                        scroll_pane(&panes[sel.pane], dir);
+                        let edge = if dir > 0 { 0 } else { lay.pane_rows.saturating_sub(1) };
+                        let c = px.saturating_sub(c0).min(lay.pane_cols.saturating_sub(1));
+                        sel.head = (abs_row(&panes[sel.pane], edge), c);
+                        ctl.last_autoscroll = std::time::Instant::now();
+                        ctl.force = true;
+                    }
+                }
+            }
+        }
+
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                    if ctl.sel.take().is_some() {
+                        ctl.force = true;
+                    }
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     let alt = k.modifiers.contains(KeyModifiers::ALT);
                     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
@@ -1843,6 +2035,70 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                     ctl.prev.clear();
                     settle(panes, focus, cols, rows);
                     ctl.force = true;
+                }
+                Event::Mouse(m) if !ctl.side.focus => {
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let drawn = sidebar::drawn(panes);
+                    let lay = make_layout(cols, rows, drawn.len().max(1));
+                    match m.kind {
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let delta = if m.kind == MouseEventKind::ScrollUp { WHEEL_LINES as isize } else { -(WHEEL_LINES as isize) };
+                            // The pane under the pointer, else the focused one.
+                            let target = pane_cell(&lay, &drawn, m.column, m.row).map(|c| c.0).unwrap_or(*focus);
+                            scroll_pane(&panes[target], delta);
+                            ctl.force = true;
+                        }
+                        // Selecting text is done here, since mouse capture
+                        // takes it away from the terminal: press, drag, release
+                        // copies the selection.
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            ctl.sel = None;
+                            ctl.dragging = false;
+                            ctl.force = true;
+                            if let Some((idx, row, col)) = pane_cell(&lay, &drawn, m.column, m.row) {
+                                if idx != *focus {
+                                    sidebar::focus_pane(panes, focus, idx);
+                                    ctl.typed.clear();
+                                }
+                                if let Some(r) = row {
+                                    let a = abs_row(&panes[idx], r);
+                                    ctl.sel = Some(Sel { pane: idx, anchor: (a, col), head: (a, col) });
+                                    ctl.dragging = true;
+                                    ctl.pointer = (m.column, m.row);
+                                }
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            ctl.pointer = (m.column, m.row);
+                            if let Some(sel) = ctl.sel.as_mut() {
+                                if let Some((c0, r0)) = pane_origin(&lay, &drawn, sel.pane) {
+                                    let c = m.column.saturating_sub(c0).min(lay.pane_cols.saturating_sub(1));
+                                    let r = m.row.saturating_sub(r0).min(lay.pane_rows.saturating_sub(1));
+                                    let head = (abs_row(&panes[sel.pane], r), c);
+                                    if head != sel.head {
+                                        sel.head = head;
+                                        ctl.force = true;
+                                    }
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            ctl.dragging = false;
+                            if let Some(sel) = ctl.sel {
+                                if sel.anchor == sel.head {
+                                    ctl.sel = None; // a plain click
+                                    ctl.force = true;
+                                } else if let Some(p) = panes.get(sel.pane) {
+                                    let text = selection_text(p, &sel);
+                                    if !text.is_empty() {
+                                        clipboard::copy(&text);
+                                        ctl.say(format!("copied {} chars", text.chars().count()));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Event::FocusGained => ctl.window_focused = true,
                 Event::FocusLost => ctl.window_focused = false,
@@ -2023,5 +2279,77 @@ mod tests {
         assert_eq!(writes.lock().unwrap().as_slice(), &[osc7501::QUERY_REPLY.to_vec()]);
         assert_eq!(reported.lock().unwrap().status(), Status::Working);
         assert!(parser.lock().unwrap().screen().contents().contains("hi"));
+    }
+
+    #[test]
+    fn pane_at_maps_cells_to_drawn_panes() {
+        // 2x2 grid of 10x4 panes, 3 apart, starting at column 5.
+        let lay = Layout { main_x: 5, grows: 2, gcols: 2, pane_cols: 10, pane_rows: 4 };
+        let drawn = [7, 8, 9];
+        assert_eq!(pane_at(&lay, &drawn, 5, 1), Some(7)); // label row of pane 0
+        assert_eq!(pane_at(&lay, &drawn, 14, 5), Some(7)); // last cell of pane 0
+        assert_eq!(pane_at(&lay, &drawn, 15, 3), None); // separator
+        assert_eq!(pane_at(&lay, &drawn, 18, 3), Some(8)); // pane 1
+        assert_eq!(pane_at(&lay, &drawn, 6, 7), Some(9)); // second grid row
+        assert_eq!(pane_at(&lay, &drawn, 18, 7), None); // empty fourth cell
+        assert_eq!(pane_at(&lay, &drawn, 2, 3), None); // sidebar
+        assert_eq!(pane_at(&lay, &drawn, 6, 0), None); // header
+    }
+
+    #[test]
+    fn selection_spans_rows_in_reading_order() {
+        let s = Sel { pane: 0, anchor: (3, 5), head: (1, 2) };
+        assert_eq!(s.ordered(), ((1, 2), (3, 5)));
+        assert_eq!(s.cols_on_row(0, 20), None);
+        assert_eq!(s.cols_on_row(1, 20), Some((2, 19)));
+        assert_eq!(s.cols_on_row(2, 20), Some((0, 19)));
+        assert_eq!(s.cols_on_row(3, 20), Some((0, 5)));
+        assert_eq!(s.cols_on_row(4, 20), None);
+        let one = Sel { pane: 0, anchor: (2, 7), head: (2, 3) };
+        assert_eq!(one.cols_on_row(2, 20), Some((3, 7)));
+    }
+
+    #[test]
+    fn pane_cell_reports_the_cell_inside_the_pane() {
+        let lay = Layout { main_x: 5, grows: 1, gcols: 2, pane_cols: 10, pane_rows: 4 };
+        let drawn = [3, 4];
+        assert_eq!(pane_cell(&lay, &drawn, 5, 2), Some((3, Some(0), 0)));
+        assert_eq!(pane_cell(&lay, &drawn, 21, 5), Some((4, Some(3), 3)));
+        assert_eq!(pane_cell(&lay, &drawn, 6, 1), Some((3, None, 1))); // label row
+        assert_eq!(pane_origin(&lay, &drawn, 4), Some((18, 2)));
+    }
+
+    #[test]
+    fn selection_text_reads_history_and_restores_the_scroll_position() {
+        let mut p = vt100::Parser::new(5, 20, 100);
+        for i in 0..30 {
+            p.process(format!("row {i:02} text\r\n").as_bytes());
+        }
+        let len = history_len(&mut p);
+        assert!(len >= 25);
+        p.set_scrollback(2);
+        // Lines 3..=6 of the buffer, from column 4 of the first to column 5 of the last.
+        let sel = Sel { pane: 0, anchor: (3, 4), head: (6, 5) };
+        let text = extract_selection(&mut p, &sel);
+        assert_eq!(text, "03 text\nrow 04 text\nrow 05 text\nrow 06");
+        assert_eq!(p.screen().scrollback(), 2);
+        // A selection reaching the live screen works too.
+        let tail = Sel { pane: 0, anchor: (len + 2, 0), head: (len + 3, 19) };
+        assert_eq!(extract_selection(&mut p, &tail).lines().count(), 2);
+    }
+
+    #[test]
+    fn selection_rows_follow_the_text_as_output_arrives() {
+        let mut p = vt100::Parser::new(5, 20, 100);
+        for i in 0..8 {
+            p.process(format!("row {i}\r\n").as_bytes());
+        }
+        let before = history_len(&mut p) + 1; // buffer line of the second screen row
+        let shown = p.screen().rows(0, 20).nth(1).unwrap();
+        p.process(b"more\r\nmore\r\n");
+        let moved_by = history_len(&mut p) + 1 - before;
+        assert_eq!(moved_by, 2); // new lines pushed history down by two...
+        let sel = Sel { pane: 0, anchor: (before, 0), head: (before, 19) };
+        assert_eq!(extract_selection(&mut p, &sel), shown.trim_end()); // ...but the selection still reads the same line
     }
 }

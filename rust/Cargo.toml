@@ -30,5 +30,12 @@ wait-timeout = "0.2"
 portable-pty = "0.9"
 vt100 = "0.15"
 
+# vt100 0.15's Grid::visible_rows computes `rows_len - scrollback_offset`,
+# which underflows once a pane is scrolled back further than it is tall. In
+# release builds (overflow checks off) the wrapped value is harmless: the view
+# still comes from the scrollback. Debug builds would panic, so match release.
+[profile.dev]
+overflow-checks = false
+
 [profile.release]
 opt-level = 2
