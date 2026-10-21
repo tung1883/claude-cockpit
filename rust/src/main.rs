@@ -21,6 +21,7 @@ mod statusline;
 mod sync;
 mod handoff;
 mod ui;
+mod worktree;
 
 use anyhow::Result;
 use picker::Action;

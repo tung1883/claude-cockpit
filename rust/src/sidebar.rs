@@ -41,6 +41,22 @@ pub struct PaneMeta {
     pub status: Status,
     /// Monotonic counter bumped whenever the pane takes focus.
     pub last_focus: u64,
+    /// Set when the pane works in its own git worktree.
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// A pane's git worktree (see `worktree.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    /// Name given by the user; the folder name and the part after `worktree-`.
+    pub name: String,
+    /// The worktree folder the pane runs in.
+    pub path: PathBuf,
+    /// The main checkout it belongs to.
+    pub repo: PathBuf,
+    pub branch: String,
+    /// What the branch was started from (for the "commits ahead" count).
+    pub base: String,
 }
 
 pub trait HasMeta {
@@ -365,8 +381,15 @@ pub fn render_sidebar<T: HasMeta>(
                         } else {
                             title.clone()
                         };
-                        let used = 4 + 1 + 1 + title.chars().count();
-                        let mut s = format!("    {} {}", mode_glyph(m.mode), title_styled);
+                        // `wt:name` after the title when there is room for it.
+                        let tag = m
+                            .worktree
+                            .as_ref()
+                            .map(|w| fit(&format!(" wt:{}", w.name), title_w.saturating_sub(title.chars().count())))
+                            .filter(|t| t.chars().count() >= 4)
+                            .unwrap_or_default();
+                        let used = 4 + 1 + 1 + title.chars().count() + tag.chars().count();
+                        let mut s = format!("    {} {}{}", mode_glyph(m.mode), title_styled, color::cyan(&tag));
                         if let Some((t, paint)) = badge {
                             let gap = inner.saturating_sub(1 + used + t.chars().count());
                             s.push_str(&" ".repeat(gap));
@@ -396,7 +419,7 @@ mod tests {
     use super::*;
 
     fn pane(id: u64, profile: &str, project: &str, mode: Mode, status: Status, last: u64) -> PaneMeta {
-        PaneMeta { id, profile: profile.into(), project: PathBuf::from(project), title: format!("claude {id}"), shell: false, mode, status, last_focus: last }
+        PaneMeta { id, profile: profile.into(), project: PathBuf::from(project), title: format!("claude {id}"), shell: false, mode, status, last_focus: last, worktree: None }
     }
 
     fn modes(v: &[PaneMeta]) -> Vec<Mode> {
@@ -537,5 +560,27 @@ mod tests {
         assert_eq!(out.len(), 10);
         assert!(out.iter().all(|l| layout::vis_len(l) == 30), "{:?}", out.iter().map(|l| layout::vis_len(l)).collect::<Vec<_>>());
         assert!(scroll > 0, "cursor on the last row must scroll the view");
+    }
+
+    #[test]
+    fn a_worktree_pane_shows_its_name_after_the_title_when_there_is_room() {
+        let mut v = vec![pane(1, "main", "C:/w/cockpit", Mode::Small, Status::Unknown, 1), pane(2, "main", "C:/w/cockpit", Mode::Small, Status::Done, 2)];
+        v[1].worktree = Some(WorktreeInfo {
+            name: "fix".into(),
+            path: PathBuf::from("C:/w/cockpit/.claude/worktrees/fix"),
+            repo: PathBuf::from("C:/w/cockpit"),
+            branch: "worktree-fix".into(),
+            base: "HEAD".into(),
+        });
+        let rows = build_tree(&v, &HashSet::new());
+        let wide = render_sidebar(&v, &rows, &HashSet::new(), "", &mut 0usize, false, 0, 34, 10);
+        let line = |out: &[String], needle: &str| out.iter().find(|l| l.contains(needle)).cloned().unwrap_or_default();
+        assert!(line(&wide, "claude 2").contains("wt:fix"));
+        assert!(line(&wide, "claude 2").contains("done"), "the status badge must still fit");
+        assert!(!line(&wide, "claude 1").contains("wt:"));
+        // Too narrow for the tag: it is dropped, the badge stays, the row keeps its width.
+        let narrow = render_sidebar(&v, &rows, &HashSet::new(), "", &mut 0usize, false, 0, 22, 10);
+        assert!(!line(&narrow, "claude 2").contains("wt:"));
+        assert!(narrow.iter().all(|l| layout::vis_len(l) == 22));
     }
 }

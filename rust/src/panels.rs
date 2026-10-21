@@ -15,8 +15,8 @@ use crate::clipboard;
 use crate::conpty;
 use crate::notify;
 use crate::osc7501;
-use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status};
-use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui};
+use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
+use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui, worktree};
 use anyhow::Result;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
@@ -185,6 +185,95 @@ fn process_output(
     }
 }
 
+/// Starts the pane described by `t`, creating its worktree first when it has
+/// one (the pane then runs in the worktree folder; its project stays the repo
+/// so the pane list groups it with the repo's other panes).
+fn spawn_target(t: &Target, cols: u16, rows: u16) -> Result<Pane> {
+    let Some(spec) = &t.worktree else {
+        return spawn_pane(&t.profile, &t.dir, cols, rows);
+    };
+    let repo = worktree::repo_root(&t.dir).ok_or_else(|| anyhow::anyhow!("{} is not in a git repository", t.dir.display()))?;
+    let made = worktree::create(&repo, &spec.name, &spec.base)?;
+    let mut pane = match spawn_pane(&t.profile, &made.path, cols, rows) {
+        Ok(p) => p,
+        Err(e) => {
+            // Nothing started, so don't leave an unused worktree behind.
+            let _ = worktree::remove(&repo, &made.path);
+            return Err(e);
+        }
+    };
+    pane.meta.project = repo.clone();
+    pane.meta.worktree = Some(WorktreeInfo { name: spec.name.clone(), path: made.path, repo, branch: made.branch, base: spec.base.clone() });
+    Ok(pane)
+}
+
+/// Asks for the worktree name and base for a new pane in `dir`'s repo. `queued`
+/// holds the names already chosen for earlier queue entries. None = cancelled.
+fn ask_worktree(profile: &str, dir: &std::path::Path, queued: &[String]) -> Result<Option<Target>> {
+    let Some(repo) = worktree::repo_root(dir) else { return Ok(None) };
+    let spec = prompt_worktree(&repo, queued)?;
+    Ok(spec.map(|spec| Target { profile: profile.to_string(), dir: dir.to_path_buf(), worktree: Some(spec) }))
+}
+
+/// The worktree name prompt: Name (typed), From (Tab switches between the
+/// default base and the current branch) and the resulting folder. Esc cancels.
+fn prompt_worktree(repo: &std::path::Path, queued: &[String]) -> Result<Option<WorktreeSpec>> {
+    let default_base = worktree::default_base(repo);
+    let current = worktree::current_branch(repo);
+    let mut bases = vec![default_base.clone()];
+    if current != "HEAD" && current != default_base {
+        bases.push(current);
+    }
+    let mut base_i = 0usize;
+    let mut taken: Vec<String> = queued.to_vec();
+    taken.extend(worktree::existing_names(repo));
+    let suggested = worktree::default_name(&taken, 2);
+    let mut buf = String::new();
+    let mut error = String::new();
+    ui::show_cursor();
+    let result = loop {
+        let name = if buf.is_empty() { suggested.clone() } else { buf.clone() };
+        let mut lines = vec![
+            format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("New worktree")),
+            ui::color::dim(&format!("   repo  {}", repo.display())),
+            String::new(),
+            format!("   Name    {}{}", ui::color::cyan(&buf), if buf.is_empty() { ui::color::dim(&suggested) } else { String::new() }),
+            format!("   From    {}{}", bases[base_i], if bases.len() > 1 { ui::color::dim("   (Tab: switch)") } else { String::new() }),
+            format!("   Folder  {}", ui::color::dim(&worktree::worktree_path(repo, &name).display().to_string())),
+            format!("   Branch  {}", ui::color::dim(&worktree::branch_name(&name))),
+            String::new(),
+            if error.is_empty() { ui::color::dim("   Enter create · Esc back") } else { ui::color::red(&format!("   {error}")) },
+        ];
+        lines.push(String::new());
+        ui::repaint(&lines);
+        let key = read_key()?;
+        match key.code {
+            KeyCode::Esc => break None,
+            KeyCode::Tab => base_i = (base_i + 1) % bases.len(),
+            KeyCode::Enter => {
+                if queued.contains(&name) {
+                    error = "that name is already used by a queued pane".to_string();
+                } else if let Some(p) = worktree::name_problem(repo, &name) {
+                    error = p;
+                } else {
+                    break Some(WorktreeSpec { name, base: bases[base_i].clone() });
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                error.clear();
+            }
+            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                buf.push(c);
+                error.clear();
+            }
+            _ => {}
+        }
+    };
+    ui::hide_cursor();
+    Ok(result)
+}
+
 /// Starts a Claude session for `profile` in `project`. The pane comes back
 /// hidden and unnumbered; `register` + `sidebar::set_mode` place it.
 fn spawn_pane(profile: &str, project: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
@@ -244,6 +333,7 @@ fn spawn_pane_cmd(
         mode: Mode::Hidden,
         status: Status::Unknown,
         last_focus: 0,
+        worktree: None,
     };
     Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
@@ -469,7 +559,7 @@ const QUEUE_BOX_W: usize = 36;
 /// The right-hand queue box, fully framed: one entry per queued pane
 /// (profile + path), the next free slot, and a key hint. The frame turns
 /// orange while the box has focus.
-fn render_queue_box(queue: &[(String, std::path::PathBuf)], drawn_cap: usize, focused: bool, sel: usize) -> Vec<String> {
+fn render_queue_box(queue: &[Target], drawn_cap: usize, focused: bool, sel: usize) -> Vec<String> {
     let frame = |t: &str| if focused { ui::color::orange(t) } else { ui::color::dim(t) };
     let inner = QUEUE_BOX_W - 4; // two border columns + a space of padding each side
     let row = |content: &str| format!("{} {} {}", frame("│"), layout::pad_to(content, inner), frame("│"));
@@ -485,13 +575,14 @@ fn render_queue_box(queue: &[(String, std::path::PathBuf)], drawn_cap: usize, fo
         })),
         row(""),
     ];
-    for (i, (name, dir)) in queue.iter().enumerate() {
+    for (i, t) in queue.iter().enumerate() {
         let on = focused && i == sel;
         let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
         let first = if i == 0 { ui::color::dim(" (first)") } else { String::new() };
-        let title = format!("{} {name}", i + 1);
-        out.push(row(&format!("{marker} {}{first}", if on { ui::color::orange_bold(&title) } else { title })));
-        let path = dir.display().to_string();
+        let title = format!("{} {}", i + 1, t.profile);
+        let tag = t.worktree.as_ref().map(|w| ui::color::cyan(&format!(" wt:{}", w.name))).unwrap_or_default();
+        out.push(row(&format!("{marker} {}{tag}{first}", if on { ui::color::orange_bold(&title) } else { title })));
+        let path = t.dir.display().to_string();
         let max = inner - 2;
         let n = path.chars().count();
         let shown = if n > max { format!("…{}", path.chars().skip(n - (max - 1)).collect::<String>()) } else { path };
@@ -504,10 +595,34 @@ fn render_queue_box(queue: &[(String, std::path::PathBuf)], drawn_cap: usize, fo
     out
 }
 
+/// A git worktree to create for a pane just before it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeSpec {
+    name: String,
+    /// Branch or ref the new worktree branch starts from.
+    base: String,
+}
+
+/// One pane to launch: which profile, in which project directory, and
+/// optionally in a fresh worktree of that project's repo. The worktree is
+/// created when the pane starts, so dropping a queued entry leaves nothing behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Target {
+    profile: String,
+    dir: std::path::PathBuf,
+    worktree: Option<WorktreeSpec>,
+}
+
+impl Target {
+    fn plain(profile: &str, dir: std::path::PathBuf) -> Target {
+        Target { profile: profile.to_string(), dir, worktree: None }
+    }
+}
+
 /// What picking a row in `pick_pane_target` resolves to.
 enum PaneAdd {
     Start,
-    Pick(String, std::path::PathBuf),
+    Pick(Target),
 }
 
 /// One flattened, navigable row in `pick_pane_target`'s list.
@@ -519,6 +634,8 @@ enum TargetRow {
     Project { profile_idx: usize, path: std::path::PathBuf, is_current: bool },
     /// "Choose path" — type any directory for `profile_idx`'s pane.
     ChoosePath(usize),
+    /// "New worktree" — a fresh worktree of the launch directory's repo.
+    NewWorktree(usize),
 }
 
 /// Profile picker for adding a pane, with each profile expandable (→) into
@@ -538,7 +655,7 @@ fn pick_pane_target(
     profiles: &[Profile],
     cwd: &std::path::Path,
     heading: &str,
-    mut queue: Option<&mut Vec<(String, std::path::PathBuf)>>,
+    mut queue: Option<&mut Vec<Target>>,
 ) -> Result<Option<PaneAdd>> {
     let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
     // Only one profile expanded at a time — keeps "collapse" unambiguous
@@ -561,6 +678,12 @@ fn pick_pane_target(
     // Queue-box focus (Tab) and its highlighted pane.
     let mut focus_q = false;
     let mut qsel = 0usize;
+    // Rows turned into worktree panes with `w` (profile index + project), and
+    // a one-line message for the next frame.
+    let mut marked: std::collections::HashSet<(usize, std::path::PathBuf)> = std::collections::HashSet::new();
+    let mut note: Option<String> = None;
+    // The launch directory's repo: "New worktree…" is offered only inside one.
+    let in_repo = worktree::repo_root(cwd).is_some();
     // Computed once, not per frame — this used to call `account_stat`
     // (a full directory walk per profile) on every single keystroke via
     // `quota_note`/`account_lines`, which is what made the screen laggy.
@@ -588,6 +711,9 @@ fn pick_pane_target(
                     }
                 }
                 rows.push(TargetRow::ChoosePath(i));
+                if in_repo {
+                    rows.push(TargetRow::NewWorktree(i));
+                }
             }
         }
         // The always-shown "(current)" row under each profile is display
@@ -618,14 +744,18 @@ fn pick_pane_target(
             }
             Some(q) => {
                 header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Panes so far ({}, {drawn_cap} shown at once)", q.len()))));
-                for (i, (name, dir)) in q.iter().enumerate() {
-                    header.push(format!("   {} {name}  {}", ui::color::orange(&(i + 1).to_string()), ui::color::dim(&dir.display().to_string())));
+                for (i, t) in q.iter().enumerate() {
+                    let tag = t.worktree.as_ref().map(|w| ui::color::cyan(&format!(" wt:{}", w.name))).unwrap_or_default();
+                    header.push(format!("   {} {}{tag}  {}", ui::color::orange(&(i + 1).to_string()), t.profile, ui::color::dim(&t.dir.display().to_string())));
                 }
             }
             None => header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(heading))),
         }
-        header.push(ui::color::dim("   Enter select · → on a profile: recent projects & Choose path"));
-        header.push(String::new());
+        header.push(ui::color::dim("   Enter select · → on a profile: recent projects, Choose path & New worktree · w worktree"));
+        header.push(match note.take() {
+            Some(n) => ui::color::red(&format!("   {n}")),
+            None => String::new(),
+        });
         let body_start = header.len();
 
         // Same viewport-paging pattern as every other scrollable list here
@@ -666,11 +796,16 @@ fn pick_pane_target(
                     let text = "    Choose path…";
                     if on { ui::color::orange_bold(text) } else { ui::color::dim(text) }
                 }
-                TargetRow::Project { path, is_current, .. } => {
+                TargetRow::NewWorktree(_) => {
+                    let text = "    New worktree…";
+                    if on { ui::color::orange_bold(text) } else { ui::color::cyan(text) }
+                }
+                TargetRow::Project { profile_idx, path, is_current } => {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let tag = if *is_current { ui::color::dim("(current)") } else { String::new() };
+                    let wt = if marked.contains(&(*profile_idx, path.clone())) { ui::color::cyan(" worktree") } else { String::new() };
                     let text = format!("    {name} {tag}");
-                    if on { ui::color::orange_bold(&text) } else { ui::color::dim(&text) }
+                    format!("{}{wt}", if on { ui::color::orange_bold(&text) } else { ui::color::dim(&text) })
                 }
             };
             lines.push(format!(" {marker} {text}"));
@@ -721,8 +856,12 @@ fn pick_pane_target(
                         qsel = qsel.min(q.len() - 1);
                     }
                     KeyCode::Enter => {
-                        if let Some(dir) = prompt_dir(&format!("Pane {} — which directory?", qsel + 1), &q[qsel].1)? {
-                            q[qsel].1 = dir;
+                        if let Some(dir) = prompt_dir(&format!("Pane {} — which directory?", qsel + 1), &q[qsel].dir)? {
+                            if q[qsel].dir != dir {
+                                // A worktree belongs to the old directory's repo.
+                                q[qsel].worktree = None;
+                            }
+                            q[qsel].dir = dir;
                         }
                     }
                     _ => {}
@@ -757,19 +896,50 @@ fn pick_pane_target(
                     expanded = Some(pi);
                 }
             }
+            KeyCode::Char('w') => {
+                let key = match &rows[active_row] {
+                    TargetRow::Profile(pi) => Some((*pi, cwd.to_path_buf())),
+                    TargetRow::Project { profile_idx, path, .. } => Some((*profile_idx, path.clone())),
+                    _ => None,
+                };
+                if let Some(k) = key {
+                    if worktree::repo_root(&k.1).is_none() {
+                        note = Some("not a git repository — no worktree possible here".to_string());
+                    } else if !marked.remove(&k) {
+                        marked.insert(k);
+                    }
+                }
+            }
             KeyCode::Enter => {
-                let pick: (String, std::path::PathBuf) = match &rows[active_row] {
+                let queued: Vec<String> = queue.as_deref().map(|q| q.iter().filter_map(|t| t.worktree.as_ref().map(|w| w.name.clone())).collect()).unwrap_or_default();
+                let pick: Target = match &rows[active_row] {
                     TargetRow::Start => {
                         ui::show_cursor();
                         return Ok(Some(PaneAdd::Start));
                     }
-                    TargetRow::Profile(pi) => (profiles[*pi].name.clone(), cwd.to_path_buf()),
-                    TargetRow::Project { profile_idx, path, .. } => (profiles[*profile_idx].name.clone(), path.clone()),
+                    TargetRow::Profile(pi) | TargetRow::Project { profile_idx: pi, .. } => {
+                        let dir = match &rows[active_row] {
+                            TargetRow::Project { path, .. } => path.clone(),
+                            _ => cwd.to_path_buf(),
+                        };
+                        if marked.contains(&(*pi, dir.clone())) {
+                            match ask_worktree(&profiles[*pi].name, &dir, &queued)? {
+                                Some(t) => t,
+                                None => continue,
+                            }
+                        } else {
+                            Target::plain(&profiles[*pi].name, dir)
+                        }
+                    }
+                    TargetRow::NewWorktree(pi) => match ask_worktree(&profiles[*pi].name, cwd, &queued)? {
+                        Some(t) => t,
+                        None => continue,
+                    },
                     TargetRow::ChoosePath(pi) => {
                         let title = format!("{} — which directory?", profiles[*pi].name);
                         // Esc in the prompt just returns to this list.
                         match prompt_dir(&title, cwd)? {
-                            Some(dir) => (profiles[*pi].name.clone(), dir),
+                            Some(dir) => Target::plain(&profiles[*pi].name, dir),
                             None => continue,
                         }
                     }
@@ -788,7 +958,7 @@ fn pick_pane_target(
                     }
                     None => {
                         ui::show_cursor();
-                        return Ok(Some(PaneAdd::Pick(pick.0, pick.1)));
+                        return Ok(Some(PaneAdd::Pick(pick)));
                     }
                 }
             }
@@ -805,7 +975,7 @@ fn pick_pane_target(
 pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
 
-    let mut chosen: Vec<(String, std::path::PathBuf)> = vec![(first.to_string(), cwd.clone())];
+    let mut chosen: Vec<Target> = vec![Target::plain(first, cwd.clone())];
     // The picker keeps adding to `chosen` until "Start" (one pane = a solo
     // session, two or more = a split) or the open-pane limit; Esc cancels the
     // whole thing. Only the first few are drawn (as many as fit, at most 9);
@@ -826,7 +996,7 @@ pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
 /// `None` if they quit (Ctrl+Q) or the last pane exited.
 pub fn run_split_profiles(profiles: &[Profile], profile_names: &[String]) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
-    let targets: Vec<(String, std::path::PathBuf)> = profile_names.iter().map(|n| (n.clone(), cwd.clone())).collect();
+    let targets: Vec<Target> = profile_names.iter().map(|n| Target::plain(n, cwd.clone())).collect();
     run_split_targets(profiles, &targets)
 }
 
@@ -834,7 +1004,7 @@ pub fn run_split_profiles(profiles: &[Profile], profile_names: &[String]) -> Res
 /// project directory instead of all sharing the caller's cwd — what the
 /// interactive picker (`pick_pane_target`, → to pick another project)
 /// needs underneath.
-fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBuf)]) -> Result<Option<Session>> {
+fn run_split_targets(profiles: &[Profile], targets: &[Target]) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let cap = shown_cap(cols, rows);
@@ -846,7 +1016,7 @@ fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBu
     let spawned: Vec<Result<Pane>> = std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|(name, project)| scope.spawn(move || spawn_pane(name, project, pane_cols, pane_rows)))
+            .map(|t| scope.spawn(move || spawn_target(t, pane_cols, pane_rows)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("pane spawn panicked")))).collect()
     });
@@ -1050,10 +1220,14 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     let choice = pick_pane_target(profiles, cwd, "Add a pane — which profile?", None)?;
     ui::hide_cursor(); // the picker shows it again
     let mut toast = None;
-    if let Some(PaneAdd::Pick(name, project)) = choice {
+    if let Some(PaneAdd::Pick(target)) = choice {
         let (pc, pr) = spawn_geometry(panes, cols, rows);
-        let pane = spawn_pane(&name, &project, pc, pr)?;
-        toast = show_new(panes, focus, pane, cols, rows);
+        match spawn_target(&target, pc, pr) {
+            Ok(pane) => toast = show_new(panes, focus, pane, cols, rows),
+            // A failed worktree (git refused) must not take the panel down.
+            Err(e) if target.worktree.is_some() => toast = Some(format!("worktree failed: {e}")),
+            Err(e) => return Err(e),
+        }
     }
     mark_all(panes);
     Ok(toast)
@@ -1144,6 +1318,102 @@ fn remove_pane(panes: &mut Vec<Pane>, focus: &mut usize, idx: usize) -> bool {
     false
 }
 
+/// What to do with a worktree when its pane is closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WtChoice {
+    Keep,
+    Remove,
+    Cancel,
+}
+
+/// The close prompt for a worktree pane: shows what removing it would lose and
+/// asks keep (default) / remove / cancel. Remove is refused while the worktree
+/// has uncommitted files.
+fn close_worktree_prompt(info: &WorktreeInfo) -> Result<WtChoice> {
+    let st = worktree::status(&info.path, &info.base);
+    let mut error = String::new();
+    let choice = loop {
+        let state = if st.changed == 0 {
+            format!("{}  ·  {} commit(s) not in {} (branch {})", ui::color::green("clean"), st.ahead, info.base, info.branch)
+        } else {
+            ui::color::red(&format!("{} file(s) changed, not committed", st.changed))
+        };
+        let lines = vec![
+            format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Close the pane in worktree {}", info.name))),
+            String::new(),
+            format!("   Worktree  {}", ui::color::cyan(&info.path.display().to_string())),
+            format!("   State     {state}"),
+            String::new(),
+            format!("   {}   the folder and branch stay; open it again with Choose path", ui::color::orange_bold("[k/Enter] keep worktree")),
+            if st.changed == 0 {
+                "   [r] remove worktree   deletes the folder, keeps the branch and its commits".to_string()
+            } else {
+                ui::color::dim("   [r] remove worktree   unavailable: commit or discard the changes first")
+            },
+            "   [Esc] cancel".to_string(),
+            String::new(),
+            if error.is_empty() { String::new() } else { ui::color::red(&format!("   {error}")) },
+        ];
+        ui::repaint(&lines);
+        let key = read_key()?;
+        match key.code {
+            KeyCode::Esc => break WtChoice::Cancel,
+            KeyCode::Enter | KeyCode::Char('k') => break WtChoice::Keep,
+            KeyCode::Char('r') if st.changed == 0 => break WtChoice::Remove,
+            KeyCode::Char('r') => error = format!("{} file(s) changed — not removing", st.changed),
+            _ => {}
+        }
+    };
+    ui::hide_cursor();
+    Ok(choice)
+}
+
+/// Deletes a worktree after its pane's child was killed. Windows can hold the
+/// folder for a moment after a process dies, so retry briefly.
+fn remove_worktree_retry(info: &WorktreeInfo) -> Result<()> {
+    let mut last = Ok(());
+    for _ in 0..15 {
+        last = worktree::remove(&info.repo, &info.path);
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    last
+}
+
+/// Result of `close_pane`.
+enum Closed {
+    Cancelled,
+    Done { quit: bool, toast: Option<String> },
+}
+
+/// Closes pane `idx`. A pane in a worktree first asks what to do with it; the
+/// branch is never deleted. Callers `settle` afterwards.
+fn close_pane(panes: &mut Vec<Pane>, focus: &mut usize, idx: usize) -> Result<Closed> {
+    let info = panes[idx].meta.worktree.clone();
+    let mut remove = false;
+    if let Some(info) = &info {
+        match close_worktree_prompt(info)? {
+            WtChoice::Cancel => return Ok(Closed::Cancelled),
+            WtChoice::Remove => remove = true,
+            WtChoice::Keep => {}
+        }
+    }
+    let quit = remove_pane(panes, focus, idx);
+    let toast = info.map(|i| {
+        if remove {
+            match remove_worktree_retry(&i) {
+                Ok(()) => format!("worktree {} removed (branch {} kept)", i.name, i.branch),
+                Err(e) => format!("could not remove worktree: {e}"),
+            }
+        } else {
+            format!("worktree {} kept at {}", i.name, i.path.display())
+        }
+    });
+    Ok(Closed::Done { quit, toast })
+}
+
 /// State of the pane list while the run loop is going.
 struct SideState {
     focus: bool,
@@ -1230,10 +1500,17 @@ fn side_key(code: KeyCode, panes: &mut Vec<Pane>, focus: &mut usize, side: &mut 
         }
         KeyCode::Char('x') => {
             if let sidebar::TreeRow::Pane { idx, .. } = &tree[ci] {
-                quit = remove_pane(panes, focus, *idx);
-                if !quit {
-                    let after = sidebar::build_tree(panes, &side.collapsed);
-                    side.cursor = after[ci.min(after.len() - 1)].key().to_string();
+                match close_pane(panes, focus, *idx) {
+                    Ok(Closed::Done { quit: q, toast: t }) => {
+                        quit = q;
+                        toast = t;
+                        if !quit {
+                            let after = sidebar::build_tree(panes, &side.collapsed);
+                            side.cursor = after[ci.min(after.len() - 1)].key().to_string();
+                        }
+                    }
+                    Ok(Closed::Cancelled) => {}
+                    Err(e) => toast = Some(format!("close failed: {e}")),
                 }
             }
         }
@@ -1246,19 +1523,28 @@ fn side_key(code: KeyCode, panes: &mut Vec<Pane>, focus: &mut usize, side: &mut 
 }
 
 fn pane_label(p: &Pane, width: usize, focused: bool, full: bool, scrolled: usize) -> String {
+    let wt = p.meta.worktree.as_ref().map(|w| format!(" wt:{}", w.name)).unwrap_or_default();
     let mut suffix = if full { "  (full)".to_string() } else { String::new() };
     if scrolled > 0 {
         suffix.push_str(&format!("  ↑{scrolled} lines back"));
     }
     let badge = sidebar::status_badge(p.meta.status);
     let badge_w = badge.map_or(0, |(t, _)| t.chars().count() + 1);
-    let mut text = format!(" {} · {}{suffix}", p.meta.title, sidebar::project_name(&p.meta.project));
+    let head = format!(" {} · {}", p.meta.title, sidebar::project_name(&p.meta.project));
+    let mut text = format!("{head}{wt}{suffix}");
     let room = width.saturating_sub(badge_w);
-    if text.chars().count() > room {
+    let truncated = text.chars().count() > room;
+    if truncated {
         text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
     }
     let pad = width.saturating_sub(text.chars().count() + badge_w);
-    let styled = if focused { ui::color::orange_bold(&text) } else { ui::color::dim(&text) };
+    let base_style = |t: &str| if focused { ui::color::orange_bold(t) } else { ui::color::dim(t) };
+    // The worktree tag is cyan when the label fits untruncated.
+    let styled = if wt.is_empty() || truncated {
+        base_style(&text)
+    } else {
+        format!("{}{}{}", base_style(&head), ui::color::cyan(&wt), base_style(&suffix))
+    };
     let tail = badge.map_or(String::new(), |(t, paint)| format!(" {}", paint(t)));
     format!("{styled}{}{tail}", " ".repeat(pad))
 }
@@ -1727,10 +2013,16 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
         }
         Act::Close => {
             let f = *focus;
-            if remove_pane(panes, focus, f) {
-                return Ok(true);
+            match close_pane(panes, focus, f)? {
+                Closed::Cancelled => {}
+                Closed::Done { quit: true, .. } => return Ok(true),
+                Closed::Done { toast, .. } => {
+                    if let Some(t) = toast {
+                        ctl.say(t);
+                    }
+                    settle(panes, focus, cols, rows);
+                }
             }
-            settle(panes, focus, cols, rows);
         }
         Act::Waiting => {
             // Jumps to the next pane that is blocked or done — nothing reports
