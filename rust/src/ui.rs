@@ -195,7 +195,13 @@ pub fn repaint_diff(prev: &[String], lines: &[String]) -> String {
     if out.is_empty() {
         return out;
     }
-    out.push_str(&format!("\x1b[{};1H\x1b[0J", lines.len() + 1));
+    // Erase below the last line — but only if there is a row below it. When
+    // the frame fills the terminal, CUP clamps to the last row and the erase
+    // would wipe the footer.
+    let rows = terminal::size().map(|(_, h)| h as usize).unwrap_or(usize::MAX);
+    if lines.len() < rows {
+        out.push_str(&format!("\x1b[{};1H\x1b[0J", lines.len() + 1));
+    }
     out
 }
 

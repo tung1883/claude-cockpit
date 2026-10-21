@@ -11,6 +11,7 @@ mod picker;
 mod profiles;
 mod quota;
 mod session;
+mod sidebar;
 mod settings;
 mod statusline;
 mod sync;

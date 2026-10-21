@@ -15,7 +15,7 @@ pub fn account_stat(name: &str) -> Stat {
 }
 
 /// Visible width — ANSI escapes (\x1b[...m) take no columns.
-fn vis_len(s: &str) -> usize {
+pub fn vis_len(s: &str) -> usize {
     let mut len = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

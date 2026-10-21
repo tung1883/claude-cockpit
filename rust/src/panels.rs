@@ -11,17 +11,20 @@
 // KERNELBASE!ConsoleInitialize forever, and dies with STATUS_DLL_INIT_FAILED
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
+use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status};
 use crate::{input::read_key, launch, layout, profiles::Profile, session, ui};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Pane {
-    label: String,
+    /// Everything the pane list and the mode rules need (see `sidebar.rs`).
+    meta: PaneMeta,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
@@ -35,6 +38,8 @@ struct Pane {
     /// When set, a Ctrl+L is due to be sent to this (Claude) pane — see
     /// `RESIZE_NUDGE`.
     nudge_at: Mutex<Option<std::time::Instant>>,
+    /// When input was last forwarded to this pane (or when it was created).
+    last_input: Mutex<std::time::Instant>,
 }
 
 /// How long after a Claude pane's last resize it gets a Ctrl+L (screen
@@ -46,11 +51,52 @@ struct Pane {
 /// settled makes Claude redraw cleanly and the glitch does not occur.
 const RESIZE_NUDGE: Duration = Duration::from_millis(800);
 
+/// A Claude pane that has had no input for this long gets a Ctrl+L written in
+/// front of the next keystroke. Left idle for several seconds, the inner
+/// ConPTY re-syncs on the next input and writes the first typed character one
+/// column too far left (`❯ab` instead of `❯ ab`, with the stray character
+/// surviving backspace). Reproduced with bare `claude.exe` in a ConPTY and no
+/// cpit involved: fine after a 4 s wait, broken after 9 s and 20 s; a Ctrl+L
+/// immediately before the first key avoids it every time.
+const IDLE_NUDGE: Duration = Duration::from_secs(3);
+
+/// Writes `bytes` to the pane's PTY as one write, preceded by a Ctrl+L when
+/// it is a Claude pane that has been idle past `IDLE_NUDGE` (see above).
+fn send_to_pane(pane: &Pane, bytes: &[u8]) {
+    let now = std::time::Instant::now();
+    let idle = match pane.last_input.lock() {
+        Ok(mut t) => {
+            let idle = now.duration_since(*t) >= IDLE_NUDGE;
+            *t = now;
+            idle
+        }
+        Err(_) => false,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 1);
+    if pane.claude && idle && bytes != [0x0c] {
+        out.push(0x0c);
+    }
+    out.extend_from_slice(bytes);
+    if let Ok(mut w) = pane.writer.lock() {
+        let _ = w.write_all(&out);
+        let _ = w.flush();
+    }
+}
+
 impl Drop for Pane {
     fn drop(&mut self) {
         if let Some(path) = &self.sysprompt_tmp {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+impl HasMeta for Pane {
+    fn meta(&self) -> &PaneMeta {
+        &self.meta
+    }
+    fn meta_mut(&mut self) -> &mut PaneMeta {
+        &mut self.meta
     }
 }
 
@@ -105,21 +151,25 @@ fn process_output(carry: &mut Vec<u8>, chunk: &[u8], parser: &Mutex<vt100::Parse
     }
 }
 
-fn spawn_pane(profile: &str, label: String, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
-    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, cwd);
-    spawn_pane_cmd(cmd, sysprompt_tmp, true, label, cols, rows)
+/// Starts a Claude session for `profile` in `project`. The pane comes back
+/// hidden and unnumbered; `register` + `sidebar::set_mode` place it.
+fn spawn_pane(profile: &str, project: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
+    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, project);
+    spawn_pane_cmd(cmd, sysprompt_tmp, true, profile, project, cols, rows)
 }
 
-/// A pane running a plain interactive shell instead of Claude.
-fn spawn_shell_pane(cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
-    spawn_pane_cmd(launch::shell_pty_command(cwd), None, false, "shell".to_string(), cols, rows)
+/// A pane running a plain interactive shell instead of Claude, listed under
+/// `profile` (the profile of the pane it was opened from).
+fn spawn_shell_pane(profile: &str, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
+    spawn_pane_cmd(launch::shell_pty_command(cwd), None, false, profile, cwd, cols, rows)
 }
 
 fn spawn_pane_cmd(
     cmd: portable_pty::CommandBuilder,
     sysprompt_tmp: Option<std::path::PathBuf>,
     claude: bool,
-    label: String,
+    profile: &str,
+    project: &std::path::Path,
     cols: u16,
     rows: u16,
 ) -> Result<Pane> {
@@ -147,7 +197,17 @@ fn spawn_pane_cmd(
             }
         }
     });
-    Ok(Pane { label, parser, writer, master: pair.master, child, dirty, sysprompt_tmp, claude, nudge_at: Mutex::new(None) })
+    let meta = PaneMeta {
+        id: 0,
+        profile: profile.to_string(),
+        project: project.to_path_buf(),
+        title: String::new(),
+        shell: !claude,
+        mode: Mode::Hidden,
+        status: Status::Unknown,
+        last_focus: 0,
+    };
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()) })
 }
 
 fn color_code(c: vt100::Color, fg: bool) -> String {
@@ -253,17 +313,48 @@ fn key_bytes(code: KeyCode, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
 // and rendering must agree on both.
 const SEP: &str = " │ ";
 const SEP_COLS: u16 = 3;
-/// Chrome lines that aren't panes: the label header, a blank spacer, and the
-/// key-hint footer.
+/// Chrome lines that aren't pane cells: the header, the rule above the
+/// footer, and the key-hint footer.
 const CHROME_ROWS: u16 = 3;
 /// Below these a pane is too small for Claude's UI to be usable; they bound
 /// how many panes fit.
 const MIN_PANE_COLS: u16 = 24;
 const MIN_PANE_ROWS: u16 = 6;
-/// Hard ceiling regardless of terminal size — more than this is unreadable
-/// and hammers the machine with that many live Claude sessions. 9 = a 3x3
-/// grid.
-const MAX_PANES: usize = 9;
+/// Most panes drawn at once — more is unreadable and a 3x3 grid is the limit
+/// of what tiles sensibly.
+const MAX_SHOWN: usize = 9;
+/// Most panes open at once (shown or in the list); each is a live session.
+const MAX_TOTAL: usize = 64;
+/// The pane list's width and the narrowest terminal that gets it beside the
+/// grid; below that it is an overlay on `F2` instead.
+const SIDEBAR_W: u16 = 34;
+const SIDEBAR_MIN_COLS: u16 = 100;
+
+/// Whether the user hid the pane list box (it is then only reachable as a
+/// full-width overlay, like on a narrow terminal).
+static SIDEBAR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+fn side_width_for(cols: u16, hidden: bool) -> u16 {
+    if hidden || cols < SIDEBAR_MIN_COLS {
+        0
+    } else {
+        SIDEBAR_W
+    }
+}
+
+fn side_width(cols: u16) -> u16 {
+    side_width_for(cols, SIDEBAR_HIDDEN.load(Ordering::Relaxed))
+}
+
+/// (x offset, width) of the area the pane grid occupies.
+fn grid_area(cols: u16) -> (u16, u16) {
+    let s = side_width(cols);
+    if s == 0 {
+        (0, cols)
+    } else {
+        (s + 1, cols - s - 1)
+    }
+}
 
 /// Grid shape (rows, cols) for `n` panes — as square as possible, filling
 /// left-to-right, top-to-bottom. n=2 stays a single row of two (side by
@@ -275,35 +366,59 @@ fn grid_dims(n: usize) -> (usize, usize) {
     (grows, gcols)
 }
 
-/// Per-pane cell size for `n` panes tiled across one terminal of `cols`x`rows`.
+/// Per-pane PTY size (cols, rows) for `n` panes tiled across a grid area of
+/// `cols`x`rows` terminal rows. Each grid row also spends one line on the
+/// pane labels, and adjacent grid rows are split by a rule.
 fn pane_geometry(cols: u16, rows: u16, n: usize) -> (u16, u16) {
     let (grows, gcols) = grid_dims(n);
     let sep_w = (gcols as u16 - 1) * SEP_COLS;
     let pane_cols = cols.saturating_sub(sep_w) / gcols as u16;
-    // One rule line between adjacent grid rows, on top of the fixed chrome.
     let chrome = CHROME_ROWS + (grows as u16 - 1);
-    let pane_rows = rows.saturating_sub(chrome) / grows as u16;
-    (pane_cols.max(10), pane_rows.max(3))
+    let cell_h = rows.saturating_sub(chrome) / grows as u16;
+    (pane_cols.max(10), cell_h.saturating_sub(1).max(3))
 }
 
 /// Whether `n` panes tile `cols`x`rows` while every pane stays usable.
 fn panes_fit(cols: u16, rows: u16, n: usize) -> bool {
     let (grows, gcols) = grid_dims(n);
     let pane_cols = cols.saturating_sub((gcols as u16 - 1) * SEP_COLS) / gcols as u16;
-    let pane_rows = rows.saturating_sub(CHROME_ROWS + (grows as u16 - 1)) / grows as u16;
-    pane_cols >= MIN_PANE_COLS && pane_rows >= MIN_PANE_ROWS
+    let cell_h = rows.saturating_sub(CHROME_ROWS + (grows as u16 - 1)) / grows as u16;
+    pane_cols >= MIN_PANE_COLS && cell_h.saturating_sub(1) >= MIN_PANE_ROWS
 }
 
-/// Largest pane count that still tiles `cols`x`rows` usably, capped at
-/// `MAX_PANES` (and always at least 1 so a solo session is possible).
+/// Largest pane count that still tiles a `cols`x`rows` grid area usably,
+/// capped at `MAX_SHOWN` (and always at least 1 so a solo session is possible).
 fn max_panes_for(cols: u16, rows: u16) -> usize {
     let mut best = 1;
-    for n in 2..=MAX_PANES {
+    for n in 2..=MAX_SHOWN {
         if panes_fit(cols, rows, n) {
             best = n;
         }
     }
     best
+}
+
+/// How many panes can be drawn at once on a `cols`x`rows` terminal (the grid
+/// area excludes the pane list).
+fn shown_cap(cols: u16, rows: u16) -> usize {
+    let (_, w) = grid_area(cols);
+    max_panes_for(w, rows)
+}
+
+/// Where the grid's cells sit for `n` drawn panes.
+struct Layout {
+    main_x: u16,
+    grows: usize,
+    gcols: usize,
+    pane_cols: u16,
+    pane_rows: u16,
+}
+
+fn make_layout(cols: u16, rows: u16, n: usize) -> Layout {
+    let (main_x, gw) = grid_area(cols);
+    let (grows, gcols) = grid_dims(n);
+    let (pane_cols, pane_rows) = pane_geometry(gw, rows, n);
+    Layout { main_x, grows, gcols, pane_cols, pane_rows }
 }
 
 /// Queue box on the right of the pane picker: narrowest terminal that gets it,
@@ -314,15 +429,20 @@ const QUEUE_BOX_W: usize = 36;
 /// The right-hand queue box, fully framed: one entry per queued pane
 /// (profile + path), the next free slot, and a key hint. The frame turns
 /// orange while the box has focus.
-fn render_queue_box(queue: &[(String, std::path::PathBuf)], cap: usize, focused: bool, sel: usize) -> Vec<String> {
+fn render_queue_box(queue: &[(String, std::path::PathBuf)], drawn_cap: usize, focused: bool, sel: usize) -> Vec<String> {
     let frame = |t: &str| if focused { ui::color::orange(t) } else { ui::color::dim(t) };
     let inner = QUEUE_BOX_W - 4; // two border columns + a space of padding each side
     let row = |content: &str| format!("{} {} {}", frame("│"), layout::pad_to(content, inner), frame("│"));
     let hint = if focused { "↑/↓ · Enter dir · x remove" } else { "Tab → focus queue" };
     let mut out = vec![
         frame(&format!("┌{}┐", "─".repeat(QUEUE_BOX_W - 2))),
-        row(&ui::color::orange_bold(&format!("Queue {}/{cap}", queue.len()))),
+        row(&ui::color::orange_bold(&format!("Queue {}", queue.len()))),
         row(&ui::color::dim(hint)),
+        row(&ui::color::dim(&if queue.len() > drawn_cap {
+            format!("{drawn_cap} shown, {} in the list", queue.len() - drawn_cap)
+        } else {
+            format!("up to {drawn_cap} shown at once")
+        })),
         row(""),
     ];
     for (i, (name, dir)) in queue.iter().enumerate() {
@@ -337,7 +457,7 @@ fn render_queue_box(queue: &[(String, std::path::PathBuf)], cap: usize, focused:
         let shown = if n > max { format!("…{}", path.chars().skip(n - (max - 1)).collect::<String>()) } else { path };
         out.push(row(&format!("  {}", ui::color::dim(&shown))));
     }
-    if queue.len() < cap {
+    if queue.len() < MAX_TOTAL {
         out.push(row(&format!("  {}", ui::color::dim(&format!("{} next…", queue.len() + 1)))));
     }
     out.push(frame(&format!("└{}┘", "─".repeat(QUEUE_BOX_W - 2))));
@@ -370,7 +490,7 @@ enum TargetRow {
 ///
 /// `queue` is `run_split`'s list of panes chosen so far: when `Some`, a
 /// "Start" row appears first, picks are pushed onto the queue (the picker
-/// stays open until Start or the cap), and the queue is shown — as a box on
+/// stays open until Start or the open-pane limit), and the queue is shown — as a box on
 /// the right when the terminal is wide enough, else as a header list — where
 /// Tab moves into it to re-path (Enter) or remove (x) a pane. `None` is the
 /// mid-split "add a pane" picker (F7): one pick, returned directly.
@@ -446,7 +566,7 @@ fn pick_pane_target(
         let active_row = selectable_idx[selected];
 
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let cap = max_panes_for(term_cols, term_rows);
+        let drawn_cap = shown_cap(term_cols, term_rows);
         let show_box = queue.is_some() && term_cols >= QUEUE_BOX_MIN_COLS;
         if let Some(q) = queue.as_deref() {
             qsel = qsel.min(q.len().saturating_sub(1));
@@ -457,7 +577,7 @@ fn pick_pane_target(
                 header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Add pane {}", q.len() + 1))));
             }
             Some(q) => {
-                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Panes so far ({}/{cap})", q.len()))));
+                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Panes so far ({}, {drawn_cap} shown at once)", q.len()))));
                 for (i, (name, dir)) in q.iter().enumerate() {
                     header.push(format!("   {} {name}  {}", ui::color::orange(&(i + 1).to_string()), ui::color::dim(&dir.display().to_string())));
                 }
@@ -519,7 +639,7 @@ fn pick_pane_target(
             lines.push(ui::color::dim(&format!("    ↓ {} more", rows.len() - end)));
         }
         if show_box {
-            let box_lines = render_queue_box(queue.as_deref().unwrap(), cap, focus_q, qsel);
+            let box_lines = render_queue_box(queue.as_deref().unwrap(), drawn_cap, focus_q, qsel);
             // Keep the box off the terminal's last column — a glyph written there is
             // eaten by the pending-wrap state, which is what hid the right border.
             let left_w = term_cols as usize - QUEUE_BOX_W - 4;
@@ -616,11 +736,12 @@ fn pick_pane_target(
                 };
                 match queue.as_deref_mut() {
                     Some(q) => {
-                        if q.len() < cap {
+                        if q.len() < MAX_TOTAL {
                             q.push(pick);
                         }
-                        // Full: nothing more to add, so launch.
-                        if q.len() >= cap {
+                        // At the open-pane limit nothing more can be added,
+                        // so launch.
+                        if q.len() >= MAX_TOTAL {
                             ui::show_cursor();
                             return Ok(Some(PaneAdd::Start));
                         }
@@ -642,18 +763,15 @@ fn pick_pane_target(
 /// only when the last pane is gone (or Ctrl+Q). v1 scope: no system-prompt
 /// composition for the panes (plain launches only).
 pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let cap = max_panes_for(cols, rows);
     let cwd = std::env::current_dir()?;
 
     let mut chosen: Vec<(String, std::path::PathBuf)> = vec![(first.to_string(), cwd.clone())];
-    if chosen.len() < cap {
-        // The picker keeps adding to `chosen` until "Start" (one pane = a
-        // solo session, two or more = a split) or the cap; Esc cancels the
-        // whole thing.
-        if pick_pane_target(profiles, &cwd, "", Some(&mut chosen))?.is_none() {
-            return Ok(None);
-        }
+    // The picker keeps adding to `chosen` until "Start" (one pane = a solo
+    // session, two or more = a split) or the open-pane limit; Esc cancels the
+    // whole thing. Only the first few are drawn (as many as fit, at most 9);
+    // the rest start in the pane list.
+    if pick_pane_target(profiles, &cwd, "", Some(&mut chosen))?.is_none() {
+        return Ok(None);
     }
     run_split_targets(profiles, &chosen)
 }
@@ -679,21 +797,27 @@ pub fn run_split_profiles(profiles: &[Profile], profile_names: &[String]) -> Res
 fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBuf)]) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (pane_cols, pane_rows) = pane_geometry(cols, rows, targets.len());
+    let cap = shown_cap(cols, rows);
+    let (_, gw) = grid_area(cols);
+    let (pane_cols, pane_rows) = pane_geometry(gw, rows, targets.len().min(cap));
 
     // Each spawn opens a ConPTY and starts a process — noticeable serially
     // with several panes, so do them concurrently (order is preserved).
     let spawned: Vec<Result<Pane>> = std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|(name, project)| scope.spawn(move || spawn_pane(name, name.clone(), project, pane_cols, pane_rows)))
+            .map(|(name, project)| scope.spawn(move || spawn_pane(name, project, pane_cols, pane_rows)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("pane spawn panicked")))).collect()
     });
     let mut panes: Vec<Pane> = Vec::with_capacity(targets.len());
     for pane in spawned {
         match pane {
-            Ok(p) => panes.push(p),
+            Ok(p) => {
+                // The first `cap` are drawn, the rest wait in the list.
+                let idx = register(&mut panes, p);
+                panes[idx].meta.mode = if idx < cap { Mode::Small } else { Mode::Hidden };
+            }
             Err(e) => {
                 for p in &mut panes {
                     let _ = p.child.kill();
@@ -703,6 +827,7 @@ fn run_split_targets(profiles: &[Profile], targets: &[(String, std::path::PathBu
         }
     }
     let mut focus = 0usize;
+    sidebar::focus_pane(&mut panes, &mut focus, 0);
 
     ui::hide_cursor();
     // The shared `cwd` here (not each pane's own project) is what F9/`
@@ -770,7 +895,7 @@ fn finish(mut panes: Vec<Pane>, focus: usize, cwd: std::path::PathBuf, exit: Res
 /// quit or error `session` is dropped, which kills its children.
 pub fn resume(mut session: Session, profiles: &[Profile]) -> Result<Option<Session>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    reflow(&session.panes, cols, rows);
+    settle(&mut session.panes, &mut session.focus, cols, rows);
     ui::hide_cursor();
     let cwd = session.cwd.clone();
     let exit = run_loop(&mut session.panes, &mut session.focus, profiles, &cwd);
@@ -800,38 +925,98 @@ fn resize_pane(pane: &Pane, rows: u16, cols: u16) {
     pane.dirty.store(true, Ordering::Relaxed);
 }
 
-/// Re-lays every pane for the current pane count and terminal size, and marks
-/// them dirty so the next tick repaints. Call after a pane is added, closed,
-/// or the terminal is resized.
-fn reflow(panes: &[Pane], cols: u16, rows: u16) {
-    let (pc, pr) = pane_geometry(cols, rows, panes.len());
-    for pane in panes {
-        resize_pane(pane, pr, pc);
+/// Resizes the drawn panes to their cells for the current terminal size. A
+/// full pane takes the whole grid area; the panes behind it keep their size
+/// (they are not drawn) until it goes back to small. Hidden panes are never
+/// resized.
+fn relayout(panes: &[Pane], cols: u16, rows: u16) {
+    let drawn = sidebar::drawn(panes);
+    if drawn.is_empty() {
+        return;
+    }
+    let (_, gw) = grid_area(cols);
+    let (pc, pr) = pane_geometry(gw, rows, drawn.len());
+    for &i in &drawn {
+        resize_pane(&panes[i], pr, pc);
     }
 }
 
+fn mark_all(panes: &[Pane]) {
+    for p in panes {
+        p.dirty.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Restores the pane-state invariants for the current terminal size (at most
+/// `shown_cap` drawn, at least one drawn, focus on a drawn pane), then
+/// re-lays out and marks everything for repaint. Call after any change to the
+/// pane set, a pane's mode, or the terminal size.
+fn settle(panes: &mut [Pane], focus: &mut usize, cols: u16, rows: u16) {
+    if panes.is_empty() {
+        return;
+    }
+    sidebar::settle(panes, focus, shown_cap(cols, rows));
+    relayout(panes, cols, rows);
+    mark_all(panes);
+}
+
+/// Adds a spawned pane to the set: unique id and a title numbered within its
+/// profile + project + kind. Returns its index.
+fn register(panes: &mut Vec<Pane>, mut pane: Pane) -> usize {
+    pane.meta.id = sidebar::next_id(panes);
+    let kind = if pane.meta.shell { "shell" } else { "claude" };
+    let mut n = 1;
+    loop {
+        let title = format!("{kind} {n}");
+        let taken = panes.iter().any(|p| p.meta.profile == pane.meta.profile && p.meta.project == pane.meta.project && p.meta.title == title);
+        if !taken {
+            pane.meta.title = title;
+            break;
+        }
+        n += 1;
+    }
+    panes.push(pane);
+    panes.len() - 1
+}
+
+/// Puts a freshly spawned pane on screen: small (or full when another pane is
+/// full), evicting if the grid is at its cap, and focuses it.
+fn show_new(panes: &mut Vec<Pane>, focus: &mut usize, pane: Pane, cols: u16, rows: u16) -> Option<String> {
+    let idx = register(panes, pane);
+    let mode = if sidebar::full_index(panes).is_some() { Mode::Full } else { Mode::Small };
+    let toast = sidebar::set_mode(panes, focus, idx, mode, shown_cap(cols, rows));
+    if panes[idx].meta.mode != Mode::Hidden {
+        sidebar::focus_pane(panes, focus, idx);
+    }
+    settle(panes, focus, cols, rows);
+    toast
+}
+
+/// PTY size for a pane about to be added: one more than are drawn now, so it
+/// usually starts at its final size.
+fn spawn_geometry(panes: &[Pane], cols: u16, rows: u16) -> (u16, u16) {
+    let (_, gw) = grid_area(cols);
+    let n = (sidebar::shown_count(panes) + 1).min(shown_cap(cols, rows)).max(1);
+    pane_geometry(gw, rows, n)
+}
+
 /// Opens the profile picker and, if one is chosen, spawns it as a new pane
-/// appended to the grid and focused. No-op if already at the size-based cap.
-fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<()> {
+/// and shows it (see `show_new`). Returns a message worth showing, if any.
+fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<Option<String>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if panes.len() >= max_panes_for(cols, rows) {
-        return Ok(()); // no room for another usable pane
+    if panes.len() >= MAX_TOTAL {
+        return Ok(Some("pane limit reached".to_string()));
     }
     let choice = pick_pane_target(profiles, cwd, "Add a pane — which profile?", None)?;
     ui::hide_cursor(); // the picker shows it again
+    let mut toast = None;
     if let Some(PaneAdd::Pick(name, project)) = choice {
-        let (pc, pr) = pane_geometry(cols, rows, panes.len() + 1);
-        let pane = spawn_pane(&name, name.clone(), &project, pc, pr)?;
-        for p in panes.iter() {
-            resize_pane(p, pr, pc);
-        }
-        panes.push(pane);
-        *focus = panes.len() - 1;
+        let (pc, pr) = spawn_geometry(panes, cols, rows);
+        let pane = spawn_pane(&name, &project, pc, pr)?;
+        toast = show_new(panes, focus, pane, cols, rows);
     }
-    for p in panes.iter() {
-        p.dirty.store(true, Ordering::Relaxed);
-    }
-    Ok(())
+    mark_all(panes);
+    Ok(toast)
 }
 
 /// Asks which directory a new shell pane should start in. Empty input means
@@ -884,80 +1069,312 @@ fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::Pa
     Ok(result)
 }
 
-/// Spawns a shell in `cwd` as a new pane appended to the grid and focused.
-/// No-op if already at the size-based cap.
-fn add_shell_pane(panes: &mut Vec<Pane>, focus: &mut usize, cwd: &std::path::Path) -> Result<()> {
+/// Spawns a shell in `cwd` as a new pane, listed under the focused pane's
+/// profile, and shows it. Returns a message worth showing, if any.
+fn add_shell_pane(panes: &mut Vec<Pane>, focus: &mut usize, cwd: &std::path::Path) -> Result<Option<String>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if panes.len() >= max_panes_for(cols, rows) {
-        return Ok(());
+    if panes.len() >= MAX_TOTAL {
+        return Ok(Some("pane limit reached".to_string()));
     }
-    let (pc, pr) = pane_geometry(cols, rows, panes.len() + 1);
-    let pane = spawn_shell_pane(cwd, pc, pr)?;
-    for p in panes.iter() {
-        resize_pane(p, pr, pc);
-    }
-    panes.push(pane);
-    *focus = panes.len() - 1;
-    for p in panes.iter() {
-        p.dirty.store(true, Ordering::Relaxed);
-    }
-    Ok(())
+    let profile = panes[*focus].meta.profile.clone();
+    let (pc, pr) = spawn_geometry(panes, cols, rows);
+    let pane = spawn_shell_pane(&profile, cwd, pc, pr)?;
+    let toast = show_new(panes, focus, pane, cols, rows);
+    mark_all(panes);
+    Ok(toast)
 }
 
-/// Kills the focused pane's child and drops it from the split, reflowing the
-/// rest. The other panes' sessions keep running untouched. Returns true when
-/// no panes are left (the caller then exits the split).
-fn close_focused(panes: &mut Vec<Pane>, focus: &mut usize, cols: u16, rows: u16) -> bool {
-    let mut pane = panes.remove(*focus);
+/// Kills pane `idx`'s child and drops it from the set, moving focus to the
+/// most recently used pane if it was the focused one. Returns true when no
+/// panes are left (the caller then exits). Callers `settle` afterwards.
+fn remove_pane(panes: &mut Vec<Pane>, focus: &mut usize, idx: usize) -> bool {
+    let mut pane = panes.remove(idx);
     let _ = pane.child.kill();
     if panes.is_empty() {
         return true;
     }
+    if idx < *focus {
+        *focus -= 1;
+    } else if idx == *focus {
+        *focus = (0..panes.len()).max_by_key(|&i| panes[i].meta.last_focus).unwrap_or(0);
+    }
     if *focus >= panes.len() {
         *focus = panes.len() - 1;
     }
-    reflow(panes, cols, rows);
     false
+}
+
+/// State of the pane list while the run loop is going.
+struct SideState {
+    focus: bool,
+    /// Key of the highlighted row (`sidebar::TreeRow::key`).
+    cursor: String,
+    collapsed: HashSet<String>,
+    scroll: usize,
+}
+
+/// Keys while the pane list has focus. Returns (message to show, true when
+/// the last pane was closed).
+fn side_key(code: KeyCode, panes: &mut Vec<Pane>, focus: &mut usize, side: &mut SideState, cols: u16, rows: u16) -> (Option<String>, bool) {
+    let tree = sidebar::build_tree(panes, &side.collapsed);
+    if tree.is_empty() {
+        side.focus = false;
+        return (None, false);
+    }
+    let ci = tree.iter().position(|r| r.key() == side.cursor).unwrap_or(0);
+    let cap = shown_cap(cols, rows);
+    let mut toast = None;
+    let mut quit = false;
+    match code {
+        KeyCode::Esc | KeyCode::F(2) => side.focus = false,
+        KeyCode::Down => {
+            if ci + 1 < tree.len() {
+                side.cursor = tree[ci + 1].key().to_string();
+            }
+        }
+        KeyCode::Up => {
+            if ci > 0 {
+                side.cursor = tree[ci - 1].key().to_string();
+            }
+        }
+        KeyCode::Left => match &tree[ci] {
+            sidebar::TreeRow::Pane { .. } => {
+                if let Some(parent) = tree[..ci].iter().rev().find(|r| !matches!(r, sidebar::TreeRow::Pane { .. })) {
+                    side.cursor = parent.key().to_string();
+                }
+            }
+            row => {
+                side.collapsed.insert(row.key().to_string());
+            }
+        },
+        KeyCode::Right => {
+            if !matches!(tree[ci], sidebar::TreeRow::Pane { .. }) {
+                side.collapsed.remove(tree[ci].key());
+            }
+        }
+        KeyCode::Enter => match &tree[ci] {
+            sidebar::TreeRow::Pane { idx, .. } => {
+                let idx = *idx;
+                // Opening a pane shows it; if another pane is full, this one
+                // takes over as the full pane.
+                let full = sidebar::full_index(panes);
+                if panes[idx].meta.mode == Mode::Hidden || full.is_some_and(|f| f != idx) {
+                    let mode = if full.is_some() { Mode::Full } else { Mode::Small };
+                    toast = sidebar::set_mode(panes, focus, idx, mode, cap);
+                }
+                if panes[idx].meta.mode != Mode::Hidden {
+                    sidebar::focus_pane(panes, focus, idx);
+                    side.focus = false;
+                }
+            }
+            row => {
+                let key = row.key().to_string();
+                if !side.collapsed.remove(&key) {
+                    side.collapsed.insert(key);
+                }
+            }
+        },
+        KeyCode::Char('f') => {
+            if let sidebar::TreeRow::Pane { idx, .. } = &tree[ci] {
+                let idx = *idx;
+                toast = sidebar::toggle_full(panes, focus, idx, cap);
+                if panes[idx].meta.mode != Mode::Hidden {
+                    sidebar::focus_pane(panes, focus, idx);
+                }
+            }
+        }
+        KeyCode::Char('h') => {
+            if let sidebar::TreeRow::Pane { idx, .. } = &tree[ci] {
+                toast = sidebar::set_mode(panes, focus, *idx, Mode::Hidden, cap);
+            }
+        }
+        KeyCode::Char('x') => {
+            if let sidebar::TreeRow::Pane { idx, .. } = &tree[ci] {
+                quit = remove_pane(panes, focus, *idx);
+                if !quit {
+                    let after = sidebar::build_tree(panes, &side.collapsed);
+                    side.cursor = after[ci.min(after.len() - 1)].key().to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+    if !quit {
+        settle(panes, focus, cols, rows);
+    }
+    (toast, quit)
+}
+
+fn pane_label(p: &Pane, width: usize, focused: bool, full: bool) -> String {
+    let suffix = if full { "  (full)" } else { "" };
+    let badge = sidebar::status_badge(p.meta.status);
+    let badge_w = badge.map_or(0, |(t, _)| t.chars().count() + 1);
+    let mut text = format!(" {} · {}{suffix}", p.meta.title, sidebar::project_name(&p.meta.project));
+    let room = width.saturating_sub(badge_w);
+    if text.chars().count() > room {
+        text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
+    }
+    let pad = width.saturating_sub(text.chars().count() + badge_w);
+    let styled = if focused { ui::color::orange_bold(&text) } else { ui::color::dim(&text) };
+    let tail = badge.map_or(String::new(), |(t, paint)| format!(" {}", paint(t)));
+    format!("{styled}{}{tail}", " ".repeat(pad))
+}
+
+fn key_hints(pairs: &[(&str, &str)]) -> String {
+    pairs.iter().map(|(k, l)| format!("{} {l}", ui::color::dim(k))).collect::<Vec<_>>().join("   ")
+}
+
+/// Builds one full frame (every screen line) plus the cursor escape: header,
+/// pane list beside the grid (labels + pane rows), rule and key hints.
+fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut SideState, toast: Option<&str>, leader: bool) -> (Vec<String>, String) {
+    let drawn = sidebar::drawn(panes);
+    let full = sidebar::full_index(panes).is_some();
+    let lay = make_layout(cols, rows, drawn.len().max(1));
+    let body_h = rows.saturating_sub(CHROME_ROWS) as usize;
+    let side_w = side_width(cols) as usize;
+    let n = drawn.len();
+    let pc = lay.pane_cols as usize;
+    let total_w = lay.gcols * pc + (lay.gcols - 1) * SEP_COLS as usize;
+    let blank = " ".repeat(pc);
+
+    let mut main: Vec<String> = Vec::with_capacity(body_h);
+    {
+        let guards: Vec<_> = drawn.iter().map(|&i| panes[i].parser.lock().unwrap()).collect();
+        for grow in 0..lay.grows {
+            let labels: Vec<String> = (0..lay.gcols)
+                .map(|gc| {
+                    let pos = grow * lay.gcols + gc;
+                    if pos < n { pane_label(&panes[drawn[pos]], pc, drawn[pos] == focus, full) } else { blank.clone() }
+                })
+                .collect();
+            main.push(labels.join(SEP));
+            for row in 0..lay.pane_rows {
+                let cells: Vec<String> = (0..lay.gcols)
+                    .map(|gc| {
+                        let pos = grow * lay.gcols + gc;
+                        if pos < n { render_row(guards[pos].screen(), row, lay.pane_cols) } else { blank.clone() }
+                    })
+                    .collect();
+                main.push(cells.join(SEP));
+            }
+            if grow + 1 < lay.grows {
+                main.push(ui::color::gray(&"─".repeat(total_w)));
+            }
+        }
+    }
+    main.truncate(body_h);
+    while main.len() < body_h {
+        main.push(String::new());
+    }
+
+    let tree = sidebar::build_tree(panes, &side.collapsed);
+    let mut body: Vec<String> = Vec::with_capacity(body_h);
+    if side_w > 0 {
+        let sl = sidebar::render_sidebar(panes, &tree, &side.collapsed, &side.cursor, &mut side.scroll, side.focus, focus, side_w, body_h);
+        for (l, m) in sl.into_iter().zip(main) {
+            body.push(format!("{l} {m}"));
+        }
+    } else if side.focus {
+        // Narrow terminal: the list takes over the screen until F2/Esc.
+        body = sidebar::render_sidebar(panes, &tree, &side.collapsed, &side.cursor, &mut side.scroll, true, focus, cols as usize, body_h);
+    } else {
+        body = main;
+    }
+
+    let blocked = panes.iter().filter(|p| p.meta.status == Status::Blocked).count();
+    let mut head = format!(
+        " {}   shown {}/{}   total {}",
+        ui::color::orange_bold("cpit panels"),
+        sidebar::shown_count(panes),
+        shown_cap(cols, rows),
+        panes.len()
+    );
+    if blocked > 0 {
+        head.push_str(&format!("   {}", ui::color::red(&format!("● {blocked} blocked"))));
+    }
+    if let Some(t) = toast {
+        let room = (cols as usize).saturating_sub(layout::vis_len(&head) + t.chars().count() + 3);
+        head.push_str(&" ".repeat(room.max(1)));
+        head.push_str(&ui::color::orange(t));
+    }
+
+    let hints = if leader {
+        format!(
+            "{} {}",
+            ui::color::orange_bold("Ctrl+\\ ›"),
+            key_hints(&[
+                ("l", "list"),
+                ("h", "hide"),
+                ("f", "full/small"),
+                ("n", "new"),
+                ("s", "shell"),
+                ("x", "close"),
+                ("w", "waiting"),
+                ("b", "sidebar"),
+                ("1-9", "jump"),
+                ("←→↑↓", "move"),
+                ("Esc", "cancel"),
+            ])
+        )
+    } else if side.focus {
+        key_hints(&[("↑/↓", "move"), ("←/→", "fold"), ("Enter", "open"), ("f", "full/small"), ("h", "to list"), ("x", "close"), ("F2/Esc", "back")])
+    } else {
+        key_hints(&[
+            ("Ctrl+\\", "menu"),
+            ("F2", "list"),
+            ("F5", "sidebar"),
+            ("F6", "switch"),
+            ("F7", "add"),
+            ("F9", "shell"),
+            ("F10", if full { "unfull" } else { "full" }),
+            ("F3", "hide"),
+            ("F8", "close"),
+            ("Ctrl+B", "back"),
+            ("Ctrl+Q", "quit"),
+        ])
+    };
+
+    let mut lines = Vec::with_capacity(rows as usize);
+    lines.push(head);
+    lines.extend(body);
+    lines.push(ui::color::gray(&"─".repeat(cols as usize)));
+    lines.push(format!(" {hints}"));
+
+    let cursor = if side.focus { "\x1b[?25l".to_string() } else { cursor_escape(panes, focus, &lay, &drawn) };
+    (lines, cursor)
 }
 
 /// Places the real terminal cursor at the focused pane's own cursor (so
 /// typing shows a caret where Claude expects one), or hides it if that pane
-/// has the cursor hidden. Mirrors the grid layout: line 1 is the label
-/// header, then each grid row is `pane_rows` content lines plus one rule
-/// line; a pane at grid cell (gr, gc) starts at column
-/// `gc*(pane_cols+SEP_COLS)` and line `1 + gr*(pane_rows+1)` (all 1-based
-/// for the CUP escape).
+/// has the cursor hidden. The pane at drawn position `pos` sits in grid cell
+/// (pos / gcols, pos % gcols): column `main_x + gc*(pane_cols+SEP_COLS)`, and
+/// below the header line, each grid row is a label line, `pane_rows` content
+/// lines and a rule (all 1-based for the CUP escape).
 /// Builds the cursor-positioning escape sequence without writing it — the
 /// caller folds it into the same single write+flush as the frame's content
 /// (see the comment on `ui::repaint_body` for why that matters: separate
 /// flushed writes for hide/content/reposition is what produced a fast
 /// blink instead of one clean cursor move per frame).
-fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16, zoomed: bool) -> String {
-    // Zoomed, the focused pane is drawn alone at grid cell (0, 0) — its
-    // real index among `panes` doesn't matter for layout math anymore.
-    let (gr, gc) = if zoomed {
-        (0u16, 0u16)
-    } else {
-        let (_, gcols) = grid_dims(panes.len());
-        ((focus / gcols) as u16, (focus % gcols) as u16)
-    };
+fn cursor_escape(panes: &[Pane], focus: usize, lay: &Layout, drawn: &[usize]) -> String {
+    let Some(pos) = drawn.iter().position(|&i| i == focus) else { return "\x1b[?25l".to_string() };
+    let (gr, gc) = ((pos / lay.gcols) as u16, (pos % lay.gcols) as u16);
     let Ok(p) = panes[focus].parser.lock() else { return String::new() };
     let screen = p.screen();
     if screen.hide_cursor() {
         "\x1b[?25l".to_string()
     } else {
-        // Clamped defensively: a resize (zoom) mid-frame can have this
-        // pane's vt100 buffer resized to pane_rows/pane_cols while
-        // cursor_position() still briefly reports the pre-resize spot (or
-        // vice versa, if a caller ever passes stale geometry). An
-        // unclamped value here computes a CUP escape that lands outside
-        // this pane's cell entirely — into another pane, the chrome
-        // lines, or off-screen — which is what "cursor error" was.
+        // Clamped defensively: a resize mid-frame can have this pane's vt100
+        // buffer resized to pane_rows/pane_cols while cursor_position() still
+        // briefly reports the pre-resize spot (or vice versa, if a caller
+        // ever passes stale geometry). An unclamped value here computes a
+        // CUP escape that lands outside this pane's cell entirely — into
+        // another pane, the chrome lines, or off-screen — which is what
+        // "cursor error" was.
         let (cr, cc) = screen.cursor_position();
-        let cr = cr.min(pane_rows.saturating_sub(1));
-        let cc = cc.min(pane_cols.saturating_sub(1));
-        let term_row = 1 + gr * (pane_rows + 1) + cr + 1;
-        let term_col = gc * (pane_cols + SEP_COLS) + cc + 1;
+        let cr = cr.min(lay.pane_rows.saturating_sub(1));
+        let cc = cc.min(lay.pane_cols.saturating_sub(1));
+        let term_row = gr * (lay.pane_rows + 2) + cr + 3;
+        let term_col = lay.main_x + gc * (lay.pane_cols + SEP_COLS) + cc + 1;
         format!("\x1b[{term_row};{term_col}H\x1b[?25h")
     }
 }
@@ -967,21 +1384,217 @@ fn cursor_escape(panes: &[Pane], focus: usize, pane_rows: u16, pane_cols: u16, z
 /// text once it's inside Claude, so it watches the keystrokes it forwards.
 const SHELL_CMD: &str = "/shell";
 
+/// How long a message (an eviction, a refused action) stays in the header.
+const TOAST_TTL: Duration = Duration::from_millis(2500);
+
+/// Everything a pane-manager command can do, whether it came from an F-key or
+/// from the leader key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Act {
+    List,
+    Hide,
+    Full,
+    Add,
+    Shell,
+    Close,
+    Waiting,
+    Sidebar,
+    Next,
+    Prev,
+    Jump(usize),
+    Move(Dir),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Leader key: `Ctrl+\`. Claude doesn't use it, and it never reaches the pane
+/// (press it twice to send a literal one). After it, one more key picks the
+/// command (tmux-style), so everything is reachable without F-keys.
+fn is_leader(code: KeyCode, ctrl: bool) -> bool {
+    ctrl && code == KeyCode::Char('\\')
+}
+
+/// The command a key means right after the leader key.
+fn leader_action(code: KeyCode) -> Option<Act> {
+    match code {
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'l' => Some(Act::List),
+            'h' => Some(Act::Hide),
+            'f' => Some(Act::Full),
+            'n' => Some(Act::Add),
+            's' => Some(Act::Shell),
+            'x' => Some(Act::Close),
+            'w' => Some(Act::Waiting),
+            'b' => Some(Act::Sidebar),
+            d @ '1'..='9' => Some(Act::Jump(d as usize - '0' as usize)),
+            _ => None,
+        },
+        KeyCode::Left => Some(Act::Move(Dir::Left)),
+        KeyCode::Right => Some(Act::Move(Dir::Right)),
+        KeyCode::Up => Some(Act::Move(Dir::Up)),
+        KeyCode::Down => Some(Act::Move(Dir::Down)),
+        _ => None,
+    }
+}
+
+/// The command an F-key means.
+fn fkey_action(code: KeyCode, shift: bool) -> Option<Act> {
+    match code {
+        KeyCode::F(2) => Some(Act::List),
+        KeyCode::F(3) => Some(Act::Hide),
+        KeyCode::F(4) => Some(Act::Waiting),
+        KeyCode::F(5) => Some(Act::Sidebar),
+        KeyCode::F(6) => Some(if shift { Act::Prev } else { Act::Next }),
+        KeyCode::F(7) => Some(Act::Add),
+        KeyCode::F(8) => Some(Act::Close),
+        KeyCode::F(9) => Some(Act::Shell),
+        KeyCode::F(10) => Some(Act::Full),
+        _ => None,
+    }
+}
+
+/// Mutable state of the run loop that commands touch.
+struct Ctl {
+    /// What the user has typed into the focused pane since the last line
+    /// break, so a lone "/shell"+Enter can be recognised. Reset whenever focus
+    /// moves or a non-text key is pressed.
+    typed: String,
+    side: SideState,
+    toast: Option<(String, std::time::Instant)>,
+    /// Set when something other than pane output changed what's on screen.
+    force: bool,
+    /// Last frame's lines, so only changed rows are rewritten. Cleared
+    /// whenever something else drew over the screen (picker, prompt) or the
+    /// layout changed, which forces one full repaint.
+    prev: Vec<String>,
+    /// The leader key was pressed; the next key picks a command.
+    leader: bool,
+}
+
+impl Ctl {
+    fn say(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), std::time::Instant::now()));
+    }
+}
+
+/// Runs one command. Returns true when the last pane was closed (the caller
+/// then exits the split).
+fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<bool> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cap = shown_cap(cols, rows);
+    ctl.typed.clear();
+    ctl.force = true;
+    // Moving focus keeps the same cells on screen; everything else can change
+    // the layout (or drew a picker over it), so repaint in full.
+    if !matches!(a, Act::List | Act::Next | Act::Prev | Act::Jump(_) | Act::Move(_)) {
+        ctl.prev.clear();
+    }
+    match a {
+        Act::List => {
+            ctl.side.focus = !ctl.side.focus;
+            if ctl.side.focus {
+                ctl.side.cursor = sidebar::pane_key(panes[*focus].meta.id);
+            }
+        }
+        Act::Sidebar => {
+            let hidden = !SIDEBAR_HIDDEN.load(Ordering::Relaxed);
+            SIDEBAR_HIDDEN.store(hidden, Ordering::Relaxed);
+            settle(panes, focus, cols, rows);
+            ctl.say(if hidden { "pane list hidden — open it with F2 or Ctrl+\\ l" } else { "pane list shown" });
+        }
+        Act::Hide => {
+            let f = *focus;
+            if let Some(t) = sidebar::set_mode(panes, focus, f, Mode::Hidden, cap) {
+                ctl.say(t);
+            }
+            settle(panes, focus, cols, rows);
+        }
+        Act::Full => {
+            let f = *focus;
+            if let Some(t) = sidebar::toggle_full(panes, focus, f, cap) {
+                ctl.say(t);
+            }
+            sidebar::focus_pane(panes, focus, f);
+            settle(panes, focus, cols, rows);
+        }
+        Act::Add => {
+            if let Some(t) = add_pane(panes, focus, profiles, cwd)? {
+                ctl.say(t);
+            }
+        }
+        Act::Shell => {
+            if let Some(t) = add_shell_pane(panes, focus, cwd)? {
+                ctl.say(t);
+            }
+        }
+        Act::Close => {
+            let f = *focus;
+            if remove_pane(panes, focus, f) {
+                return Ok(true);
+            }
+            settle(panes, focus, cols, rows);
+        }
+        Act::Waiting => {
+            // Jumps to the next pane that is blocked or done — nothing reports
+            // that yet, so for now it just says so.
+            let waiting: Vec<usize> = (0..panes.len()).filter(|&i| i != *focus && matches!(panes[i].meta.status, Status::Blocked | Status::Done)).collect();
+            match waiting.iter().copied().min_by_key(|&i| (panes[i].meta.status != Status::Blocked, panes[i].meta.last_focus)) {
+                Some(i) => {
+                    let mode = if sidebar::full_index(panes).is_some() { Mode::Full } else { Mode::Small };
+                    if panes[i].meta.mode == Mode::Hidden || mode == Mode::Full {
+                        if let Some(t) = sidebar::set_mode(panes, focus, i, mode, cap) {
+                            ctl.say(t);
+                        }
+                    }
+                    sidebar::focus_pane(panes, focus, i);
+                    settle(panes, focus, cols, rows);
+                }
+                None => ctl.say("no pane is waiting"),
+            }
+        }
+        Act::Next | Act::Prev | Act::Jump(_) | Act::Move(_) => {
+            if sidebar::full_index(panes).is_some() {
+                // Nothing else is drawn; use the list (F2) to bring another up.
+                ctl.say("a pane is full — use the list (F2) to switch");
+            } else {
+                let drawn = sidebar::drawn(panes);
+                let n = drawn.len();
+                if let Some(pos) = drawn.iter().position(|&i| i == *focus) {
+                    let gcols = make_layout(cols, rows, n.max(1)).gcols;
+                    let target = match a {
+                        Act::Next | Act::Move(Dir::Right) => Some((pos + 1) % n),
+                        Act::Prev | Act::Move(Dir::Left) => Some((pos + n - 1) % n),
+                        Act::Move(Dir::Down) => (pos + gcols < n).then_some(pos + gcols),
+                        Act::Move(Dir::Up) => pos.checked_sub(gcols),
+                        Act::Jump(k) => (k >= 1 && k <= n).then_some(k - 1),
+                        _ => None,
+                    };
+                    if let Some(t) = target {
+                        sidebar::focus_pane(panes, focus, drawn[t]);
+                    }
+                }
+            }
+        }
+    }
+    mark_all(panes);
+    Ok(false)
+}
+
 fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
-    // What the user has typed into the focused pane since the last line break,
-    // so a lone "/shell"+Enter can be recognised. Reset whenever focus moves
-    // or a non-text key is pressed.
-    let mut typed = String::new();
-    // Pane zoom: the focused pane alone, resized to fill the terminal; the
-    // rest keep running (their reader threads still drain output, their
-    // dirty flags still get set) but aren't drawn or resized until unzoomed
-    // — same idea as tmux's zoom, not a separate mode with its own state
-    // machine, just a different `n` for layout math.
-    let mut zoomed = false;
-    // Last frame's lines, so only changed rows are rewritten. Cleared
-    // whenever something else drew over the screen (picker, prompt) or the
-    // layout changed, which forces one full repaint.
-    let mut prev: Vec<String> = Vec::new();
+    let mut ctl = Ctl {
+        typed: String::new(),
+        side: SideState { focus: false, cursor: String::new(), collapsed: HashSet::new(), scroll: 0 },
+        toast: None,
+        force: true,
+        prev: Vec::new(),
+        leader: false,
+    };
     loop {
         // Send the post-resize Ctrl+L to any Claude pane whose resize has
         // settled (see `RESIZE_NUDGE`).
@@ -995,57 +1608,15 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                 }
             }
         }
+        if ctl.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST_TTL) {
+            ctl.toast = None;
+            ctl.force = true;
+        }
         // Swap every dirty flag (not short-circuiting) so one repaint clears
         // all of them and picks up every pane that changed this tick.
-        let dirty = panes.iter().fold(false, |acc, p| acc | p.dirty.swap(false, Ordering::Relaxed));
+        let dirty = panes.iter().fold(false, |acc, p| acc | p.dirty.swap(false, Ordering::Relaxed)) | std::mem::take(&mut ctl.force);
         if dirty {
-            let n = if zoomed { 1 } else { panes.len() };
-            let (grows, gcols) = grid_dims(n);
-            let guards: Vec<_> =
-                if zoomed { vec![panes[*focus].parser.lock().unwrap()] } else { panes.iter().map(|p| p.parser.lock().unwrap()).collect() };
-            let (pane_rows, pane_cols) = guards[0].screen().size();
-            let labels: Vec<String> = if zoomed {
-                vec![format!("{} {}", ui::color::orange_bold(&panes[*focus].label), ui::color::dim("(zoomed)"))]
-            } else {
-                panes.iter().enumerate().map(|(i, p)| if i == *focus { ui::color::orange_bold(&p.label) } else { p.label.clone() }).collect()
-            };
-            let total_w = gcols * pane_cols as usize + (gcols - 1) * SEP_COLS as usize;
-            let blank_cell = " ".repeat(pane_cols as usize);
-            let mut lines = Vec::with_capacity(grows * (pane_rows as usize + 1) + 3);
-            lines.push(format!(" {}", labels.join(&format!(" {SEP}"))));
-            for grow in 0..grows {
-                for row in 0..pane_rows {
-                    let cells: Vec<String> = (0..gcols)
-                        .map(|gcol| {
-                            let idx = grow * gcols + gcol;
-                            if idx < n {
-                                render_row(guards[idx].screen(), row, pane_cols)
-                            } else {
-                                blank_cell.clone()
-                            }
-                        })
-                        .collect();
-                    lines.push(cells.join(SEP));
-                }
-                if grow + 1 < grows {
-                    lines.push(ui::color::gray(&"─".repeat(total_w)));
-                }
-            }
-            lines.push(String::new());
-            lines.push(if zoomed {
-                format!(" {} unzoom   {} shell   {} back   {} quit", ui::color::dim("F10"), ui::color::dim("F9"), ui::color::dim("Ctrl+B"), ui::color::dim("Ctrl+Q"))
-            } else {
-                format!(
-                    " {} switch   {} add   {} close   {} zoom   {} shell   {} back   {} quit",
-                    ui::color::dim("F6"),
-                    ui::color::dim("F7"),
-                    ui::color::dim("F8"),
-                    ui::color::dim("F10"),
-                    ui::color::dim("F9"),
-                    ui::color::dim("Ctrl+B"),
-                    ui::color::dim("Ctrl+Q"),
-                )
-            });
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             // One write+flush for hide+content+reposition+show together —
             // hiding the cursor before the content overwrite (so the
             // redraw can't drag a visible cursor across it) used to be a
@@ -1053,10 +1624,10 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
             // reposition/show after it; three flushes a frame was enough
             // gap between "cursor off" and "back on" to look like a fast
             // blink instead of one clean frame.
-            drop(guards); // cursor_escape below re-locks the focused pane's parser
-            let cursor = cursor_escape(panes, *focus, pane_rows, pane_cols, zoomed);
-            let body = ui::repaint_diff(&prev, &lines);
-            prev = lines;
+            let toast = ctl.toast.as_ref().map(|(m, _)| m.clone());
+            let (lines, cursor) = compose_frame(panes, *focus, cols, rows, &mut ctl.side, toast.as_deref(), ctl.leader);
+            let body = ui::repaint_diff(&ctl.prev, &lines);
+            ctl.prev = lines;
             let frame = format!("\x1b[?25l{body}{cursor}");
             let mut out = std::io::stdout();
             let _ = out.write_all(frame.as_bytes());
@@ -1069,6 +1640,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     let alt = k.modifiers.contains(KeyModifiers::ALT);
                     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                     if ctrl && k.code == KeyCode::Char('q') {
                         return Ok(LoopExit::Quit);
                     }
@@ -1078,98 +1650,88 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     if ctrl && k.code == KeyCode::Char('b') {
                         return Ok(LoopExit::Detach);
                     }
-                    // F10 toggles zoom: the focused pane alone, resized to
-                    // fill the terminal; the others keep running untouched
-                    // (still draining output, still marked dirty) but stay
-                    // undrawn and unresized until unzoomed.
-                    if k.code == KeyCode::F(10) {
-                        typed.clear();
-                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        zoomed = !zoomed;
-                        prev.clear();
-                        if zoomed {
-                            let (pc, pr) = pane_geometry(cols, rows, 1);
-                            resize_pane(&panes[*focus], pr, pc);
-                        } else {
-                            // Back to the shared grid size for every pane —
-                            // the others were never resized while zoomed, so
-                            // this is what brings them back in sync with the
-                            // one that was.
-                            reflow(panes, cols, rows);
-                        }
-                        for pane in panes.iter() {
-                            pane.dirty.store(true, Ordering::Relaxed);
+                    // The key after the leader picks a command; pressing the
+                    // leader twice sends a literal one to the pane.
+                    if ctl.leader {
+                        ctl.leader = false;
+                        ctl.force = true;
+                        if is_leader(k.code, ctrl) {
+                            if !ctl.side.focus {
+                                send_to_pane(&panes[*focus], &[0x1c]);
+                            }
+                        } else if k.code != KeyCode::Esc {
+                            match leader_action(k.code) {
+                                Some(a) => {
+                                    if act(a, &mut ctl, panes, focus, profiles, cwd)? {
+                                        return Ok(LoopExit::Quit);
+                                    }
+                                }
+                                None => ctl.say("unknown leader key — Esc cancels"),
+                            }
                         }
                         continue;
                     }
-                    // Switch/add/close would need to reconcile with a
-                    // single resized-to-fill pane mid-zoom — simpler to
-                    // just require F10 first, same as tmux.
-                    if zoomed && matches!(k.code, KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8)) {
+                    if is_leader(k.code, ctrl) {
+                        ctl.leader = true;
+                        ctl.force = true;
                         continue;
                     }
-                    // F6 cycles focus forward, Shift+F6 backward. (Tab/BackTab
-                    // are deliberately left for the focused pane — Claude uses
+                    // F2 moves keyboard focus between the grid and the pane
+                    // list, F5 hides or shows the list box. (Tab/BackTab can't
+                    // be used: they belong to the focused pane — Claude uses
                     // Shift+Tab itself.)
-                    if k.code == KeyCode::F(6) {
-                        let n = panes.len();
-                        *focus = if shift { (*focus + n - 1) % n } else { (*focus + 1) % n };
-                        typed.clear();
-                        for pane in panes.iter() {
-                            pane.dirty.store(true, Ordering::Relaxed);
+                    let fa = fkey_action(k.code, shift);
+                    if ctl.side.focus {
+                        if matches!(fa, Some(Act::List | Act::Sidebar)) {
+                            if act(fa.unwrap(), &mut ctl, panes, focus, profiles, cwd)? {
+                                return Ok(LoopExit::Quit);
+                            }
+                            continue;
                         }
+                        let (t, quit) = side_key(k.code, panes, focus, &mut ctl.side, cols, rows);
+                        if let Some(t) = t {
+                            ctl.say(t);
+                        }
+                        if quit {
+                            return Ok(LoopExit::Quit);
+                        }
+                        ctl.prev.clear();
+                        ctl.force = true;
                         continue;
                     }
-                    if k.code == KeyCode::F(7) {
-                        typed.clear();
-                        add_pane(panes, focus, profiles, cwd)?;
-                        prev.clear();
-                        continue;
-                    }
-                    if k.code == KeyCode::F(8) {
-                        typed.clear();
-                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        if close_focused(panes, focus, cols, rows) {
+                    if let Some(a) = fa {
+                        if act(a, &mut ctl, panes, focus, profiles, cwd)? {
                             return Ok(LoopExit::Quit);
                         }
                         continue;
                     }
-                    // F9, or typing "/shell" + Enter, drops into a real
-                    // interactive shell without leaving the running Claude
-                    // session(s). The panes stay alive in their PTYs (their
-                    // reader threads keep draining output) while the shell owns
-                    // the terminal; on exit we repaint them from vt100 state.
-                    let shell_via_command = k.code == KeyCode::Enter && !ctrl && !alt && typed == SHELL_CMD;
-                    if k.code == KeyCode::F(9) || shell_via_command {
-                        if shell_via_command {
-                            // The "/shell" chars were already echoed into the
-                            // pane as they were typed; erase them and swallow
-                            // this Enter so Claude is left with a clean prompt.
-                            if let Ok(mut w) = panes[*focus].writer.lock() {
-                                let _ = w.write_all(&vec![0x7f; SHELL_CMD.chars().count()]);
-                                let _ = w.flush();
-                            }
+                    // Typing "/shell" + Enter also opens a shell as a new pane
+                    // without leaving the running Claude session(s).
+                    if k.code == KeyCode::Enter && !ctrl && !alt && ctl.typed == SHELL_CMD {
+                        // The "/shell" chars were already echoed into the
+                        // pane as they were typed; erase them and swallow
+                        // this Enter so Claude is left with a clean prompt.
+                        if let Ok(mut w) = panes[*focus].writer.lock() {
+                            let _ = w.write_all(&vec![0x7f; SHELL_CMD.chars().count()]);
+                            let _ = w.flush();
                         }
-                        typed.clear();
-                        add_shell_pane(panes, focus, cwd)?;
-                        prev.clear();
+                        if act(Act::Shell, &mut ctl, panes, focus, profiles, cwd)? {
+                            return Ok(LoopExit::Quit);
+                        }
                         continue;
                     }
                     // Track the current line so the "/shell" command above can
                     // be recognised. Live-forward keystrokes as usual.
                     match k.code {
-                        KeyCode::Char(c) if !ctrl && !alt => typed.push(c),
+                        KeyCode::Char(c) if !ctrl && !alt => ctl.typed.push(c),
                         KeyCode::Backspace if !ctrl && !alt => {
-                            typed.pop();
+                            ctl.typed.pop();
                         }
-                        KeyCode::Enter if !ctrl && !alt => typed.clear(),
-                        _ => typed.clear(),
+                        KeyCode::Enter if !ctrl && !alt => ctl.typed.clear(),
+                        _ => ctl.typed.clear(),
                     }
                     if let Some(bytes) = key_bytes(k.code, ctrl, alt) {
-                        if let Ok(mut w) = panes[*focus].writer.lock() {
-                            let _ = w.write_all(&bytes);
-                            let _ = w.flush();
-                        }
+                        send_to_pane(&panes[*focus], &bytes);
                     }
                 }
                 Event::Resize(mut cols, mut rows) => {
@@ -1195,24 +1757,17 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                             // dropping it (unlikely to happen — scrolling
                             // to zoom and typing at the same time — but
                             // free to handle).
-                            Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                            Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) && !ctl.side.focus && !ctl.leader => {
                                 if let Some(bytes) = key_bytes(k.code, k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT)) {
-                                    if let Ok(mut w) = panes[*focus].writer.lock() {
-                                        let _ = w.write_all(&bytes);
-                                        let _ = w.flush();
-                                    }
+                                    send_to_pane(&panes[*focus], &bytes);
                                 }
                             }
                             _ => {}
                         }
                     }
-                    prev.clear();
-                    if zoomed {
-                        let (pc, pr) = pane_geometry(cols, rows, 1);
-                        resize_pane(&panes[*focus], pr, pc);
-                    } else {
-                        reflow(panes, cols, rows);
-                    }
+                    ctl.prev.clear();
+                    settle(panes, focus, cols, rows);
+                    ctl.force = true;
                 }
                 _ => {}
             }
@@ -1225,29 +1780,19 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
         let mut removed = false;
         while i < panes.len() {
             if matches!(panes[i].child.try_wait(), Ok(Some(_))) {
-                panes.remove(i);
+                if remove_pane(panes, focus, i) {
+                    return Ok(LoopExit::Quit);
+                }
                 removed = true;
             } else {
                 i += 1;
             }
         }
-        if panes.is_empty() {
-            return Ok(LoopExit::Quit);
-        }
         if removed {
-            if *focus >= panes.len() {
-                *focus = panes.len() - 1;
-            }
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            if zoomed {
-                // The exited pane may have been the zoomed one — resize
-                // whichever pane is focused now to fill the screen rather
-                // than the shared grid size.
-                let (pc, pr) = pane_geometry(cols, rows, 1);
-                resize_pane(&panes[*focus], pr, pc);
-            } else {
-                reflow(panes, cols, rows);
-            }
+            settle(panes, focus, cols, rows);
+            ctl.prev.clear();
+            ctl.force = true;
         }
     }
 }
@@ -1336,16 +1881,54 @@ mod tests {
 
     #[test]
     fn geometry_tiles_the_grid_minus_separators_and_chrome() {
-        // 2 panes = 1x2: width (80-3)/2 = 38; height (24-3)/1 = 21.
-        assert_eq!(pane_geometry(80, 24, 2), (38, 21));
-        // 4 panes = 2x2: width (80-3)/2 = 38; height (24 - 3 - 1 rule)/2 = 10.
-        assert_eq!(pane_geometry(80, 24, 4), (38, 10));
+        // 2 panes = 1x2: width (80-3)/2 = 38; cell height (24-3)/1 = 21,
+        // minus the label line = 20 PTY rows.
+        assert_eq!(pane_geometry(80, 24, 2), (38, 20));
+        // 4 panes = 2x2: width (80-3)/2 = 38; cell height (24 - 3 - 1 rule)/2
+        // = 10, minus the label line = 9.
+        assert_eq!(pane_geometry(80, 24, 4), (38, 9));
+    }
+
+    #[test]
+    fn leader_keys_map_to_commands_and_unknown_keys_do_nothing() {
+        assert_eq!(leader_action(KeyCode::Char('l')), Some(Act::List));
+        assert_eq!(leader_action(KeyCode::Char('L')), Some(Act::List));
+        assert_eq!(leader_action(KeyCode::Char('b')), Some(Act::Sidebar));
+        assert_eq!(leader_action(KeyCode::Char('1')), Some(Act::Jump(1)));
+        assert_eq!(leader_action(KeyCode::Char('9')), Some(Act::Jump(9)));
+        assert_eq!(leader_action(KeyCode::Char('0')), None);
+        assert_eq!(leader_action(KeyCode::Left), Some(Act::Move(Dir::Left)));
+        assert_eq!(leader_action(KeyCode::Char('z')), None);
+        assert_eq!(leader_action(KeyCode::Esc), None);
+    }
+
+    #[test]
+    fn fkeys_and_leader_reach_the_same_commands() {
+        for (f, l) in [(2u8, 'l'), (3, 'h'), (4, 'w'), (5, 'b'), (7, 'n'), (8, 'x'), (9, 's'), (10, 'f')] {
+            assert_eq!(fkey_action(KeyCode::F(f), false), leader_action(KeyCode::Char(l)), "F{f} vs leader {l}");
+        }
+        assert_eq!(fkey_action(KeyCode::F(6), false), Some(Act::Next));
+        assert_eq!(fkey_action(KeyCode::F(6), true), Some(Act::Prev));
+    }
+
+    #[test]
+    fn leader_is_ctrl_backslash_only() {
+        assert!(is_leader(KeyCode::Char('\\'), true));
+        assert!(!is_leader(KeyCode::Char('\\'), false));
+        assert!(!is_leader(KeyCode::Char('a'), true));
+    }
+
+    #[test]
+    fn hiding_the_pane_list_gives_the_grid_the_whole_width() {
+        assert_eq!(side_width_for(200, false), SIDEBAR_W);
+        assert_eq!(side_width_for(200, true), 0);
+        assert_eq!(side_width_for(SIDEBAR_MIN_COLS - 1, false), 0);
     }
 
     #[test]
     fn max_panes_is_bounded_by_size_and_the_hard_cap() {
         assert_eq!(max_panes_for(40, 24), 1); // one 24-wide column barely fits, no room for two
         assert!(max_panes_for(200, 60) >= 4); // a big terminal fits a grid
-        assert!(max_panes_for(10000, 10000) <= MAX_PANES); // capped
+        assert!(max_panes_for(10000, 10000) <= MAX_SHOWN); // capped
     }
 }
