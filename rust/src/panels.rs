@@ -11,6 +11,8 @@
 // KERNELBASE!ConsoleInitialize forever, and dies with STATUS_DLL_INIT_FAILED
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
+use crate::conpty;
+use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status};
 use crate::{input::read_key, launch, layout, profiles::Profile, session, ui};
 use anyhow::Result;
@@ -18,7 +20,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +32,9 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     dirty: Arc<AtomicBool>,
+    /// Latest OSC 7501 status the pane's program reported (`osc7501::to_u8`);
+    /// written by the reader thread, copied into `meta.status` by the UI loop.
+    reported: Arc<AtomicU8>,
     /// Temp file holding this pane's composed system prompt (if any); removed
     /// when the pane is dropped. Killing the child stays explicit elsewhere.
     sysprompt_tmp: Option<std::path::PathBuf>,
@@ -121,20 +126,35 @@ const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 /// Shares the one PTY writer with keystroke forwarding (portable_pty's
 /// `take_writer` can only be called once per master), hence the mutex.
 /// The parser lock is never held while writing to the PTY.
-fn process_output(carry: &mut Vec<u8>, chunk: &[u8], parser: &Mutex<vt100::Parser>, writer: &Mutex<Box<dyn Write + Send>>) {
+fn process_output(
+    carry: &mut Vec<u8>,
+    osc: &mut osc7501::Scanner,
+    chunk: &[u8],
+    parser: &Mutex<vt100::Parser>,
+    writer: &Mutex<Box<dyn Write + Send>>,
+    reported: &AtomicU8,
+) {
     let mut scan = std::mem::take(carry);
     let mut fed = scan.len(); // everything before this index was parsed last time
     scan.extend_from_slice(chunk);
-    let mut replies: Vec<String> = Vec::new();
+    let mut replies: Vec<Vec<u8>> = Vec::new();
     if let Ok(mut p) = parser.lock() {
         let ends = scan.windows(CURSOR_QUERY.len()).enumerate().filter(|(_, w)| *w == CURSOR_QUERY).map(|(i, _)| i + CURSOR_QUERY.len());
         for end in ends {
             p.process(&scan[fed..end]);
             fed = end;
             let (row, col) = p.screen().cursor_position();
-            replies.push(format!("\x1b[{};{}R", row + 1, col + 1));
+            replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
         }
         p.process(&scan[fed..]);
+    }
+    // Claude Code only reports its status (OSC 7501) once the query has been
+    // answered; the answer rides in the same write as any cursor replies.
+    for ev in osc.feed(chunk) {
+        match ev {
+            osc7501::Event::Query => replies.push(osc7501::QUERY_REPLY.to_vec()),
+            osc7501::Event::Report(s) => reported.store(osc7501::to_u8(s), Ordering::Relaxed),
+        }
     }
     // Keep only a partial tail: never enough bytes to re-match a query
     // this call already answered.
@@ -145,7 +165,7 @@ fn process_output(carry: &mut Vec<u8>, chunk: &[u8], parser: &Mutex<vt100::Parse
     }
     if let Ok(mut w) = writer.lock() {
         for reply in &replies {
-            let _ = w.write_all(reply.as_bytes());
+            let _ = w.write_all(reply);
         }
         let _ = w.flush();
     }
@@ -173,6 +193,7 @@ fn spawn_pane_cmd(
     cols: u16,
     rows: u16,
 ) -> Result<Pane> {
+    conpty::init();
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
     let child = pair.slave.spawn_command(cmd)?;
@@ -183,15 +204,18 @@ fn spawn_pane_cmd(
     let dirty = Arc::new(AtomicBool::new(true));
     let parser_bg = parser.clone();
     let dirty_bg = dirty.clone();
+    let reported = Arc::new(AtomicU8::new(0));
+    let reported_bg = reported.clone();
     let writer_bg = writer.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut carry = Vec::with_capacity(CURSOR_QUERY.len());
+        let mut osc = osc7501::Scanner::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    process_output(&mut carry, &buf[..n], &parser_bg, &writer_bg);
+                    process_output(&mut carry, &mut osc, &buf[..n], &parser_bg, &writer_bg, &reported_bg);
                     dirty_bg.store(true, Ordering::Relaxed);
                 }
             }
@@ -207,7 +231,7 @@ fn spawn_pane_cmd(
         status: Status::Unknown,
         last_focus: 0,
     };
-    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()) })
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()) })
 }
 
 fn color_code(c: vt100::Color, fg: bool) -> String {
@@ -1612,6 +1636,13 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
             ctl.toast = None;
             ctl.force = true;
         }
+        for p in panes.iter_mut() {
+            let st = osc7501::from_u8(p.reported.load(Ordering::Relaxed));
+            if st != p.meta.status {
+                p.meta.status = st;
+                ctl.force = true;
+            }
+        }
         // Swap every dirty flag (not short-circuiting) so one repaint clears
         // all of them and picks up every pane that changed this tick.
         let dirty = panes.iter().fold(false, |acc, p| acc | p.dirty.swap(false, Ordering::Relaxed)) | std::mem::take(&mut ctl.force);
@@ -1819,8 +1850,10 @@ mod tests {
         let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Recorder(writes.clone())));
         let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
         let mut carry = Vec::new();
+        let mut osc = osc7501::Scanner::default();
+        let reported = AtomicU8::new(0);
         for chunk in chunks {
-            process_output(&mut carry, chunk, &parser, &writer);
+            process_output(&mut carry, &mut osc, chunk, &parser, &writer, &reported);
         }
         let out = writes.lock().unwrap().clone();
         out
@@ -1930,5 +1963,19 @@ mod tests {
         assert_eq!(max_panes_for(40, 24), 1); // one 24-wide column barely fits, no room for two
         assert!(max_panes_for(200, 60) >= 4); // a big terminal fits a grid
         assert!(max_panes_for(10000, 10000) <= MAX_SHOWN); // capped
+    }
+
+    #[test]
+    fn status_query_is_answered_and_reports_are_recorded() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Recorder(writes.clone())));
+        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+        let (mut carry, mut osc, reported) = (Vec::new(), osc7501::Scanner::default(), AtomicU8::new(0));
+        process_output(&mut carry, &mut osc, b"hi\x1b]7501;?\x1b\\", &parser, &writer, &reported);
+        process_output(&mut carry, &mut osc, b"\x1b]7501;state=wor", &parser, &writer, &reported);
+        process_output(&mut carry, &mut osc, b"king:app=claude-code\x07", &parser, &writer, &reported);
+        assert_eq!(writes.lock().unwrap().as_slice(), &[osc7501::QUERY_REPLY.to_vec()]);
+        assert_eq!(osc7501::from_u8(reported.load(Ordering::Relaxed)), Status::Working);
+        assert!(parser.lock().unwrap().screen().contents().contains("hi"));
     }
 }

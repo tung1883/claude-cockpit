@@ -1,9 +1,11 @@
+mod conpty;
 mod detail;
 mod editor;
 mod input;
 mod inspect;
 mod launch;
 mod notes;
+mod osc7501;
 mod layout;
 mod panels;
 mod paths;

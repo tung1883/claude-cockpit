@@ -1,0 +1,1 @@
+conpty.dll and OpenConsole.exe come from the NuGet package CI.Microsoft.Windows.Console.ConPTY 1.22.250314001, built from https://github.com/microsoft/terminal (MIT, see LICENSE). cpit embeds them on Windows x64 so pseudo-console input can carry OSC replies; the inbox Windows 10 console host drops them.

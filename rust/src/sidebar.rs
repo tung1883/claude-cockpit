@@ -17,10 +17,9 @@ pub enum Mode {
     Hidden,
 }
 
-/// What a pane is doing. Nothing detects this yet (that is a later roadmap
-/// item: OSC 7501 + screen heuristics), so every pane is `Unknown` for now;
-/// the variants and their handling exist so the UI and the eviction rule are
-/// ready for it.
+/// What a pane is doing, as reported by the program in it over OSC 7501 (see
+/// `osc7501.rs`). Panes that never report (shells, an old Claude) stay
+/// `Unknown`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum Status {
