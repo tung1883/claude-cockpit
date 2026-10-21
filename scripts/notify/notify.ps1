@@ -1,3 +1,5 @@
+# Inside a cpit pane the cockpit raises its own notification (OSC 7501).
+if ($env:CPIT_PANES) { exit 0 }
 try { $p = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch {}
 # The hook's own JSON payload carries the *actual* cwd for this exact
 # invocation ("current working directory when the hook is invoked", per

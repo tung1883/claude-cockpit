@@ -29,9 +29,10 @@ function Show-ClaudeToast {
     # always renders title-then-body on its own line each; a single
     # <text> is what collapses it to one line. "Claude Cockpit" isn't
     # repeated here since the toast's sender header already shows it.
-    $line = "$Body - $Title"
+    $line = if ($Title) { "$Body - $Title" } else { $Body }
     $xmlText = @"
 <toast>
+  <audio src="ms-winsoundevent:Notification.Default" />
   <visual>
     <binding template="ToastGeneric">
       <text>$(& $escape $line)</text>

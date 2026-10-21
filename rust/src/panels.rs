@@ -12,15 +12,16 @@
 // 0xC0000142 if the conhost is later killed) until a well-formed reply
 // arrives. See PLAN.md for the full history of chasing this.
 use crate::conpty;
+use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status};
-use crate::{input::read_key, launch, layout, profiles::Profile, session, ui};
+use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,9 +33,9 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     dirty: Arc<AtomicBool>,
-    /// Latest OSC 7501 status the pane's program reported (`osc7501::to_u8`);
-    /// written by the reader thread, copied into `meta.status` by the UI loop.
-    reported: Arc<AtomicU8>,
+    /// What the pane's program reported over OSC 7501; written by the reader
+    /// thread, read by the UI loop (status badge, notifications).
+    reported: Arc<Mutex<osc7501::Reports>>,
     /// Temp file holding this pane's composed system prompt (if any); removed
     /// when the pane is dropped. Killing the child stays explicit elsewhere.
     sysprompt_tmp: Option<std::path::PathBuf>,
@@ -45,6 +46,10 @@ struct Pane {
     nudge_at: Mutex<Option<std::time::Instant>>,
     /// When input was last forwarded to this pane (or when it was created).
     last_input: Mutex<std::time::Instant>,
+    /// When this pane last raised a notification (rate limit, see `notify`).
+    notified_at: Option<std::time::Instant>,
+    /// Same for sub-agent notifications.
+    sub_notified_at: Option<std::time::Instant>,
 }
 
 /// How long after a Claude pane's last resize it gets a Ctrl+L (screen
@@ -132,7 +137,7 @@ fn process_output(
     chunk: &[u8],
     parser: &Mutex<vt100::Parser>,
     writer: &Mutex<Box<dyn Write + Send>>,
-    reported: &AtomicU8,
+    reported: &Mutex<osc7501::Reports>,
 ) {
     let mut scan = std::mem::take(carry);
     let mut fed = scan.len(); // everything before this index was parsed last time
@@ -151,9 +156,10 @@ fn process_output(
     // Claude Code only reports its status (OSC 7501) once the query has been
     // answered; the answer rides in the same write as any cursor replies.
     for ev in osc.feed(chunk) {
-        match ev {
-            osc7501::Event::Query => replies.push(osc7501::QUERY_REPLY.to_vec()),
-            osc7501::Event::Report(s) => reported.store(osc7501::to_u8(s), Ordering::Relaxed),
+        if ev == osc7501::Event::Query {
+            replies.push(osc7501::QUERY_REPLY.to_vec());
+        } else if let Ok(mut r) = reported.lock() {
+            r.apply(ev);
         }
     }
     // Keep only a partial tail: never enough bytes to re-match a query
@@ -204,7 +210,7 @@ fn spawn_pane_cmd(
     let dirty = Arc::new(AtomicBool::new(true));
     let parser_bg = parser.clone();
     let dirty_bg = dirty.clone();
-    let reported = Arc::new(AtomicU8::new(0));
+    let reported = Arc::new(Mutex::new(osc7501::Reports::default()));
     let reported_bg = reported.clone();
     let writer_bg = writer.clone();
     std::thread::spawn(move || {
@@ -231,7 +237,7 @@ fn spawn_pane_cmd(
         status: Status::Unknown,
         last_focus: 0,
     };
-    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()) })
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
 
 fn color_code(c: vt100::Color, fg: bool) -> String {
@@ -1499,6 +1505,9 @@ struct Ctl {
     prev: Vec<String>,
     /// The leader key was pressed; the next key picks a command.
     leader: bool,
+    /// Whether the terminal window has focus (focus reports); assumed true
+    /// until the terminal says otherwise.
+    window_focused: bool,
 }
 
 impl Ctl {
@@ -1610,7 +1619,23 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
     Ok(false)
 }
 
+/// Asks the terminal for focus-in/out reports while the split runs, so a
+/// pane the user is looking at does not raise a notification only while the
+/// window is actually in front.
 fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
+    focus_reports(true);
+    let result = run_loop_inner(panes, focus, profiles, cwd);
+    focus_reports(false);
+    result
+}
+
+fn focus_reports(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { b"\x1b[?1004h" } else { b"\x1b[?1004l" });
+    let _ = out.flush();
+}
+
+fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
     let mut ctl = Ctl {
         typed: String::new(),
         side: SideState { focus: false, cursor: String::new(), collapsed: HashSet::new(), scroll: 0 },
@@ -1618,6 +1643,7 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
         force: true,
         prev: Vec::new(),
         leader: false,
+        window_focused: true,
     };
     loop {
         // Send the post-resize Ctrl+L to any Claude pane whose resize has
@@ -1636,11 +1662,29 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
             ctl.toast = None;
             ctl.force = true;
         }
-        for p in panes.iter_mut() {
-            let st = osc7501::from_u8(p.reported.load(Ordering::Relaxed));
+        for (i, p) in panes.iter_mut().enumerate() {
+            let (report, subagents) = match p.reported.lock() {
+                Ok(mut r) => (r.status.clone(), r.take_finished()),
+                Err(_) => (None, Vec::new()),
+            };
+            let st = report.as_ref().map(|r| r.status).unwrap_or(Status::Unknown);
+            let watching = i == *focus && p.meta.mode != Mode::Hidden && ctl.window_focused;
+            let project = sidebar::project_name(&p.meta.project);
             if st != p.meta.status {
-                p.meta.status = st;
+                let prev = std::mem::replace(&mut p.meta.status, st);
                 ctl.force = true;
+                if let Some(kind) = notify::decide(prev, st, watching, p.notified_at, now) {
+                    p.notified_at = Some(now);
+                    let (block_kind, msg) = report.as_ref().map(|r| (r.kind.as_deref(), r.msg.as_deref())).unwrap_or((None, None));
+                    notify::send(settings::notify_mode(), kind, &notify::message(&p.meta.title, &project, kind, block_kind, msg));
+                }
+            }
+            // One notification for a burst of sub-agents, naming the last.
+            if let Some(title) = subagents.last() {
+                if let Some(kind) = notify::decide_subagent(watching, p.sub_notified_at, now) {
+                    p.sub_notified_at = Some(now);
+                    notify::send(settings::notify_mode(), kind, &notify::message(&p.meta.title, &project, kind, None, Some(title)));
+                }
             }
         }
         // Swap every dirty flag (not short-circuiting) so one repaint clears
@@ -1800,6 +1844,8 @@ fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
                     settle(panes, focus, cols, rows);
                     ctl.force = true;
                 }
+                Event::FocusGained => ctl.window_focused = true,
+                Event::FocusLost => ctl.window_focused = false,
                 _ => {}
             }
         }
@@ -1851,7 +1897,7 @@ mod tests {
         let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
         let mut carry = Vec::new();
         let mut osc = osc7501::Scanner::default();
-        let reported = AtomicU8::new(0);
+        let reported = Mutex::new(osc7501::Reports::default());
         for chunk in chunks {
             process_output(&mut carry, &mut osc, chunk, &parser, &writer, &reported);
         }
@@ -1970,12 +2016,12 @@ mod tests {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Recorder(writes.clone())));
         let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
-        let (mut carry, mut osc, reported) = (Vec::new(), osc7501::Scanner::default(), AtomicU8::new(0));
+        let (mut carry, mut osc, reported) = (Vec::new(), osc7501::Scanner::default(), Mutex::new(osc7501::Reports::default()));
         process_output(&mut carry, &mut osc, b"hi\x1b]7501;?\x1b\\", &parser, &writer, &reported);
         process_output(&mut carry, &mut osc, b"\x1b]7501;state=wor", &parser, &writer, &reported);
         process_output(&mut carry, &mut osc, b"king:app=claude-code\x07", &parser, &writer, &reported);
         assert_eq!(writes.lock().unwrap().as_slice(), &[osc7501::QUERY_REPLY.to_vec()]);
-        assert_eq!(osc7501::from_u8(reported.load(Ordering::Relaxed)), Status::Working);
+        assert_eq!(reported.lock().unwrap().status(), Status::Working);
         assert!(parser.lock().unwrap().screen().contents().contains("hi"));
     }
 }

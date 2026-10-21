@@ -18,7 +18,7 @@ impl NotifyMode {
     pub fn label(self) -> &'static str {
         match self {
             NotifyMode::Off => "off",
-            NotifyMode::Toast => "toast",
+            NotifyMode::Toast => "desktop",
             NotifyMode::Terminal => "terminal",
         }
     }

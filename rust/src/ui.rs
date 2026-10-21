@@ -146,6 +146,19 @@ fn clip_visible(s: &str, max: usize) -> String {
     out
 }
 
+/// One row's text clipped to `width`, followed by erase-to-end-of-line only
+/// when the row stops short of the edge. A row that fills the last column
+/// leaves the cursor *on* that column (pending wrap), so the erase would blank
+/// the character just written there ("done" showing as "don").
+fn row_text(line: &str, width: usize) -> String {
+    let clipped = clip_visible(line, width);
+    if crate::layout::vis_len(&clipped) < width {
+        format!("{clipped}\x1b[K")
+    } else {
+        clipped
+    }
+}
+
 /// Builds the escape sequence `repaint` writes, without writing it — lets a
 /// caller (the panel compositor) fold it into one larger write+flush along
 /// with its own trailing escapes (e.g. cursor positioning), instead of each
@@ -168,7 +181,7 @@ pub fn repaint_body(lines: &[String]) -> String {
     let width = term_width();
     let body = lines
         .iter()
-        .map(|l| format!("{}\x1b[K", clip_visible(l, width)))
+        .map(|l| row_text(l, width))
         .collect::<Vec<_>>()
         .join("\r\n");
     format!("\x1b[H{body}\x1b[0J")
@@ -189,7 +202,7 @@ pub fn repaint_diff(prev: &[String], lines: &[String]) -> String {
     let mut out = String::new();
     for (i, (old, new)) in prev.iter().zip(lines).enumerate() {
         if old != new {
-            out.push_str(&format!("\x1b[{};1H{}\x1b[K", i + 1, clip_visible(new, width)));
+            out.push_str(&format!("\x1b[{};1H{}", i + 1, row_text(new, width)));
         }
     }
     if out.is_empty() {
@@ -265,5 +278,23 @@ impl Drop for SuspendGuard {
             write_raw("\x1b[?1049h\x1b[H");
             set_title("Claude Cockpit");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_filling_the_width_is_not_erased_after_its_last_cell() {
+        assert_eq!(row_text("abcd", 4), "abcd");
+        assert_eq!(row_text("abcdef", 4), "abcd");
+        assert_eq!(row_text("\x1b[32mabcd\x1b[0m", 4), "\x1b[32mabcd\x1b[0m");
+    }
+
+    #[test]
+    fn a_short_row_has_its_tail_erased() {
+        assert_eq!(row_text("ab", 4), "ab\x1b[K");
+        assert_eq!(row_text("", 4), "\x1b[K");
     }
 }

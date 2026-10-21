@@ -5,6 +5,7 @@ mod input;
 mod inspect;
 mod launch;
 mod notes;
+mod notify;
 mod osc7501;
 mod layout;
 mod panels;

@@ -39,6 +39,9 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path) -> (portable_pty::Co
     }
     cmd.cwd(cwd);
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
+    // Tells the notify hook scripts that cpit raises its own notifications
+    // for this pane (see notify.rs), so they stay quiet.
+    cmd.env("CPIT_PANES", "1");
     (cmd, sysprompt)
 }
 
