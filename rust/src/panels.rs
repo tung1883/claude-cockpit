@@ -682,8 +682,6 @@ fn pick_pane_target(
     // a one-line message for the next frame.
     let mut marked: std::collections::HashSet<(usize, std::path::PathBuf)> = std::collections::HashSet::new();
     let mut note: Option<String> = None;
-    // The launch directory's repo: "New worktree…" is offered only inside one.
-    let in_repo = worktree::repo_root(cwd).is_some();
     // Computed once, not per frame — this used to call `account_stat`
     // (a full directory walk per profile) on every single keystroke via
     // `quota_note`/`account_lines`, which is what made the screen laggy.
@@ -695,13 +693,15 @@ fn pick_pane_target(
         // profiles/projects), and simplest way to keep the flattened
         // row list in sync with expand state without a parallel index.
         let mut rows: Vec<TargetRow> = Vec::new();
-        if queue.is_some() {
+        if queue.as_deref().map_or(false, |q| !q.is_empty()) {
             rows.push(TargetRow::Start);
         }
         for i in 0..profiles.len() {
             rows.push(TargetRow::Profile(i));
             rows.push(TargetRow::Project { profile_idx: i, path: cwd.to_path_buf(), is_current: true });
             if expanded == Some(i) {
+                rows.push(TargetRow::ChoosePath(i));
+                rows.push(TargetRow::NewWorktree(i));
                 if let Some(groups) = projects_cache.get(&i) {
                     for g in groups {
                         if g.folder.replace('\\', "/") == cwd_norm {
@@ -709,10 +709,6 @@ fn pick_pane_target(
                         }
                         rows.push(TargetRow::Project { profile_idx: i, path: std::path::PathBuf::from(&g.folder), is_current: false });
                     }
-                }
-                rows.push(TargetRow::ChoosePath(i));
-                if in_repo {
-                    rows.push(TargetRow::NewWorktree(i));
                 }
             }
         }
@@ -931,10 +927,12 @@ fn pick_pane_target(
                             Target::plain(&profiles[*pi].name, dir)
                         }
                     }
-                    TargetRow::NewWorktree(pi) => match ask_worktree(&profiles[*pi].name, cwd, &queued)? {
-                        Some(t) => t,
-                        None => continue,
-                    },
+                    TargetRow::NewWorktree(pi) => {
+                        match prompt_worktree_with_dir(&profiles[*pi].name, cwd, &queued)? {
+                            Some(t) => t,
+                            None => continue,
+                        }
+                    }
                     TargetRow::ChoosePath(pi) => {
                         let title = format!("{} — which directory?", profiles[*pi].name);
                         // Esc in the prompt just returns to this list.
@@ -972,15 +970,18 @@ fn pick_pane_target(
 /// exits on its own is dropped without disturbing the others; the split ends
 /// only when the last pane is gone (or Ctrl+Q). v1 scope: no system-prompt
 /// composition for the panes (plain launches only).
-pub fn run_split(profiles: &[Profile], first: &str) -> Result<Option<Session>> {
+pub fn run_split(profiles: &[Profile], _first: &str) -> Result<Option<Session>> {
     let cwd = std::env::current_dir()?;
 
-    let mut chosen: Vec<Target> = vec![Target::plain(first, cwd.clone())];
+    let mut chosen: Vec<Target> = vec![];
     // The picker keeps adding to `chosen` until "Start" (one pane = a solo
     // session, two or more = a split) or the open-pane limit; Esc cancels the
     // whole thing. Only the first few are drawn (as many as fit, at most 9);
     // the rest start in the pane list.
     if pick_pane_target(profiles, &cwd, "", Some(&mut chosen))?.is_none() {
+        return Ok(None);
+    }
+    if chosen.is_empty() {
         return Ok(None);
     }
     run_split_targets(profiles, &chosen)
@@ -1236,47 +1237,197 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
 /// Asks which directory a new shell pane should start in. Empty input means
 /// `cwd`; a relative path is taken against `cwd`. Esc cancels (None); a path
 /// that isn't a directory keeps the prompt open with an error.
+struct LineEdit {
+    buf: String,
+    cursor: usize, // char index
+}
+
+impl LineEdit {
+    fn new(initial: &str) -> Self {
+        LineEdit { buf: initial.to_string(), cursor: initial.chars().count() }
+    }
+    fn byte_pos(&self, char_idx: usize) -> usize {
+        self.buf.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(self.buf.len())
+    }
+    fn left(&mut self) { if self.cursor > 0 { self.cursor -= 1; } }
+    fn right(&mut self) { let n = self.buf.chars().count(); if self.cursor < n { self.cursor += 1; } }
+    fn home(&mut self) { self.cursor = 0; }
+    fn end(&mut self) { self.cursor = self.buf.chars().count(); }
+    fn insert(&mut self, c: char) { let p = self.byte_pos(self.cursor); self.buf.insert(p, c); self.cursor += 1; }
+    fn backspace(&mut self) { if self.cursor > 0 { self.cursor -= 1; let p = self.byte_pos(self.cursor); self.buf.remove(p); } }
+    fn delete(&mut self) { if self.cursor < self.buf.chars().count() { let p = self.byte_pos(self.cursor); self.buf.remove(p); } }
+    fn col(&self, prefix_len: usize) -> usize { prefix_len + self.cursor + 1 }
+}
+
+fn resolve_dir_input(input: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    let trimmed = input.trim().trim_matches('"');
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let expanded = match trimmed.strip_prefix('~') {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("{home}{rest}"),
+        _ => trimmed.to_string(),
+    };
+    let p = std::path::PathBuf::from(&expanded);
+    if p.is_absolute() { p } else { cwd.join(expanded) }
+}
+
 fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
-    let mut buf = String::new();
+    let mut edit = LineEdit::new(&cwd.to_string_lossy());
     let mut error = String::new();
+    const PREFIX: &str = "   Directory: ";
     ui::show_cursor();
     let result = loop {
         let lines = vec![
             format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(title)),
-            ui::color::dim(&format!("   Enter = {}   Esc cancel", cwd.display())),
             String::new(),
-            format!("   > {buf}"),
+            format!("{PREFIX}{}", edit.buf),
             if error.is_empty() { String::new() } else { ui::color::red(&format!("   {error}")) },
         ];
         ui::repaint(&lines);
+        ui::move_cursor(3, edit.col(PREFIX.len()));
         let key = read_key()?;
         match key.code {
             KeyCode::Esc => break None,
             KeyCode::Enter => {
-                let input = buf.trim().trim_matches('"');
-                if input.is_empty() {
-                    break Some(cwd.to_path_buf());
-                }
-                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-                let expanded = match input.strip_prefix('~') {
-                    Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with(['/', '\\'])) => format!("{home}{rest}"),
-                    _ => input.to_string(),
-                };
-                let path = cwd.join(expanded); // absolute input replaces cwd
-                if path.is_dir() {
-                    break Some(path);
-                }
-                error = format!("not a directory: {}", path.display());
+                let path = resolve_dir_input(&edit.buf, cwd);
+                if path.is_dir() { break Some(path); }
+                error = format!("not a directory: {}", edit.buf.trim());
             }
-            KeyCode::Backspace => {
-                buf.pop();
-                error.clear();
-            }
-            KeyCode::Char(c) if !key.ctrl && !key.alt => {
-                buf.push(c);
-                error.clear();
-            }
+            KeyCode::Left => edit.left(),
+            KeyCode::Right => edit.right(),
+            KeyCode::Home => edit.home(),
+            KeyCode::End => edit.end(),
+            KeyCode::Backspace => { edit.backspace(); error.clear(); }
+            KeyCode::Delete => { edit.delete(); error.clear(); }
+            KeyCode::Char(c) if !key.ctrl && !key.alt => { edit.insert(c); error.clear(); }
             _ => {}
+        }
+    };
+    ui::hide_cursor();
+    Ok(result)
+}
+
+/// Combined directory + worktree prompt on one screen for the NewWorktree flow.
+/// Directory field is pre-filled with `cwd`; Enter confirms it (must be a repo)
+/// and drops to the Name field inline. Esc on Name goes back to Directory.
+fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[String]) -> Result<Option<Target>> {
+    const DIR_PREFIX: &str = "   Directory: ";
+    const NAME_PREFIX: &str = "   Name    ";
+    let mut dir = LineEdit::new(&cwd.to_string_lossy());
+    let mut name_edit = LineEdit::new("");
+    let mut error = String::new();
+    let mut on_name = false;
+
+    let mut repo: Option<std::path::PathBuf> = None;
+    let mut bases: Vec<String> = vec![];
+    let mut base_i = 0usize;
+    let mut suggested = String::new();
+
+    let init_repo = |r: std::path::PathBuf, queued: &[String]| -> (Vec<String>, String, std::path::PathBuf) {
+        let default_base = worktree::default_base(&r);
+        let current = worktree::current_branch(&r);
+        let mut b = vec![default_base.clone()];
+        if current != "HEAD" && current != default_base { b.push(current); }
+        let mut taken: Vec<String> = queued.to_vec();
+        taken.extend(worktree::existing_names(&r));
+        let sug = worktree::default_name(&taken, 2);
+        (b, sug, r)
+    };
+
+    // Pre-compute if cwd is already a repo
+    if let Some(r) = worktree::repo_root(cwd) {
+        let (b, sug, r) = init_repo(r, queued);
+        bases = b;
+        suggested = sug;
+        repo = Some(r);
+    }
+
+    let title = format!("{} — New worktree", profile);
+    ui::show_cursor();
+    let result = loop {
+        let name = if name_edit.buf.is_empty() { suggested.clone() } else { name_edit.buf.clone() };
+        let mut lines = vec![
+            format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&title)),
+            String::new(),
+            format!("{DIR_PREFIX}{}", if on_name { ui::color::dim(&dir.buf) } else { dir.buf.clone() }),
+            String::new(),
+        ];
+        if let Some(r) = &repo {
+            if on_name {
+                lines.push(format!("{NAME_PREFIX}{}{}", ui::color::cyan(&name_edit.buf), if name_edit.buf.is_empty() { ui::color::dim(&suggested) } else { String::new() }));
+            } else {
+                lines.push(format!("{NAME_PREFIX}{}", ui::color::dim(&name)));
+            }
+            lines.push(format!("   From    {}{}", bases[base_i], if bases.len() > 1 { ui::color::dim("   (Tab: switch)") } else { String::new() }));
+            lines.push(format!("   Folder  {}", ui::color::dim(&worktree::worktree_path(r, &name).display().to_string())));
+            lines.push(format!("   Branch  {}", ui::color::dim(&worktree::branch_name(&name))));
+            lines.push(String::new());
+        }
+        lines.push(match (on_name, error.is_empty()) {
+            (_, false) => ui::color::red(&format!("   {error}")),
+            (true, _) => ui::color::dim("   Enter create · Esc back"),
+            (false, _) => ui::color::dim("   Enter confirm · Esc cancel"),
+        });
+        ui::repaint(&lines);
+        if on_name {
+            ui::move_cursor(5, name_edit.col(NAME_PREFIX.len()));
+        } else {
+            ui::move_cursor(3, dir.col(DIR_PREFIX.len()));
+        }
+        let key = read_key()?;
+        if on_name {
+            match key.code {
+                KeyCode::Esc => { on_name = false; error.clear(); }
+                KeyCode::Tab => base_i = (base_i + 1) % bases.len().max(1),
+                KeyCode::Enter => {
+                    if let Some(r) = &repo {
+                        if queued.contains(&name) {
+                            error = "that name is already used by a queued pane".to_string();
+                        } else if let Some(p) = worktree::name_problem(r, &name) {
+                            error = p;
+                        } else {
+                            let resolved = resolve_dir_input(&dir.buf, cwd);
+                            break Some(Target { profile: profile.to_string(), dir: resolved, worktree: Some(WorktreeSpec { name, base: bases[base_i].clone() }) });
+                        }
+                    }
+                }
+                KeyCode::Left => name_edit.left(),
+                KeyCode::Right => name_edit.right(),
+                KeyCode::Home => name_edit.home(),
+                KeyCode::End => name_edit.end(),
+                KeyCode::Backspace => { name_edit.backspace(); error.clear(); }
+                KeyCode::Delete => { name_edit.delete(); error.clear(); }
+                KeyCode::Char(c) if !key.ctrl && !key.alt => { name_edit.insert(c); error.clear(); }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => break None,
+                KeyCode::Enter => {
+                    let path = resolve_dir_input(&dir.buf, cwd);
+                    if !path.is_dir() {
+                        error = format!("not a directory: {}", dir.buf.trim());
+                    } else if let Some(r) = worktree::repo_root(&path) {
+                        let (b, sug, r) = init_repo(r, queued);
+                        bases = b;
+                        suggested = sug;
+                        base_i = 0;
+                        name_edit = LineEdit::new("");
+                        repo = Some(r);
+                        on_name = true;
+                        error.clear();
+                    } else {
+                        error = format!("{} is not a git repository", path.display());
+                    }
+                }
+                KeyCode::Left => dir.left(),
+                KeyCode::Right => dir.right(),
+                KeyCode::Home => dir.home(),
+                KeyCode::End => dir.end(),
+                KeyCode::Backspace => { dir.backspace(); error.clear(); }
+                KeyCode::Delete => { dir.delete(); error.clear(); }
+                KeyCode::Char(c) if !key.ctrl && !key.alt => { dir.insert(c); error.clear(); }
+                _ => {}
+            }
         }
     };
     ui::hide_cursor();

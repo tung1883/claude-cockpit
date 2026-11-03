@@ -111,6 +111,10 @@ pub fn hide_cursor() {
 pub fn show_cursor() {
     write_raw("\x1b[?25h");
 }
+/// Move cursor to 1-based (row, col).
+pub fn move_cursor(row: usize, col: usize) {
+    write_raw(&format!("\x1b[{row};{col}H"));
+}
 
 /// Cuts `s` down to `max` visible columns, passing every ANSI SGR escape
 /// (`\x1b...m`) through untouched (so a color/reset code past the cutoff —
