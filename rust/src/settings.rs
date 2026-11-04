@@ -140,3 +140,31 @@ pub fn unhide_notes_project(path: &str) {
         save(&settings);
     }
 }
+
+// Per-profile Claude Code settings (read/write <profile_dir>/settings.json).
+// Uses serde_json::Value to preserve unknown keys.
+
+fn profile_claude_path(profile: &str) -> std::path::PathBuf {
+    paths::profile_dir(profile).join("settings.json")
+}
+
+fn load_profile_claude(profile: &str) -> serde_json::Value {
+    std::fs::read_to_string(profile_claude_path(profile))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+fn save_profile_claude(profile: &str, value: &serde_json::Value) {
+    if let Ok(json) = serde_json::to_string_pretty(value) {
+        let _ = std::fs::write(profile_claude_path(profile), json);
+    }
+}
+
+pub fn profile_claude_settings(profile: &str) -> serde_json::Map<String, serde_json::Value> {
+    match load_profile_claude(profile) {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+

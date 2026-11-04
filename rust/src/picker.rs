@@ -163,16 +163,17 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
 pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Result<()> {
     use crate::settings::NotifyMode;
     const NOTIFY_ROW: usize = 2;
+    const GLOBAL_COUNT: usize = 3;
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+    let count = GLOBAL_COUNT + profiles.len();
     let mut selected = 0usize;
-    const COUNT: usize = 3;
     ui::hide_cursor();
     loop {
         let wrapped = crate::settings::session_wrapped();
         let notes = crate::settings::notes_enabled();
         let mode = crate::settings::notify_mode();
         let mode_text = if mode == NotifyMode::Off { ui::color::dim(mode.label()) } else { ui::color::green(mode.label()).to_string() };
-        let rows: [(&str, String); COUNT] = [
+        let global_rows: [(&str, String); GLOBAL_COUNT] = [
             (
                 "Launch sessions wrapped",
                 if wrapped {
@@ -190,12 +191,25 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         let mut lines = layout::account_lines(profiles, selected_account, &stats);
         lines.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Settings")));
         lines.push(String::new());
-        for (i, (label, value)) in rows.iter().enumerate() {
+        for (i, (label, value)) in global_rows.iter().enumerate() {
             let pointer = if i == selected { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-            lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 40)));
+            lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 44)));
         }
         lines.push(String::new());
-        lines.push(ui::color::dim(&format!("↑/↓ move · Enter/Space change · {}/Esc back", ui::glyph::back())));
+        lines.push(ui::color::dim("  Profile settings (Claude Code)"));
+        for (i, profile) in profiles.iter().enumerate() {
+            let row_idx = GLOBAL_COUNT + i;
+            let pointer = if row_idx == selected { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+            let map = crate::settings::profile_claude_settings(&profile.name);
+            let count_str = if map.is_empty() {
+                ui::color::dim("—")
+            } else {
+                ui::color::dim(&format!("{} key{}", map.len(), if map.len() == 1 { "" } else { "s" }))
+            };
+            lines.push(format!(" {pointer} {}  {} {}", layout::pad_to(&profile.name, 24), count_str, ui::color::dim("→")));
+        }
+        lines.push(String::new());
+        lines.push(ui::color::dim(&format!("↑/↓ move · Enter change · {}/Esc back", ui::glyph::back())));
         ui::repaint(&lines);
 
         let key = read_key()?;
@@ -205,17 +219,39 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
             return Ok(());
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => selected = (selected + COUNT - 1) % COUNT,
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => selected = (selected + 1) % COUNT,
-            KeyCode::Enter | KeyCode::Char(' ') => match selected {
-                0 => crate::settings::set_session_wrapped(!wrapped),
-                1 => crate::settings::set_notes_enabled(!notes),
-                NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
-                _ => {}
-            },
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => selected = (selected + count - 1) % count,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => selected = (selected + 1) % count,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if selected < GLOBAL_COUNT {
+                    match selected {
+                        0 => crate::settings::set_session_wrapped(!wrapped),
+                        1 => crate::settings::set_notes_enabled(!notes),
+                        NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
+                        _ => {}
+                    }
+                } else {
+                    let profile_idx = selected - GLOBAL_COUNT;
+                    profile_settings_screen(profiles, profile_idx, &stats)?;
+                    ui::hide_cursor();
+                }
+            }
             _ => {}
         }
     }
+}
+
+fn profile_settings_screen(profiles: &[Profile], profile_idx: usize, _stats: &[Stat]) -> std::io::Result<()> {
+    let profile_name = match profiles.get(profile_idx) {
+        Some(p) => p.name.clone(),
+        None => return Ok(()),
+    };
+    let path = crate::paths::profile_dir(&profile_name).join("settings.json");
+    if !path.exists() {
+        // Create empty settings.json so editor has a file to open
+        let _ = std::fs::write(&path, "{}\n");
+    }
+    let title = format!("{profile_name} › settings.json");
+    crate::editor::edit_file(&path, profiles, profile_idx as i64, Some(&title))
 }
 
 pub struct ListOption {
