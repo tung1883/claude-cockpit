@@ -24,6 +24,21 @@ pub fn system_prompt_sidecar(session_path: &std::path::Path) -> PathBuf {
     session_path.with_extension("system-prompt.md")
 }
 
+/// Deletes a session and all its associated data under the profile directory:
+/// the .jsonl transcript, .system-prompt.md sidecar, file-history/<id>/,
+/// session-env/<id>/, and tasks/<id>/.
+pub fn delete_session(profile_dir: &std::path::Path, session: &SessionFile) -> std::io::Result<()> {
+    let _ = fs::remove_file(&session.file);
+    let _ = fs::remove_file(system_prompt_sidecar(&session.file));
+    for subdir in &["file-history", "session-env", "tasks"] {
+        let dir = profile_dir.join(subdir).join(&session.id);
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+    Ok(())
+}
+
 /// Walks <profile>/projects recursively for .jsonl transcripts, newest first.
 pub fn session_files(profile: &str) -> Vec<SessionFile> {
     let root = paths::profile_dir(profile).join("projects");

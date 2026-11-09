@@ -278,6 +278,10 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "Hand off".into(), value: "handoff".into(), note: Some("copy it to another profile".into()) },
             picker::ListOption { label: "View conversation".into(), value: "view".into(), note: Some("read-only, no Claude launch".into()) },
             picker::ListOption { label: "System prompt".into(), value: "prompt".into(), note: Some("appended only when resuming this session".into()) },
+            picker::ListOption { label: "Rename".into(), value: "rename".into(), note: Some("set a custom title".into()) },
+            picker::ListOption { label: "Clone here".into(), value: "clone".into(), note: Some("fork into a new independent session".into()) },
+            picker::ListOption { label: "Edit transcript".into(), value: "edit".into(), note: Some("open raw .jsonl in $EDITOR (risky)".into()) },
+            picker::ListOption { label: "Delete".into(), value: "delete".into(), note: Some("remove this session permanently".into()) },
         ];
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
         let picker::ListChoice::Picked(action) = choice else {
@@ -313,6 +317,59 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
                     }
                     let title = format!("system prompt — {}", &id[..id.len().min(8)]);
                     editor::edit_file(&path, profiles, mark, Some(&title))?;
+                }
+            }
+            "rename" => {
+                let short = &id[..id.len().min(8)];
+                if let Some(new_title) = picker::prompt_line(&format!("New title for {short} (empty to clear): "))? {
+                    if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                        let entry = serde_json::json!({"type": "custom-title", "customTitle": new_title.trim()});
+                        let _ = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&file.file)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f, "{entry}") });
+                    }
+                    return Ok(());
+                }
+            }
+            "clone" => {
+                if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    let dest = file.file.with_file_name(format!("{new_id}.jsonl"));
+                    match std::fs::copy(&file.file, &dest) {
+                        Ok(_) => {
+                            println!("{}", ui::color::green(&format!("Cloned to new session {}", &new_id[..8])));
+                            let _ = std::io::stdin().read_line(&mut String::new());
+                        }
+                        Err(e) => {
+                            println!("{}", ui::color::red(&format!("Clone failed: {e}")));
+                            let _ = std::io::stdin().read_line(&mut String::new());
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            "edit" => {
+                if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                    let title = format!("transcript — {}", &id[..id.len().min(8)]);
+                    editor::edit_file(&file.file, profiles, mark, Some(&title))?;
+                    // fall through: stay on action menu
+                }
+            }
+            "delete" => {
+                if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                    let short = &id[..id.len().min(8)];
+                    let confirm = picker::prompt_line(&format!("Type {short} to confirm delete: "))?;
+                    if confirm.as_deref().map(str::trim) == Some(short) {
+                        let profile_dir = paths::profile_dir(from);
+                        session::delete_session(&profile_dir, file)?;
+                        println!("{}", ui::color::green("Deleted."));
+                        let _ = std::io::stdin().read_line(&mut String::new());
+                        return Ok(());
+                    } else {
+                        println!("{}", ui::color::dim("Cancelled."));
+                        let _ = std::io::stdin().read_line(&mut String::new());
+                    }
                 }
             }
             _ => continue 'list,
