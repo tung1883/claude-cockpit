@@ -3,7 +3,7 @@
 // rough estimates (bytes / 4) of the on-disk instruction text, not live tool
 // budgets. Ported from src/inspect.js.
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn read_json(file: &Path) -> Value {
     std::fs::read_to_string(file)
@@ -80,18 +80,23 @@ pub struct ScanResult {
 }
 
 /// One recursive walk, everything the screens need in a single pass. Skips
-/// node_modules/.git. This is the only expensive call; callers cache it.
+/// node_modules/.git.
+///
+/// The entry's file type and size come out of the directory listing itself, so
+/// no per-entry `stat` is needed (the old `path.is_dir()` on every entry was a
+/// syscall each, which on a profile with hundreds of transcript files is most
+/// of the time).
 pub fn scan_tree(dir: &Path) -> ScanResult {
     let mut r = ScanResult { bytes: 0, files: 0, md_bytes: 0, newest_ms: 0, jsonl: 0 };
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&current) else { continue };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                let name = entry.file_name();
                 if name != "node_modules" && name != ".git" {
-                    stack.push(path);
+                    stack.push(entry.path());
                 }
                 continue;
             }
@@ -103,7 +108,7 @@ pub fn scan_tree(dir: &Path) -> ScanResult {
                     r.newest_ms = r.newest_ms.max(ms.as_millis());
                 }
             }
-            let lower = name.to_lowercase();
+            let lower = entry.file_name().to_string_lossy().to_lowercase();
             if lower.ends_with(".md") || lower.ends_with(".txt") || lower.ends_with(".mdx") {
                 r.md_bytes += meta.len();
             }
@@ -112,6 +117,49 @@ pub fn scan_tree(dir: &Path) -> ScanResult {
             }
         }
     }
+    r
+}
+
+/// `scan_tree` spread over a few threads, one slice of the top-level folders
+/// each — for a big tree (a profile's `projects/`: one folder per project, each
+/// with its session files and subagent/tool-result subfolders).
+pub fn scan_tree_par(dir: &Path) -> ScanResult {
+    let mut r = ScanResult { bytes: 0, files: 0, md_bytes: 0, newest_ms: 0, jsonl: 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else { return r };
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(k) if k.is_dir() => subdirs.push(entry.path()),
+            Ok(_) => {
+                // a file directly in `dir`: count it here
+                if let Ok(meta) = entry.metadata() {
+                    r.bytes += meta.len();
+                    r.files += 1;
+                    if let Some(ms) = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()) {
+                        r.newest_ms = r.newest_ms.max(ms.as_millis());
+                    }
+                    if entry.file_name().to_string_lossy().to_lowercase().ends_with(".jsonl") {
+                        r.jsonl += 1;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let chunk = subdirs.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = subdirs.chunks(chunk).map(|c| scope.spawn(move || c.iter().map(|d| scan_tree(d)).collect::<Vec<_>>())).collect();
+        for h in handles {
+            for p in h.join().unwrap() {
+                r.bytes += p.bytes;
+                r.files += p.files;
+                r.md_bytes += p.md_bytes;
+                r.newest_ms = r.newest_ms.max(p.newest_ms);
+                r.jsonl += p.jsonl;
+            }
+        }
+    });
     r
 }
 
@@ -170,13 +218,18 @@ pub struct ActivityInfo {
 
 pub fn activity_info(profile_dir: &Path, extra_bytes: u64) -> ActivityInfo {
     let cj = read_json(&profile_dir.join(".claude.json"));
-    let sessions = scan_tree(&profile_dir.join("projects"));
+    // Bytes and newest-activity come from walking everything under projects/
+    // (subagent and tool-result files take disk too); the session *count* is
+    // only the real transcripts, the same number the account header shows.
+    let projects = profile_dir.join("projects");
+    let sessions = scan_tree_par(&projects);
+    let session_count = crate::session::count_sessions_in(&projects);
     let history_bytes = std::fs::metadata(profile_dir.join("history.jsonl")).map(|m| m.len()).unwrap_or(0);
     ActivityInfo {
         startups: cj.get("numStartups").and_then(|v| v.as_u64()).unwrap_or(0),
         first_start: fmt_date(cj.get("firstStartTime").and_then(|v| v.as_str())),
         projects: cj.get("projects").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0),
-        session_count: sessions.jsonl,
+        session_count: session_count as u64,
         session_bytes: sessions.bytes,
         last_active_ms: sessions.newest_ms,
         history_bytes,

@@ -349,6 +349,7 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
                     let dest = file.file.with_file_name(format!("{new_id}.jsonl"));
                     match std::fs::copy(&file.file, &dest) {
                         Ok(_) => {
+                            layout::invalidate_stats();
                             println!("{}", ui::color::green(&format!("Cloned to new session {}", &new_id[..8])));
                             let _ = std::io::stdin().read_line(&mut String::new());
                         }
@@ -542,7 +543,10 @@ fn cockpit() -> Result<()> {
 
         match action {
             Action::Quit => return Ok(()),
-            Action::Refresh => continue,
+            Action::Refresh => {
+                layout::invalidate_stats();
+                continue;
+            }
             Action::Settings(_) => {
                 picker::settings_menu(&profiles, cursor as i64)?;
             }

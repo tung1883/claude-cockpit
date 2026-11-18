@@ -3,24 +3,7 @@ use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 fn find_session(profile_dir: &std::path::Path, session_id: &str) -> Option<PathBuf> {
-    let root = profile_dir.join("projects");
-    if !root.exists() {
-        return None;
-    }
-    let target_name = format!("{session_id}.jsonl");
-    let mut queue = vec![root];
-    while let Some(current) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&current) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                queue.push(path);
-            } else if entry.file_name().to_string_lossy() == target_name {
-                return Some(path);
-            }
-        }
-    }
-    None
+    crate::session::find_in_profile_dir(profile_dir, session_id)
 }
 
 /// Copies a session to another profile and returns (source, target, thinking
@@ -41,5 +24,6 @@ pub fn copy_session(from: &str, to: &str, session_id: &str) -> Result<(PathBuf, 
     let text = std::fs::read_to_string(&source)?;
     let (out, stripped) = crate::transcript::strip_thinking(&text);
     std::fs::write(&target, out)?;
+    crate::layout::invalidate_stats();
     Ok((source, target, stripped))
 }

@@ -15,7 +15,25 @@ pub struct SessionFile {
 /// id (e.g. a `--resume <id>` launch arg) rather than an already-loaded
 /// `SessionFile`.
 pub fn session_file_path(profile: &str, session_id: &str) -> Option<PathBuf> {
-    session_files(profile).into_iter().find(|s| s.id == session_id).map(|s| s.file)
+    find_in_profile_dir(&paths::profile_dir(profile), session_id)
+}
+
+/// `<profile>/projects/<folder>/<id>.jsonl`, found by checking one path per
+/// project folder instead of listing every transcript.
+pub fn find_in_profile_dir(profile_dir: &std::path::Path, session_id: &str) -> Option<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    let root = profile_dir.join("projects");
+    let direct = root.join(&name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for entry in fs::read_dir(&root).ok()?.flatten() {
+        let candidate = entry.path().join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The per-session persisted system-prompt sidecar path for a transcript —
@@ -28,6 +46,7 @@ pub fn system_prompt_sidecar(session_path: &std::path::Path) -> PathBuf {
 /// the .jsonl transcript, .system-prompt.md sidecar, file-history/<id>/,
 /// session-env/<id>/, and tasks/<id>/.
 pub fn delete_session(profile_dir: &std::path::Path, session: &SessionFile) -> std::io::Result<()> {
+    crate::layout::invalidate_stats();
     let _ = fs::remove_file(&session.file);
     let _ = fs::remove_file(system_prompt_sidecar(&session.file));
     for subdir in &["file-history", "session-env", "tasks"] {
@@ -39,33 +58,70 @@ pub fn delete_session(profile_dir: &std::path::Path, session: &SessionFile) -> s
     Ok(())
 }
 
-/// Walks <profile>/projects recursively for .jsonl transcripts, newest first.
-pub fn session_files(profile: &str) -> Vec<SessionFile> {
-    let root = paths::profile_dir(profile).join("projects");
-    let mut result = Vec::new();
-    if !root.exists() {
-        return result;
-    }
-    let mut queue = vec![root];
-    while let Some(current) = queue.pop() {
-        let Ok(entries) = fs::read_dir(&current) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                queue.push(path);
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                let modified = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let id = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                result.push(SessionFile { id, file: path, modified });
+/// Calls `f(path, modified)` for every session transcript of a profile.
+///
+/// Sessions live at `projects/<folder>/<id>.jsonl`, so only those two levels
+/// are read. Below a session id there is a directory of that session's
+/// subagent transcripts and tool-result dumps: not sessions (they can't be
+/// resumed), and on a busy profile they are more than half of all `.jsonl`
+/// files and most of its directories — walking into them made every screen
+/// pay for hundreds of directory reads.
+fn for_each_session(profile: &str, f: impl FnMut(PathBuf, SystemTime)) {
+    for_each_session_in(&paths::profile_dir(profile).join("projects"), f)
+}
+
+fn for_each_session_in(root: &std::path::Path, mut f: impl FnMut(PathBuf, SystemTime)) {
+    let Ok(top) = fs::read_dir(root) else { return };
+    let mut visit = |entry: &fs::DirEntry| {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+            f(path, modified);
+        }
+    };
+    for entry in top.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            let Ok(children) = fs::read_dir(entry.path()) else { continue };
+            for child in children.flatten() {
+                if child.file_type().is_ok_and(|t| t.is_file()) {
+                    visit(&child);
+                }
             }
+        } else if kind.is_file() {
+            visit(&entry);
         }
     }
+}
+
+/// Number of real session transcripts under a `projects/` directory.
+pub fn count_sessions_in(projects: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    for_each_session_in(projects, |_, _| n += 1);
+    n
+}
+
+/// Session count and newest modification time, without building (or sorting)
+/// the file list — what the account header shows on every screen.
+pub fn session_summary(profile: &str) -> (usize, Option<SystemTime>) {
+    let mut count = 0usize;
+    let mut newest: Option<SystemTime> = None;
+    for_each_session(profile, |_, modified| {
+        count += 1;
+        if newest.map_or(true, |n| modified > n) {
+            newest = Some(modified);
+        }
+    });
+    (count, newest)
+}
+
+/// Session transcripts of a profile, newest first.
+pub fn session_files(profile: &str) -> Vec<SessionFile> {
+    let mut result = Vec::new();
+    for_each_session(profile, |path, modified| {
+        let id = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        result.push(SessionFile { id, file: path, modified });
+    });
     result.sort_by(|a, b| b.modified.cmp(&a.modified));
     result
 }
@@ -249,14 +305,28 @@ pub struct Turn {
 /// and their results are skipped (this is for reading the conversation,
 /// not auditing it), keeping only actual message text.
 pub fn read_transcript(file: &std::path::Path) -> Vec<Turn> {
+    use std::io::BufRead;
     let mut turns = Vec::new();
-    let Ok(content) = std::fs::read_to_string(file) else { return turns };
-    for line in content.lines() {
-        if line.is_empty() {
+    let Ok(f) = std::fs::File::open(file) else { return turns };
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // Most of a transcript's bytes are hook output, request blobs and tool
+        // results. Messages are the only lines worth a JSON parse, and a user
+        // line that is a tool result (often megabytes) carries no `text` block.
+        if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let role = entry.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if line.len() > 50_000 && line.contains("\"tool_result\"") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else { continue };
+        let role = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if role != "user" && role != "assistant" {
             continue;
         }
@@ -273,7 +343,7 @@ pub fn read_transcript(file: &std::path::Path) -> Vec<Turn> {
         };
         let text = text.trim().to_string();
         if !text.is_empty() {
-            turns.push(Turn { role, text });
+            turns.push(Turn { role: role.to_string(), text });
         }
     }
     turns
@@ -366,5 +436,57 @@ pub fn relative_age(date: Option<SystemTime>) -> String {
         format!("{}h ago", (seconds / 3600.0) as u64)
     } else {
         format!("{}d ago", (seconds / 86400.0) as u64)
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// Timing harness for the real profiles on this machine:
+    /// `cargo test --release bench_hot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_hot_paths() {
+        let names: Vec<String> = ["main", "main2", "work", "work2"].iter().map(|s| s.to_string()).collect();
+        for n in &names {
+            let t = Instant::now();
+            let files = session_files(n);
+            println!("session_files({n}): {} files in {:?}", files.len(), t.elapsed());
+        }
+        let t = Instant::now();
+        for n in &names {
+            let _ = crate::layout::account_stat(n);
+        }
+        println!("account_stat x4 (what every screen pays): {:?}", t.elapsed());
+        for n in &names {
+            let t = Instant::now();
+            let g = grouped_sessions(n);
+            println!("grouped_sessions({n}): {} groups in {:?}", g.len(), t.elapsed());
+        }
+        for n in &names {
+            let t = Instant::now();
+            let _ = crate::inspect::build_inspection(&paths::profile_dir(n));
+            println!("build_inspection({n}) [Enter on account → overview]: {:?}", t.elapsed());
+        }
+        let g = grouped_sessions("work");
+        let biggest = g.iter().max_by_key(|g| g.sessions.len()).unwrap();
+        let t = Instant::now();
+        for s in &biggest.sessions {
+            let _ = session_preview(&s.file);
+        }
+        println!("session_preview serial x{} in '{}': {:?}", biggest.sessions.len(), biggest.folder, t.elapsed());
+        let mut big: Vec<&SessionFile> = g.iter().flat_map(|g| g.sessions.iter()).collect();
+        big.sort_by_key(|s| std::cmp::Reverse(std::fs::metadata(&s.file).map(|m| m.len()).unwrap_or(0)));
+        if let Some(s) = big.first() {
+            let len = std::fs::metadata(&s.file).map(|m| m.len()).unwrap_or(0);
+            let t = Instant::now();
+            let turns = read_transcript(&s.file);
+            println!("read_transcript largest ({} MB): {} turns in {:?}", len / 1_000_000, turns.len(), t.elapsed());
+            let t = Instant::now();
+            let _ = session_preview(&s.file);
+            println!("session_preview largest: {:?}", t.elapsed());
+        }
     }
 }

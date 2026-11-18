@@ -8,10 +8,36 @@ pub struct Stat {
     pub age: String,
 }
 
+// Nearly every screen starts by asking for every account's stats, and a screen
+// change usually follows another within a second or two. A few seconds of
+// cache turns those repeated directory scans into one; anything that adds or
+// removes a session calls `invalidate_stats`.
+static STATS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Stat)>>> = std::sync::OnceLock::new();
+const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+pub fn invalidate_stats() {
+    if let Some(m) = STATS.get() {
+        if let Ok(mut m) = m.lock() {
+            m.clear();
+        }
+    }
+}
+
 pub fn account_stat(name: &str) -> Stat {
-    let sessions = session::session_files(name);
-    let age = session::relative_age(sessions.first().map(|s| s.modified));
-    Stat { count: sessions.len(), age }
+    let cache = STATS.get_or_init(Default::default);
+    if let Ok(m) = cache.lock() {
+        if let Some((at, stat)) = m.get(name) {
+            if at.elapsed() < STATS_TTL {
+                return stat.clone();
+            }
+        }
+    }
+    let (count, newest) = session::session_summary(name);
+    let stat = Stat { count, age: session::relative_age(newest) };
+    if let Ok(mut m) = cache.lock() {
+        m.insert(name.to_string(), (std::time::Instant::now(), stat.clone()));
+    }
+    stat
 }
 
 /// Visible width — ANSI escapes (\x1b[...m) take no columns.
