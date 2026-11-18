@@ -39,12 +39,30 @@ const READ_CAP: usize = 400_000;
 /// Lines are shared (`Arc`) so an undo snapshot costs a pointer per line.
 #[derive(Clone)]
 struct L {
-    raw: String,
+    raw: Raw,
     ty: String,
     uuid: Option<String>,
     parent: Option<String>,
     v: Option<Value>,
     dirty: bool,
+}
+
+/// The text of one line. Lines loaded from a file are windows into the single
+/// buffer the file was read into (no per-line copy: a 230 MB transcript used to
+/// be held twice); lines built any other way own their text.
+#[derive(Clone)]
+enum Raw {
+    Slice(Arc<String>, usize, usize),
+    Owned(String),
+}
+
+impl Raw {
+    fn as_str(&self) -> &str {
+        match self {
+            Raw::Slice(buf, a, b) => &buf[*a..*b],
+            Raw::Owned(s) => s,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -58,24 +76,31 @@ struct Head {
 
 impl L {
     fn parse(raw: &str) -> L {
-        let (ty, uuid, parent) = match serde_json::from_str::<Head>(raw) {
+        L::from_raw(Raw::Owned(raw.to_string()))
+    }
+    fn from_raw(raw: Raw) -> L {
+        let text = raw.as_str();
+        let (ty, uuid, parent) = match serde_json::from_str::<Head>(text) {
             Ok(h) => (h.ty.unwrap_or_default(), h.uuid, h.parent),
             Err(_) => (String::new(), None, None),
         };
-        let v = if ty == "user" || ty == "assistant" { serde_json::from_str(raw).ok() } else { None };
-        L { raw: raw.to_string(), ty, uuid, parent, v, dirty: false }
+        let v = if ty == "user" || ty == "assistant" { serde_json::from_str(text).ok() } else { None };
+        L { raw, ty, uuid, parent, v, dirty: false }
+    }
+    fn raw(&self) -> &str {
+        self.raw.as_str()
     }
     /// Full JSON of the line, parsed on first use for lines not parsed up front.
     fn value_mut(&mut self) -> Option<&mut Value> {
         if self.v.is_none() {
-            self.v = serde_json::from_str(&self.raw).ok();
+            self.v = serde_json::from_str(self.raw.as_str()).ok();
         }
         self.v.as_mut()
     }
     fn out(&self) -> String {
         match (&self.v, self.dirty) {
             (Some(v), true) => v.to_string(),
-            _ => self.raw.clone(),
+            _ => self.raw().to_string(),
         }
     }
     fn ty(&self) -> &str {
@@ -100,17 +125,34 @@ type Doc = Vec<Arc<L>>;
 
 /// Splits and parses the file's lines across a few threads. A 200 MB
 /// transcript is ~20k lines; parsing them on one thread was the main cost of
-/// opening the editor.
-fn parse_doc(text: &str) -> Doc {
-    let mut lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
-    if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop();
+/// opening the editor. Takes the file's text by value: the lines stay windows
+/// into that one buffer.
+fn parse_doc(text: String) -> Doc {
+    let buf = Arc::new(text);
+    let base = buf.as_ptr() as usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for line in buf.split('\n') {
+        let start = line.as_ptr() as usize - base;
+        let mut end = start + line.len();
+        if end > start && buf.as_bytes()[end - 1] == b'\r' {
+            end -= 1;
+        }
+        ranges.push((start, end));
+    }
+    if ranges.last().map(|&(a, b)| a == b).unwrap_or(false) {
+        ranges.pop();
     }
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
-    let chunk = lines.len().div_ceil(workers).max(1);
-    let mut out: Doc = Vec::with_capacity(lines.len());
+    let chunk = ranges.len().div_ceil(workers).max(1);
+    let mut out: Doc = Vec::with_capacity(ranges.len());
     std::thread::scope(|scope| {
-        let handles: Vec<_> = lines.chunks(chunk).map(|c| scope.spawn(move || c.iter().map(|l| Arc::new(L::parse(l))).collect::<Vec<_>>())).collect();
+        let handles: Vec<_> = ranges
+            .chunks(chunk)
+            .map(|c| {
+                let buf = buf.clone();
+                scope.spawn(move || c.iter().map(|&(a, b)| Arc::new(L::from_raw(Raw::Slice(buf.clone(), a, b)))).collect::<Vec<_>>())
+            })
+            .collect();
         for h in handles {
             out.extend(h.join().unwrap());
         }
@@ -125,7 +167,7 @@ fn write_doc(doc: &[Arc<L>], path: &Path) -> std::io::Result<()> {
     for l in doc {
         match (&l.v, l.dirty) {
             (Some(v), true) => serde_json::to_writer(&mut w, v)?,
-            _ => w.write_all(l.raw.as_bytes())?,
+            _ => w.write_all(l.raw().as_bytes())?,
         }
         w.write_all(b"\n")?;
     }
@@ -177,17 +219,92 @@ struct Row {
     kind: Kind,
     name: String,
     tid: String,
+    agent_id: Option<String>,
+    agent_prompt: String,
+    /// Text of the row (preview, capped payload, size), built the first time the
+    /// row is drawn / edited and not for the thousands of rows nobody looks at.
+    info: std::cell::OnceCell<Info>,
+    /// Lowercased search text; built on the first search or text filter.
+    lower: std::cell::OnceCell<String>,
+}
+
+#[derive(Default)]
+struct Info {
     preview: String,
     /// Capped payload (pane + search); the full one is re-read from the doc.
     text: String,
     chars: usize,
-    lower: String,
     big: Option<String>,
-    agent_id: Option<String>,
-    agent_prompt: String,
+}
+
+fn compute_info(l: &L, blk: usize, kind: Kind, name: &str) -> Info {
+    let mut info = Info::default();
+    for_each_block(l, |i, b| {
+        if i != blk {
+            return;
+        }
+        let body = block_body(b);
+        info.chars = body.chars().count();
+        info.text = cap_chars(&body, ROW_TEXT_CAP);
+        let input = || b.get("input").map(|i| i.to_string()).unwrap_or_default();
+        info.preview = match kind {
+            Kind::Text if b.get("type").and_then(|t| t.as_str()) == Some("image") => "[image]".to_string(),
+            Kind::Text => flat(&body, 300),
+            Kind::Think => {
+                if body.is_empty() {
+                    "(empty, signature only)".to_string()
+                } else {
+                    flat(&body, 300)
+                }
+            }
+            Kind::Agent => {
+                let st = b.get("input").and_then(|i| i.get("subagent_type")).and_then(|p| p.as_str()).unwrap_or("agent");
+                flat(&format!("{st}  {}", input()), 300)
+            }
+            Kind::Mcp => {
+                let rest = name.strip_prefix("mcp__").unwrap_or(name);
+                let mut parts = rest.splitn(2, "__");
+                let server = parts.next().unwrap_or("");
+                let tool = parts.next().unwrap_or("");
+                flat(&format!("{server} · {tool}  {}", input()), 300)
+            }
+            Kind::Tool => flat(&format!("{name}  {}", input()), 300),
+            Kind::Result => {
+                if info.chars > 20_000 {
+                    info.big = Some(format!("{} KB", info.chars / 1000));
+                }
+                flat(&body, 300)
+            }
+        };
+    });
+    info
 }
 
 impl Row {
+    fn info(&self, doc: &[Arc<L>]) -> &Info {
+        self.info.get_or_init(|| compute_info(&doc[self.line], self.blk, self.kind, &self.name))
+    }
+    fn lower(&self, doc: &[Arc<L>]) -> &str {
+        self.lower.get_or_init(|| format!("{} {} {}", self.kind.filter_name(), self.name, self.info(doc).text).to_lowercase())
+    }
+    /// A row standing in for one block, to address it when editing.
+    fn probe(line: usize, blk: usize, kind: Kind) -> Row {
+        Row {
+            line,
+            blk,
+            turn: 0,
+            sub: 0,
+            user: false,
+            who: "",
+            kind,
+            name: String::new(),
+            tid: String::new(),
+            agent_id: None,
+            agent_prompt: String::new(),
+            info: Default::default(),
+            lower: Default::default(),
+        }
+    }
     fn label(&self) -> String {
         if self.sub == 0 {
             self.turn.to_string()
@@ -326,47 +443,37 @@ fn build_rows(doc: &[Arc<L>], agent_dir: &Path) -> Vec<Row> {
         let mut first_in_line = true;
         for_each_block(l, |bi, b| {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let body = block_body(b);
             let mut name = String::new();
             let mut tid = String::new();
-            let mut big = None;
             let mut agent_id = None;
             let mut agent_prompt = String::new();
-            let (kind, preview) = match ty {
+            let kind = match ty {
                 "text" => {
-                    if body.trim().is_empty() || body.trim_start().starts_with("<system-reminder>") {
+                    let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("").trim_start();
+                    if t.is_empty() || t.starts_with("<system-reminder>") {
                         return;
                     }
-                    (Kind::Text, flat(&body, 300))
+                    Kind::Text
                 }
-                "thinking" => (Kind::Think, if body.is_empty() { "(empty, signature only)".to_string() } else { flat(&body, 300) }),
+                "thinking" => Kind::Think,
                 "tool_use" => {
                     name = b.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
                     tid = b.get("id").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                    let input = b.get("input").map(|i| i.to_string()).unwrap_or_default();
                     if name == "Agent" || name == "Task" {
                         agent_id = agent_of.get(&tid).cloned();
                         agent_prompt = b.get("input").and_then(|i| i.get("prompt")).and_then(|p| p.as_str()).unwrap_or("").to_string();
-                        let st = b.get("input").and_then(|i| i.get("subagent_type")).and_then(|p| p.as_str()).unwrap_or("agent");
-                        (Kind::Agent, flat(&format!("{st}  {input}"), 300))
-                    } else if let Some(rest) = name.strip_prefix("mcp__") {
-                        let mut parts = rest.splitn(2, "__");
-                        let server = parts.next().unwrap_or("");
-                        let tool = parts.next().unwrap_or("");
-                        (Kind::Mcp, flat(&format!("{server} · {tool}  {input}"), 300))
+                        Kind::Agent
+                    } else if name.starts_with("mcp__") {
+                        Kind::Mcp
                     } else {
-                        (Kind::Tool, flat(&format!("{name}  {input}"), 300))
+                        Kind::Tool
                     }
                 }
                 "tool_result" => {
                     tid = b.get("tool_use_id").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                    let n = body.chars().count();
-                    if n > 20_000 {
-                        big = Some(format!("{} KB", n / 1000));
-                    }
-                    (Kind::Result, flat(&body, 300))
+                    Kind::Result
                 }
-                "image" => (Kind::Text, "[image]".to_string()),
+                "image" => Kind::Text,
                 _ => return,
             };
             // A new turn starts at every user line, or when the speaker changes.
@@ -378,10 +485,21 @@ fn build_rows(doc: &[Arc<L>], agent_dir: &Path) -> Vec<Row> {
                 first_in_line = false;
                 last_user = Some(user);
             }
-            let chars = body.chars().count();
-            let text = cap_chars(&body, ROW_TEXT_CAP);
-            let lower = format!("{} {} {}", kind.filter_name(), name, text).to_lowercase();
-            rows.push(Row { line: li, blk: bi, turn, sub, user, who: if user { "You" } else { "Claude" }, kind, name, tid, preview, text, chars, lower, big, agent_id, agent_prompt });
+            rows.push(Row {
+                line: li,
+                blk: bi,
+                turn,
+                sub,
+                user,
+                who: if user { "You" } else { "Claude" },
+                kind,
+                name,
+                tid,
+                agent_id,
+                agent_prompt,
+                info: Default::default(),
+                lower: Default::default(),
+            });
             sub += 1;
         });
     }
@@ -454,8 +572,11 @@ fn delete_blocks(doc: &mut Doc, rows: &[Row], set: &HashSet<(usize, usize)>) -> 
     for r in rows.iter().filter(|r| set.contains(&r.key())) {
         if !r.tid.is_empty() {
             needles.push(r.tid.clone());
-        } else if r.chars >= 30 {
-            needles.push(cap_chars(&r.text, 60));
+        } else {
+            let info = r.info(doc);
+            if info.chars >= 30 {
+                needles.push(cap_chars(&info.text, 60));
+            }
         }
     }
     let mut by_line: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -520,7 +641,7 @@ fn remove_lines(doc: &mut Doc, removed: &HashSet<usize>, needles: &[String]) {
         if removed.contains(&i) {
             continue;
         }
-        if l.ty().starts_with("api-request") && !needles.is_empty() && needles.iter().any(|n| l.raw.contains(n.as_str())) {
+        if l.ty().starts_with("api-request") && !needles.is_empty() && needles.iter().any(|n| l.raw().contains(n.as_str())) {
             continue;
         }
         keep.push(l);
@@ -603,11 +724,11 @@ pub fn strip_thinking(text: &str) -> (String, usize) {
         return (text.to_string(), 0);
     }
     let trailing = text.ends_with('\n');
-    let mut doc = parse_doc(text);
+    let mut doc = parse_doc(text.to_string());
     let mut emptied: HashSet<usize> = HashSet::new();
     let mut total = 0usize;
     for (i, l) in doc.iter_mut().enumerate() {
-        if !l.raw.contains("thinking") {
+        if !l.raw().contains("thinking") {
             continue;
         }
         let l = Arc::make_mut(l);
@@ -711,8 +832,7 @@ struct State {
 impl State {
     fn load(file: &Path, id: &str, title: &str) -> std::io::Result<State> {
         let text = std::fs::read_to_string(file)?;
-        let doc = parse_doc(&text);
-        drop(text);
+        let doc = parse_doc(text);
         let agent_dir = file.with_extension("").join("subagents");
         let rows = build_rows(&doc, &agent_dir);
         let turns0 = rows.iter().map(|r| r.turn).max().unwrap_or(0);
@@ -774,7 +894,7 @@ impl State {
                     } else if let Some(n) = t.strip_prefix("name:") {
                         r.name.to_lowercase().contains(n)
                     } else {
-                        r.lower.contains(t.as_str())
+                        r.lower(&self.doc).contains(t.as_str())
                     }
                 })
             })
@@ -782,7 +902,7 @@ impl State {
     }
 
     fn hit(&self, r: &Row) -> bool {
-        !self.query.is_empty() && r.lower.contains(&self.query.to_lowercase())
+        !self.query.is_empty() && r.lower(&self.doc).contains(&self.query.to_lowercase())
     }
 
     fn jump(&mut self, vis: &[usize], forward: bool, inclusive: bool) {
@@ -956,6 +1076,7 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
     let preview_w = term_w.saturating_sub(3 + 1 + 1 + 7 + 7 + 6 + 2);
     for n in top..end {
         let r = &st.rows[vis[n]];
+        let info = r.info(&st.doc);
         let on = n == st.sel;
         let ptr = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
         let mark = if st.picked.contains(&r.key()) { ui::color::orange("✓") } else { " ".to_string() };
@@ -966,12 +1087,12 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
             if msgs > 0 {
                 extra = format!("  ▸ {msgs} msgs");
             }
-        } else if let Some(b) = &r.big {
+        } else if let Some(b) = &info.big {
             extra = format!("  {b}");
         }
         let hit = st.hit(r);
-        let in_preview = hit && r.preview.to_lowercase().contains(&st.query.to_lowercase());
-        let mut tail = clip(&r.preview, preview_w.saturating_sub(extra.chars().count()));
+        let in_preview = hit && info.preview.to_lowercase().contains(&st.query.to_lowercase());
+        let mut tail = clip(&info.preview, preview_w.saturating_sub(extra.chars().count()));
         let label = format!(" {}", pad(&r.label(), 7));
         let line = if on {
             let body = format!("{label}{}{}{}{extra}", pad(who_t, 7), pad(r.kind.label(), 6), tail);
@@ -1011,14 +1132,15 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
     // detail pane for the highlighted block
     match vis.get(st.sel).map(|&ri| &st.rows[ri]) {
         Some(r) => {
-            let (body, more) = wrap_text(&r.text, term_w.saturating_sub(4), DET - 1);
-            let total_lines = if more || r.chars > ROW_TEXT_CAP { None } else { Some(body.len()) };
+            let info = r.info(&st.doc);
+            let (body, more) = wrap_text(&info.text, term_w.saturating_sub(4), DET - 1);
+            let total_lines = if more || info.chars > ROW_TEXT_CAP { None } else { Some(body.len()) };
             let head = format!(
                 "─ {} {}{} · {} chars{} ",
                 r.label(),
                 r.kind.filter_name(),
                 if r.name.is_empty() { String::new() } else { format!(" · {}", r.name) },
-                r.chars,
+                info.chars,
                 total_lines.map(|n| format!(" · {n} lines")).unwrap_or_default()
             );
             let fill = "─".repeat(term_w.saturating_sub(head.chars().count()));
@@ -1358,24 +1480,7 @@ fn edit_block(st: &mut State, ri: usize, whole: bool, profiles: &[Profile], mark
     let kind = r.kind;
     let r_line = r.line;
     let r_blk = r.blk;
-    let probe = Row {
-        line: r_line,
-        blk: r_blk,
-        turn: 0,
-        sub: 0,
-        user: false,
-        who: "",
-        kind,
-        name: String::new(),
-        tid: String::new(),
-        preview: String::new(),
-        text: String::new(),
-        chars: 0,
-        lower: String::new(),
-        big: None,
-        agent_id: None,
-        agent_prompt: String::new(),
-    };
+    let probe = Row::probe(r_line, r_blk, kind);
     let text = edited_cmp.to_string();
     let applied = if whole {
         match serde_json::from_str::<Value>(&text) {
@@ -1449,7 +1554,7 @@ fn read_full(st: &State, ri: usize, header: &[String]) -> std::io::Result<()> {
         ui::color::orange(ui::glyph::back()),
         ui::color::bold(&format!("{} {}{}", r.label(), r.kind.filter_name(), if r.name.is_empty() { String::new() } else { format!(" · {}", r.name) }))
     ));
-    h.push(ui::color::dim(&format!("   {} · {} chars · {} lines{}", r.who, r.chars, wrapped.len(), if cut { " (shown part)" } else { "" })));
+    h.push(ui::color::dim(&format!("   {} · {} chars · {} lines{}", r.who, r.info(&st.doc).chars, wrapped.len(), if cut { " (shown part)" } else { "" })));
     h.push(String::new());
     let rows: Vec<ScrollRow> = wrapped.into_iter().map(|l| ScrollRow::info(format!("   {l}"))).collect();
     picker::scroll_screen(&h, &rows, None, None)?;
@@ -1541,13 +1646,24 @@ mod tests {
         let rows = build_rows(&d, Path::new("."));
         assert!(set_block(&mut d, &rows[0], |b| b["text"] = Value::String("changed".into())));
         assert!(d[1].out().contains("changed"));
-        assert_eq!(d[2].out(), d[2].raw); // untouched line unchanged
+        assert_eq!(d[2].out(), d[2].raw()); // untouched line unchanged
     }
 
     #[test]
     #[ignore]
     fn real_session_smoke() {
         let p = std::env::var("TRANSCRIPT_FILE").expect("TRANSCRIPT_FILE");
+        let tr = std::time::Instant::now();
+        let text = std::fs::read_to_string(Path::new(&p)).unwrap();
+        println!("  read_to_string: {:?}", tr.elapsed());
+        let tp = std::time::Instant::now();
+        let d = parse_doc(text.clone());
+        println!("  parse_doc (8 threads): {:?} ({} lines)", tp.elapsed(), d.len());
+        let ts = std::time::Instant::now();
+        let mut n = 0usize;
+        for line in text.lines() { if serde_json::from_str::<serde_json::Value>(line).is_ok() { n += 1; } }
+        println!("  single-thread full Value parse of every line: {:?} ({n} ok)", ts.elapsed());
+        drop((text, d));
         let t0 = std::time::Instant::now();
         let st = State::load(Path::new(&p), "x", "t").unwrap();
         println!("State::load: {:?}", t0.elapsed());
@@ -1601,5 +1717,29 @@ mod tests {
         assert!(goto_target(&rows, &vis, "abc").is_err());
         // hidden by a filter
         assert!(goto_target(&rows, &[0, 3], "3").unwrap_err().contains("filter"));
+    }
+
+    #[test]
+    fn row_text_is_built_on_demand() {
+        let d: Doc = [
+            r#"{"type":"user","uuid":"a","message":{"role":"user","content":"  hello   world\n\nagain "}}"#,
+            r#"{"type":"assistant","uuid":"b","parentUuid":"a","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"S"},{"type":"tool_use","id":"t1","name":"mcp__chrome__navigate","input":{"url":"x"}},{"type":"tool_use","id":"t2","name":"Agent","input":{"subagent_type":"Explore","prompt":"find"}},{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"user","uuid":"c","parentUuid":"b","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"a.txt"},{"type":"image","source":{}}]}}"#,
+        ]
+        .iter()
+        .map(|s| Arc::new(L::parse(s)))
+        .collect();
+        let rows = build_rows(&d, Path::new("."));
+        assert!(rows.iter().all(|r| r.info.get().is_none()), "building rows must not build their text");
+        let p: Vec<String> = rows.iter().map(|r| r.info(&d).preview.clone()).collect();
+        assert_eq!(p[0], "hello world again");
+        assert_eq!(p[1], "(empty, signature only)");
+        assert_eq!(p[2], "chrome · navigate {\"url\":\"x\"}");
+        assert_eq!(p[3], "Explore {\"prompt\":\"find\",\"subagent_type\":\"Explore\"}");
+        assert_eq!(p[4], "Bash {\"command\":\"ls\"}");
+        assert_eq!(p[5], "a.txt");
+        assert_eq!(p[6], "[image]");
+        assert!(rows[0].lower(&d).contains("hello   world"));
+        assert!(rows[4].lower(&d).starts_with("tool_use bash "));
     }
 }
