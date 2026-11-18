@@ -47,6 +47,10 @@ pub fn system_prompt_sidecar(session_path: &std::path::Path) -> PathBuf {
 /// session-env/<id>/, and tasks/<id>/.
 pub fn delete_session(profile_dir: &std::path::Path, session: &SessionFile) -> std::io::Result<()> {
     crate::layout::invalidate_stats();
+    crate::sessions::forget(&session.file);
+    // `<project>/<id>/` holds this session's subagent transcripts and tool-result
+    // dumps; leaving it behind keeps most of a session's disk use.
+    let _ = fs::remove_dir_all(session.file.with_extension(""));
     let _ = fs::remove_file(&session.file);
     let _ = fs::remove_file(system_prompt_sidecar(&session.file));
     for subdir in &["file-history", "session-env", "tasks"] {
@@ -315,7 +319,7 @@ pub fn recent_sessions(groups: &[SessionGroup], n: usize) -> Vec<(usize, usize)>
 /// folder, so this is the cheap path: on a profile with hundreds of
 /// sessions, that full-file scan per session is what made the sessions
 /// view slow to open.
-fn session_cwd(path: &std::path::Path) -> String {
+pub fn session_cwd(path: &std::path::Path) -> String {
     use std::io::{BufRead, BufReader};
     let Ok(file) = std::fs::File::open(path) else { return String::new() };
     for line in BufReader::new(file).lines().map_while(Result::ok).take(20) {

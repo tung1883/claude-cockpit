@@ -18,6 +18,7 @@ mod session;
 mod sidebar;
 mod settings;
 mod statusline;
+mod sessions;
 mod sync;
 mod transcript;
 mod handoff;
@@ -229,7 +230,7 @@ fn session_label(s: &session::SessionFile, title: &str, summary: &str) -> String
     s.id.chars().take(8).collect()
 }
 
-fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup, preselect: Option<&str>) -> Result<()> {
+pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup, preselect: Option<&str>) -> Result<()> {
     // session_preview() reads/scans each transcript (a folder can hold ones
     // tens of MB each), so rows used to fill in lazily on cursor approach —
     // but that made the 3rd column visibly pop in as you scrolled. Resolving
@@ -284,7 +285,12 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
     };
 
     loop {
-        let action_options = [
+        // Claude resumes a session by id from any folder, so "here" just means the
+        // folder the cockpit is in; the folder it started in is one entry away.
+        let started = group.sessions.iter().find(|s| s.id == id).and_then(|s| sessions::started_folder(&s.file));
+        let here = std::env::current_dir().map(|p| sessions::norm_path(&p.to_string_lossy())).unwrap_or_default();
+        let started_dir = started.filter(|p| !p.eq_ignore_ascii_case(&here) && std::path::Path::new(p).is_dir());
+        let mut action_options = vec![
             picker::ListOption { label: "Resume here".into(), value: "resume".into(), note: Some(format!("continue it as '{from}'")) },
             picker::ListOption { label: "Hand off".into(), value: "handoff".into(), note: Some("copy it to another profile".into()) },
             picker::ListOption { label: "View conversation".into(), value: "view".into(), note: Some("read-only, no Claude launch".into()) },
@@ -295,6 +301,9 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "Edit raw .jsonl".into(), value: "rawedit".into(), note: Some("every line as-is (risky)".into()) },
             picker::ListOption { label: "Delete".into(), value: "delete".into(), note: Some("remove this session permanently".into()) },
         ];
+        if let Some(dir) = &started_dir {
+            action_options.insert(1, picker::ListOption { label: "Resume in started folder".into(), value: "resume-start".into(), note: Some(format!("open Claude in {dir}")) });
+        }
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
         let picker::ListChoice::Picked(action) = choice else {
             // Opened straight onto one session: back leaves, no list to land on.
@@ -311,6 +320,16 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
                 launch::launch(from, &["--resume".to_string(), id.clone()])?;
                 drop(suspend);
                 return Ok(());
+            }
+            "resume-start" => {
+                if let Some(dir) = &started_dir {
+                    let suspend = term.suspend();
+                    ui::clear_screen();
+                    println!("{} resuming as {} in {} — exit Claude to return here\n", ui::color::dim(ui::glyph::spark()), ui::color::orange(from), dir);
+                    launch::launch_in(from, &["--resume".to_string(), id.clone()], Some(std::path::Path::new(dir)))?;
+                    drop(suspend);
+                    return Ok(());
+                }
             }
             "handoff" => {
                 run_handoff(term, profiles, mark, from, &id)?;
@@ -379,7 +398,9 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             "delete" => {
                 if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
                     let short = &id[..id.len().min(8)];
-                    let confirm = picker::prompt_line(&format!("Type {short} to confirm delete: "))?;
+                    let n_folders = sessions::folder_count(&file.file);
+                    let scope = if n_folders > 1 { format!(" (touched {n_folders} folders; removed from all)") } else { String::new() };
+                    let confirm = picker::prompt_line(&format!("Type {short} to confirm delete{scope}: "))?;
                     if confirm.as_deref().map(str::trim) == Some(short) {
                         let profile_dir = paths::profile_dir(from);
                         session::delete_session(&profile_dir, file)?;
@@ -449,27 +470,6 @@ fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Full folder list (beyond the overview's first 5), sorted by each
-/// folder's most recent session — picking one drills into its sessions.
-/// Rows share `detail::folder_rows`' formatting so this reads as a plain
-/// continuation of the Sessions section in the overview (view/session),
-/// not a differently-aligned screen.
-fn open_all_folders(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, groups: &[session::SessionGroup]) -> Result<()> {
-    let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
-    let mut header = layout::account_lines(profiles, mark, &stats);
-    header.push(format!("{} {}  {}", ui::color::orange(ui::glyph::back()), ui::color::orange(from), ui::color::dim("— all sessions")));
-    header.push(String::new());
-    let rows = detail::all_folder_rows(groups);
-    let choice = picker::scroll_screen(&header, &rows, None, None)?;
-    let picker::ListChoice::Picked(pick) = choice else { return Ok(()) };
-    if let Some(idx_str) = pick.strip_prefix("folder:") {
-        if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-            open_folder_sessions(term, profiles, mark, from, group, None)?;
-        }
-    }
-    Ok(())
-}
-
 /// Detail-view data (plugin/skill/MCP scan + session grouping) keyed by
 /// profile name, filled in by a background thread started at cockpit
 /// startup so it's usually already sitting there by the time you press →
@@ -501,6 +501,8 @@ fn cockpit() -> Result<()> {
     let mut term = ui::Terminal::enter()?;
     let mut cursor: usize = 0;
     let detail_cache = prefetch_detail_cache(&profiles::list_profiles().unwrap_or_default());
+    // Keep the session index (folders touched, searchable text) up to date.
+    sessions::start_background_index(profiles::list_profiles().unwrap_or_default().into_iter().map(|p| p.name).collect());
     // A session detached with Ctrl+B keeps running in the background; it lives
     // here so the cockpit can offer to resume it. Dropped (killing its panes)
     // when the cockpit exits.
@@ -544,6 +546,10 @@ fn cockpit() -> Result<()> {
 
         match action {
             Action::Quit => return Ok(()),
+            Action::Sessions => {
+                let m = mark.map(|m| m as i64).unwrap_or(-1);
+                sessions::run(&mut term, &profiles, m, sessions::Scope::All)?;
+            }
             Action::Refresh => {
                 layout::invalidate_stats();
                 continue;
@@ -891,23 +897,8 @@ fn cockpit() -> Result<()> {
                     let picker::ListChoice::Picked(pick) = res else { break };
                     at = Some(pick.clone());
 
-                    if let Some(idx_str) = pick.strip_prefix("folder:") {
-                        if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-                            open_folder_sessions(&mut term, &profiles, m, &name, group, None)?;
-                        }
-                        continue;
-                    }
-                    if let Some(rest) = pick.strip_prefix("recent:") {
-                        let loc = rest.split_once(':').and_then(|(g, s)| Some((groups.get(g.parse::<usize>().ok()?)?, s.parse::<usize>().ok()?)));
-                        if let Some((group, si)) = loc {
-                            if let Some(s) = group.sessions.get(si) {
-                                open_folder_sessions(&mut term, &profiles, m, &name, group, Some(&s.id))?;
-                            }
-                        }
-                        continue;
-                    }
-                    if pick == "sessions-more" {
-                        open_all_folders(&mut term, &profiles, m, &name, &groups)?;
+                    if pick.starts_with("folder:") || pick.starts_with("recent:") || pick == "sessions-more" {
+                        sessions::run(&mut term, &profiles, m, sessions::Scope::Account(name.clone()))?;
                         continue;
                     }
                     if pick == "plugin-more" || pick == "skill-more" || pick == "mcp-more" {
@@ -1159,46 +1150,10 @@ fn cockpit() -> Result<()> {
                 picker::prompt_line("Press Enter to return to the menu...")?;
             }
             Action::Handoff(name) => {
-                // Same folder-grouped view as the detail view's Sessions
-                // section — capped to 5 with a "more…" row, not a separate
-                // flat list. Picking a session offers "Hand off" among its
-                // actions (open_folder_sessions), same as from Detail.
-                let groups = session::grouped_sessions(&name);
-                if groups.is_empty() {
-                    ui::home_clear();
-                    println!("{}\n", ui::banner());
-                    println!("{}", ui::color::dim(&format!("No sessions to hand off from '{name}'.")));
-                    picker::prompt_line("Press Enter...")?;
-                    continue;
-                }
+                // The session browser for this account; Enter on a session
+                // offers "Hand off" among its actions.
                 let m = mark.map(|m| m as i64).unwrap_or(-1);
-                let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
-                let mut header = layout::account_lines(&profiles, m, &stats);
-                header.push(format!("{} {}  {}", ui::color::orange(ui::glyph::back()), ui::color::orange(&name), ui::color::dim("— hand off a session")));
-                header.push(String::new());
-                let mut rows = detail::recent_rows(&groups);
-                rows.push(picker::ScrollRow::line(String::new()));
-                rows.extend(detail::folder_rows(&groups));
-                let mut at: Option<String> = None;
-                loop {
-                    let choice = picker::scroll_screen(&header, &rows, at.as_deref(), None)?;
-                    let picker::ListChoice::Picked(pick) = choice else { break };
-                    at = Some(pick.clone());
-                    if let Some(rest) = pick.strip_prefix("recent:") {
-                        let loc = rest.split_once(':').and_then(|(g, s)| Some((groups.get(g.parse::<usize>().ok()?)?, s.parse::<usize>().ok()?)));
-                        if let Some((group, si)) = loc {
-                            if let Some(s) = group.sessions.get(si) {
-                                open_folder_sessions(&mut term, &profiles, m, &name, group, Some(&s.id))?;
-                            }
-                        }
-                    } else if let Some(idx_str) = pick.strip_prefix("folder:") {
-                        if let Some(group) = idx_str.parse::<usize>().ok().and_then(|i| groups.get(i)) {
-                            open_folder_sessions(&mut term, &profiles, m, &name, group, None)?;
-                        }
-                    } else if pick == "sessions-more" {
-                        open_all_folders(&mut term, &profiles, m, &name, &groups)?;
-                    }
-                }
+                sessions::run(&mut term, &profiles, m, sessions::Scope::Account(name.clone()))?;
             }
         }
     }

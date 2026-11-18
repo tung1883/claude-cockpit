@@ -20,6 +20,7 @@ pub enum Action {
     Panels(String),
     ResumeSession,
     Settings(String),
+    Sessions,
 }
 
 /// Explainer shown every time someone presses "n" while Notes is off.
@@ -60,7 +61,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
         let row1: Vec<(&str, &str)> =
             vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("h", "handoff"), ("m", "memory"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
-            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), (",", "settings")];
+            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), ("/", "sessions"), (",", "settings")];
         if has_session {
             row2.push(("^B", "resume"));
         }
@@ -149,6 +150,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
             KeyCode::Char(',') => {
                 ui::show_cursor();
                 return Ok(Action::Settings(profiles[selected].name.clone()));
+            }
+            KeyCode::Char('/') => {
+                ui::show_cursor();
+                return Ok(Action::Sessions);
             }
             _ => {}
         }
