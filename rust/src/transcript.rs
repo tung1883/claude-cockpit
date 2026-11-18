@@ -17,6 +17,7 @@ use crossterm::event::KeyCode;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Rows of the detail pane under the list (1 title line + body lines).
 const DET: usize = 6;
@@ -30,16 +31,46 @@ const READ_CAP: usize = 400_000;
 /// One physical line of the .jsonl. `raw` is written back byte-for-byte unless
 /// the line was modified (then it is re-serialized from `v`), so untouched
 /// lines keep their original key order and spacing.
+///
+/// Only message lines (user/assistant) are fully parsed up front — they carry
+/// the content the editor shows. Everything else (hooks, attachments, request
+/// blobs, snapshots; most of a big file's bytes) is read just far enough to get
+/// type/uuid/parentUuid, and parsed in full only if it has to be changed.
+/// Lines are shared (`Arc`) so an undo snapshot costs a pointer per line.
 #[derive(Clone)]
 struct L {
     raw: String,
+    ty: String,
+    uuid: Option<String>,
+    parent: Option<String>,
     v: Option<Value>,
     dirty: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct Head {
+    #[serde(rename = "type")]
+    ty: Option<String>,
+    uuid: Option<String>,
+    #[serde(rename = "parentUuid")]
+    parent: Option<String>,
+}
+
 impl L {
     fn parse(raw: &str) -> L {
-        L { raw: raw.to_string(), v: serde_json::from_str(raw).ok(), dirty: false }
+        let (ty, uuid, parent) = match serde_json::from_str::<Head>(raw) {
+            Ok(h) => (h.ty.unwrap_or_default(), h.uuid, h.parent),
+            Err(_) => (String::new(), None, None),
+        };
+        let v = if ty == "user" || ty == "assistant" { serde_json::from_str(raw).ok() } else { None };
+        L { raw: raw.to_string(), ty, uuid, parent, v, dirty: false }
+    }
+    /// Full JSON of the line, parsed on first use for lines not parsed up front.
+    fn value_mut(&mut self) -> Option<&mut Value> {
+        if self.v.is_none() {
+            self.v = serde_json::from_str(&self.raw).ok();
+        }
+        self.v.as_mut()
     }
     fn out(&self) -> String {
         match (&self.v, self.dirty) {
@@ -48,14 +79,57 @@ impl L {
         }
     }
     fn ty(&self) -> &str {
-        self.v.as_ref().and_then(|v| v.get("type")).and_then(|t| t.as_str()).unwrap_or("")
+        &self.ty
     }
     fn uuid(&self) -> Option<&str> {
-        self.v.as_ref().and_then(|v| v.get("uuid")).and_then(|t| t.as_str())
+        self.uuid.as_deref()
     }
     fn parent(&self) -> Option<&str> {
-        self.v.as_ref().and_then(|v| v.get("parentUuid")).and_then(|t| t.as_str())
+        self.parent.as_deref()
     }
+    fn set_parent(&mut self, p: Option<String>) {
+        if let Some(v) = self.value_mut() {
+            v["parentUuid"] = p.clone().map(Value::String).unwrap_or(Value::Null);
+            self.dirty = true;
+        }
+        self.parent = p;
+    }
+}
+
+type Doc = Vec<Arc<L>>;
+
+/// Splits and parses the file's lines across a few threads. A 200 MB
+/// transcript is ~20k lines; parsing them on one thread was the main cost of
+/// opening the editor.
+fn parse_doc(text: &str) -> Doc {
+    let mut lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
+    if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let chunk = lines.len().div_ceil(workers).max(1);
+    let mut out: Doc = Vec::with_capacity(lines.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = lines.chunks(chunk).map(|c| scope.spawn(move || c.iter().map(|l| Arc::new(L::parse(l))).collect::<Vec<_>>())).collect();
+        for h in handles {
+            out.extend(h.join().unwrap());
+        }
+    });
+    out
+}
+
+/// Writes the document line by line (no giant joined String for big files).
+fn write_doc(doc: &[Arc<L>], path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+    for l in doc {
+        match (&l.v, l.dirty) {
+            (Some(v), true) => serde_json::to_writer(&mut w, v)?,
+            _ => w.write_all(l.raw.as_bytes())?,
+        }
+        w.write_all(b"\n")?;
+    }
+    w.flush()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -176,13 +250,31 @@ fn result_text(c: &Value) -> String {
 
 /// The message blocks of a line as (index, block). A plain-string `content`
 /// (a typed user prompt) is presented as one synthetic text block.
-fn blocks_of(l: &L) -> Vec<Value> {
-    let Some(v) = &l.v else { return Vec::new() };
+fn for_each_block(l: &L, mut f: impl FnMut(usize, &Value)) {
+    let Some(v) = &l.v else { return };
     match v.get("message").and_then(|m| m.get("content")) {
-        Some(Value::String(s)) => vec![serde_json::json!({"type": "text", "text": s})],
-        Some(Value::Array(a)) => a.clone(),
-        _ => Vec::new(),
+        Some(Value::String(s)) => {
+            let b = serde_json::json!({"type": "text", "text": s});
+            f(0, &b);
+        }
+        Some(Value::Array(a)) => {
+            for (i, b) in a.iter().enumerate() {
+                f(i, b);
+            }
+        }
+        _ => {}
     }
+}
+
+/// One block cloned out of its line (to edit or read in full).
+fn block_at(l: &L, blk: usize) -> Option<Value> {
+    let mut out = None;
+    for_each_block(l, |i, b| {
+        if i == blk {
+            out = Some(b.clone());
+        }
+    });
+    out
 }
 
 /// Full editable body of one block.
@@ -203,7 +295,7 @@ fn is_message_line(l: &L) -> bool {
         && v.get("isSidechain").and_then(|x| x.as_bool()) != Some(true)
 }
 
-fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
+fn build_rows(doc: &[Arc<L>], agent_dir: &Path) -> Vec<Row> {
     // tool_use id -> subagent id, taken from the tool_result line's metadata.
     let mut agent_of: HashMap<String, String> = HashMap::new();
     for l in doc {
@@ -212,13 +304,13 @@ fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
         }
         let Some(v) = &l.v else { continue };
         let Some(aid) = v.get("toolUseResult").and_then(|t| t.get("agentId")).and_then(|a| a.as_str()) else { continue };
-        for b in blocks_of(l) {
+        for_each_block(l, |_, b| {
             if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                 if let Some(tid) = b.get("tool_use_id").and_then(|t| t.as_str()) {
                     agent_of.insert(tid.to_string(), aid.to_string());
                 }
             }
-        }
+        });
     }
     let _ = agent_dir;
 
@@ -231,9 +323,8 @@ fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
             continue;
         }
         let user = l.ty() == "user";
-        let blocks = blocks_of(l);
         let mut first_in_line = true;
-        for (bi, b) in blocks.iter().enumerate() {
+        for_each_block(l, |bi, b| {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let body = block_body(b);
             let mut name = String::new();
@@ -244,7 +335,7 @@ fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
             let (kind, preview) = match ty {
                 "text" => {
                     if body.trim().is_empty() || body.trim_start().starts_with("<system-reminder>") {
-                        continue;
+                        return;
                     }
                     (Kind::Text, flat(&body, 300))
                 }
@@ -276,7 +367,7 @@ fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
                     (Kind::Result, flat(&body, 300))
                 }
                 "image" => (Kind::Text, "[image]".to_string()),
-                _ => continue,
+                _ => return,
             };
             // A new turn starts at every user line, or when the speaker changes.
             if first_in_line {
@@ -292,7 +383,7 @@ fn build_rows(doc: &[L], agent_dir: &Path) -> Vec<Row> {
             let lower = format!("{} {} {}", kind.filter_name(), name, text).to_lowercase();
             rows.push(Row { line: li, blk: bi, turn, sub, user, who: if user { "You" } else { "Claude" }, kind, name, tid, preview, text, chars, lower, big, agent_id, agent_prompt });
             sub += 1;
-        }
+        });
     }
     // Tool results come back as user messages, but only the answers to
     // AskUserQuestion are really the user's; everything else is tool output.
@@ -358,7 +449,7 @@ fn plan_delete(rows: &[Row], picked: &HashSet<(usize, usize)>) -> DeletePlan {
 /// Removes the given blocks (dropping lines left empty), relinks the parentUuid
 /// chain around removed lines, and scrubs request-blob lines that still quote
 /// the removed content. Returns the number of lines removed.
-fn delete_blocks(doc: &mut Vec<L>, rows: &[Row], set: &HashSet<(usize, usize)>) -> usize {
+fn delete_blocks(doc: &mut Doc, rows: &[Row], set: &HashSet<(usize, usize)>) -> usize {
     let mut needles: Vec<String> = Vec::new();
     for r in rows.iter().filter(|r| set.contains(&r.key())) {
         if !r.tid.is_empty() {
@@ -374,7 +465,7 @@ fn delete_blocks(doc: &mut Vec<L>, rows: &[Row], set: &HashSet<(usize, usize)>) 
     let mut removed: HashSet<usize> = HashSet::new();
     for (li, mut blks) in by_line {
         blks.sort_unstable_by(|a, b| b.cmp(a));
-        let line = &mut doc[li];
+        let line = Arc::make_mut(&mut doc[li]);
         let Some(v) = line.v.as_mut() else { continue };
         let Some(content) = v.get_mut("message").and_then(|m| m.get_mut("content")) else { continue };
         match content {
@@ -402,7 +493,7 @@ fn delete_blocks(doc: &mut Vec<L>, rows: &[Row], set: &HashSet<(usize, usize)>) 
 
 /// Drops `removed` lines (plus blob lines quoting `needles`), repointing any
 /// surviving line whose parent was removed at the nearest surviving ancestor.
-fn remove_lines(doc: &mut Vec<L>, removed: &HashSet<usize>, needles: &[String]) {
+fn remove_lines(doc: &mut Doc, removed: &HashSet<usize>, needles: &[String]) {
     let mut gone_parent: HashMap<String, Option<String>> = HashMap::new();
     for &i in removed {
         if let Some(u) = doc[i].uuid() {
@@ -424,16 +515,13 @@ fn remove_lines(doc: &mut Vec<L>, removed: &HashSet<usize>, needles: &[String]) 
         }
         cur
     };
-    let mut keep: Vec<L> = Vec::with_capacity(doc.len());
+    let mut keep: Doc = Vec::with_capacity(doc.len());
     for (i, l) in doc.drain(..).enumerate() {
         if removed.contains(&i) {
             continue;
         }
-        if l.ty().starts_with("api-request") && !needles.is_empty() {
-            let hay = l.out();
-            if needles.iter().any(|n| hay.contains(n.as_str())) {
-                continue;
-            }
+        if l.ty().starts_with("api-request") && !needles.is_empty() && needles.iter().any(|n| l.raw.contains(n.as_str())) {
+            continue;
         }
         keep.push(l);
     }
@@ -441,19 +529,18 @@ fn remove_lines(doc: &mut Vec<L>, removed: &HashSet<usize>, needles: &[String]) 
         if let Some(p) = l.parent().map(|s| s.to_string()) {
             if gone_parent.contains_key(&p) {
                 let np = resolve(Some(p));
-                if let Some(v) = l.v.as_mut() {
-                    v["parentUuid"] = np.map(Value::String).unwrap_or(Value::Null);
-                    l.dirty = true;
-                }
+                Arc::make_mut(l).set_parent(np);
             }
         }
         if l.ty() == "last-prompt" {
-            if let Some(leaf) = l.v.as_ref().and_then(|v| v.get("leafUuid")).and_then(|x| x.as_str()).map(|s| s.to_string()) {
+            let m = Arc::make_mut(l);
+            let leaf = m.value_mut().and_then(|v| v.get("leafUuid")).and_then(|x| x.as_str()).map(|s| s.to_string());
+            if let Some(leaf) = leaf {
                 if gone_parent.contains_key(&leaf) {
                     let np = resolve(Some(leaf));
-                    if let Some(v) = l.v.as_mut() {
+                    if let Some(v) = m.value_mut() {
                         v["leafUuid"] = np.map(Value::String).unwrap_or(Value::Null);
-                        l.dirty = true;
+                        m.dirty = true;
                     }
                 }
             }
@@ -482,7 +569,7 @@ const KEEP_TYPES: [&str; 9] = ["last-prompt", "mode", "permission-mode", "sessio
 /// Cuts everything after `keep_turn`: later message lines and the hook /
 /// attachment / blob lines that follow the last kept message. Session metadata
 /// lines stay; `last-prompt` is pointed at the new last message.
-fn truncate_doc(doc: &mut Vec<L>, rows: &[Row], keep_turn: usize) -> Vec<String> {
+fn truncate_doc(doc: &mut Doc, rows: &[Row], keep_turn: usize) -> Vec<String> {
     let cut = rows.iter().filter(|r| r.turn <= keep_turn).map(|r| r.line).max();
     let Some(cut) = cut else { return Vec::new() };
     let agents: Vec<String> = rows.iter().filter(|r| r.turn > keep_turn).filter_map(|r| r.agent_id.clone()).collect();
@@ -493,11 +580,14 @@ fn truncate_doc(doc: &mut Vec<L>, rows: &[Row], keep_turn: usize) -> Vec<String>
         i += 1;
         idx <= cut || KEEP_TYPES.contains(&l.ty())
     });
-    for l in doc.iter_mut() {
-        if l.ty() == "last-prompt" {
-            if let (Some(v), Some(leaf)) = (l.v.as_mut(), leaf.as_ref()) {
-                v["leafUuid"] = Value::String(leaf.clone());
-                l.dirty = true;
+    if let Some(leaf) = leaf {
+        for l in doc.iter_mut() {
+            if l.ty() == "last-prompt" {
+                let m = Arc::make_mut(l);
+                if let Some(v) = m.value_mut() {
+                    v["leafUuid"] = Value::String(leaf.clone());
+                    m.dirty = true;
+                }
             }
         }
     }
@@ -509,17 +599,18 @@ fn truncate_doc(doc: &mut Vec<L>, rows: &[Row], keep_turn: usize) -> Vec<String>
 /// A thinking block's signature only validates for the organization that
 /// produced it, so a session handed to another account must not carry them.
 pub fn strip_thinking(text: &str) -> (String, usize) {
-    let mut doc: Vec<L> = text.split('\n').map(|s| L::parse(s.trim_end_matches('\r'))).collect();
-    let trailing = doc.last().map(|l| l.raw.is_empty()).unwrap_or(false);
-    if trailing {
-        doc.pop();
+    if !text.contains("thinking") {
+        return (text.to_string(), 0);
     }
+    let trailing = text.ends_with('\n');
+    let mut doc = parse_doc(text);
     let mut emptied: HashSet<usize> = HashSet::new();
     let mut total = 0usize;
     for (i, l) in doc.iter_mut().enumerate() {
         if !l.raw.contains("thinking") {
             continue;
         }
+        let l = Arc::make_mut(l);
         let outcome = {
             let Some(v) = l.v.as_mut() else { continue };
             let Some(Value::Array(a)) = v.get_mut("message").and_then(|m| m.get_mut("content")) else { continue };
@@ -548,14 +639,14 @@ pub fn strip_thinking(text: &str) -> (String, usize) {
     (out, total)
 }
 
-fn set_block(doc: &mut [L], r: &Row, apply: impl FnOnce(&mut Value)) -> bool {
-    let Some(v) = doc[r.line].v.as_mut() else { return false };
+fn set_block(doc: &mut [Arc<L>], r: &Row, apply: impl FnOnce(&mut Value)) -> bool {
+    let line = Arc::make_mut(&mut doc[r.line]);
+    let Some(v) = line.v.as_mut() else { return false };
     let Some(content) = v.get_mut("message").and_then(|m| m.get_mut("content")) else { return false };
-    match content {
+    let ok = match content {
         Value::Array(a) => match a.get_mut(r.blk) {
             Some(b) => {
                 apply(b);
-                doc[r.line].dirty = true;
                 true
             }
             None => false,
@@ -564,15 +655,20 @@ fn set_block(doc: &mut [L], r: &Row, apply: impl FnOnce(&mut Value)) -> bool {
             // typed user prompt: edit through a synthetic block, write the text back
             let mut b = serde_json::json!({"type": "text", "text": content.as_str().unwrap_or("")});
             apply(&mut b);
-            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                *content = Value::String(t.to_string());
-                doc[r.line].dirty = true;
-                return true;
+            match b.get("text").and_then(|t| t.as_str()) {
+                Some(t) => {
+                    *content = Value::String(t.to_string());
+                    true
+                }
+                None => false,
             }
-            false
         }
         _ => false,
+    };
+    if ok {
+        line.dirty = true;
     }
+    ok
 }
 
 // ------------------------------------------------------------------ state
@@ -596,9 +692,9 @@ struct State {
     id: String,
     title: String,
     agent_dir: PathBuf,
-    doc: Vec<L>,
+    doc: Doc,
     rows: Vec<Row>,
-    hist: Vec<(Vec<L>, Vec<String>)>,
+    hist: Vec<(Doc, Vec<String>)>,
     picked: HashSet<(usize, usize)>,
     /// subagent ids whose files get set aside when the changes are saved
     drop_agents: Vec<String>,
@@ -615,10 +711,8 @@ struct State {
 impl State {
     fn load(file: &Path, id: &str, title: &str) -> std::io::Result<State> {
         let text = std::fs::read_to_string(file)?;
-        let mut doc: Vec<L> = text.split('\n').map(|s| L::parse(s.trim_end_matches('\r'))).collect();
-        if doc.last().map(|l| l.raw.is_empty()).unwrap_or(false) {
-            doc.pop();
-        }
+        let doc = parse_doc(&text);
+        drop(text);
         let agent_dir = file.with_extension("").join("subagents");
         let rows = build_rows(&doc, &agent_dir);
         let turns0 = rows.iter().map(|r| r.turn).max().unwrap_or(0);
@@ -715,9 +809,8 @@ impl State {
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let bak = PathBuf::from(format!("{}.bak-{stamp}", self.file.display()));
         std::fs::copy(&self.file, &bak)?;
-        let mut out = self.doc.iter().map(|l| l.out()).collect::<Vec<_>>().join("\n");
-        out.push('\n');
-        std::fs::write(&self.file, out)?;
+        write_doc(&self.doc, &self.file)?;
+        layout::invalidate_stats();
         // Subagent transcripts of deleted Agent calls: set aside, not erased.
         for aid in self.drop_agents.drain(..) {
             for ext in ["jsonl", "meta.json"] {
@@ -739,9 +832,8 @@ impl State {
         truncate_doc(&mut doc, &self.rows, keep_turn);
         let new_id = uuid::Uuid::new_v4().to_string();
         let dest = self.file.with_file_name(format!("{new_id}.jsonl"));
-        let mut out = doc.iter().map(|l| l.out()).collect::<Vec<_>>().join("\n");
-        out.push('\n');
-        std::fs::write(&dest, out)?;
+        write_doc(&doc, &dest)?;
+        layout::invalidate_stats();
         let kept: Vec<&String> = self.rows.iter().filter(|r| r.turn <= keep_turn).filter_map(|r| r.agent_id.as_ref()).collect();
         if !kept.is_empty() {
             let dir = dest.with_extension("").join("subagents");
@@ -1248,8 +1340,8 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str) 
 /// pretty JSON for tool input, or the whole block's JSON with `whole`.
 fn edit_block(st: &mut State, ri: usize, whole: bool, profiles: &[Profile], mark: i64) -> std::io::Result<()> {
     let r = &st.rows[ri];
-    let blocks = blocks_of(&st.doc[r.line]);
-    let Some(block) = blocks.get(r.blk) else { return Ok(()) };
+    let Some(block) = block_at(&st.doc[r.line], r.blk) else { return Ok(()) };
+    let block = &block;
     let json_mode = whole || r.kind == Kind::Tool || r.kind == Kind::Mcp || r.kind == Kind::Agent;
     let original = if whole { serde_json::to_string_pretty(block).unwrap_or_default() } else { block_body(block) };
     let ext = if json_mode { "json" } else { "txt" };
@@ -1342,8 +1434,8 @@ fn edit_block(st: &mut State, ri: usize, whole: bool, profiles: &[Profile], mark
 /// Full-screen, scrollable read-only view of one block's whole payload.
 fn read_full(st: &State, ri: usize, header: &[String]) -> std::io::Result<()> {
     let r = &st.rows[ri];
-    let blocks = blocks_of(&st.doc[r.line]);
-    let Some(block) = blocks.get(r.blk) else { return Ok(()) };
+    let Some(block) = block_at(&st.doc[r.line], r.blk) else { return Ok(()) };
+    let block = &block;
     let body = if r.kind == Kind::Agent && r.agent_id.is_some() {
         format!("{}\n\n— subagent {} · prompt —\n{}", block_body(block), r.agent_id.as_deref().unwrap_or(""), r.agent_prompt)
     } else {
@@ -1368,7 +1460,7 @@ fn read_full(st: &State, ri: usize, header: &[String]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn doc() -> Vec<L> {
+    fn doc() -> Doc {
         let lines = [
             r#"{"type":"last-prompt","leafUuid":"u4"}"#,
             r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"hello there"}}"#,
@@ -1378,7 +1470,7 @@ mod tests {
             r#"{"type":"assistant","uuid":"u4","parentUuid":"u3","message":{"role":"assistant","content":[{"type":"text","text":"done, found a.txt"}]}}"#,
             r#"{"type":"attachment","uuid":"u5","parentUuid":"u4"}"#,
         ];
-        lines.iter().map(|s| L::parse(s)).collect()
+        lines.iter().map(|s| Arc::new(L::parse(s))).collect()
     }
 
     #[test]
@@ -1419,7 +1511,7 @@ mod tests {
         assert!(d.iter().any(|l| l.ty() == "last-prompt"));
         assert!(d.iter().all(|l| l.uuid() != Some("u4") && l.uuid() != Some("u5")));
         let lp = d.iter().find(|l| l.ty() == "last-prompt").unwrap();
-        assert_eq!(lp.v.as_ref().unwrap()["leafUuid"], "u3");
+        assert!(lp.out().contains("\"leafUuid\":\"u3\""));
     }
 
     #[test]
@@ -1456,7 +1548,16 @@ mod tests {
     #[ignore]
     fn real_session_smoke() {
         let p = std::env::var("TRANSCRIPT_FILE").expect("TRANSCRIPT_FILE");
+        let t0 = std::time::Instant::now();
         let st = State::load(Path::new(&p), "x", "t").unwrap();
+        println!("State::load: {:?}", t0.elapsed());
+        let t1 = std::time::Instant::now();
+        let snap = st.doc.clone();
+        println!("one undo snapshot (doc.clone): {:?} ({} lines)", t1.elapsed(), snap.len());
+        drop(snap);
+        let t2 = std::time::Instant::now();
+        let _ = build_rows(&st.doc, &st.agent_dir);
+        println!("build_rows: {:?}", t2.elapsed());
         let agents = st.rows.iter().filter(|r| r.kind == Kind::Agent).count();
         let with_id = st.rows.iter().filter(|r| r.agent_id.is_some()).count();
         println!("lines {} rows {} turns {} agents {} (with subagent id {})", st.doc.len(), st.rows.len(), st.turns0, agents, with_id);
@@ -1475,13 +1576,13 @@ mod tests {
 
     #[test]
     fn who_labels_tool_output_vs_user_answers() {
-        let d: Vec<L> = [
+        let d: Doc = [
             r#"{"type":"user","uuid":"a","message":{"role":"user","content":"hi"}}"#,
             r#"{"type":"assistant","uuid":"b","parentUuid":"a","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{}},{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
             r#"{"type":"user","uuid":"c","parentUuid":"b","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"User answered: yes"},{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
         ]
         .iter()
-        .map(|s| L::parse(s))
+        .map(|s| Arc::new(L::parse(s)))
         .collect();
         let rows = build_rows(&d, Path::new("."));
         let whos: Vec<&str> = rows.iter().map(|r| r.who).collect();
