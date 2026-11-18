@@ -19,6 +19,7 @@ mod sidebar;
 mod settings;
 mod statusline;
 mod sync;
+mod transcript;
 mod handoff;
 mod ui;
 mod worktree;
@@ -280,7 +281,8 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             picker::ListOption { label: "System prompt".into(), value: "prompt".into(), note: Some("appended only when resuming this session".into()) },
             picker::ListOption { label: "Rename".into(), value: "rename".into(), note: Some("set a custom title".into()) },
             picker::ListOption { label: "Clone here".into(), value: "clone".into(), note: Some("fork into a new independent session".into()) },
-            picker::ListOption { label: "Edit transcript".into(), value: "edit".into(), note: Some("open raw .jsonl in $EDITOR (risky)".into()) },
+            picker::ListOption { label: "Edit transcript".into(), value: "edit".into(), note: Some("blocks, tool calls, search, delete, truncate".into()) },
+            picker::ListOption { label: "Edit raw .jsonl".into(), value: "rawedit".into(), note: Some("every line as-is (risky)".into()) },
             picker::ListOption { label: "Delete".into(), value: "delete".into(), note: Some("remove this session permanently".into()) },
         ];
         let choice = picker::choose_from_list(profiles, mark, "What do you want to do with it?", None, &action_options, None)?;
@@ -351,9 +353,16 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
             }
             "edit" => {
                 if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
+                    let (name, summary) = session::session_preview(&file.file);
+                    let title = session_label(file, &name, &summary);
+                    transcript::run(profiles, mark, &file.file, &id, &title)?;
+                    // fall through: stay on action menu
+                }
+            }
+            "rawedit" => {
+                if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
                     let title = format!("transcript — {}", &id[..id.len().min(8)]);
                     editor::edit_file(&file.file, profiles, mark, Some(&title))?;
-                    // fall through: stay on action menu
                 }
             }
             "delete" => {
