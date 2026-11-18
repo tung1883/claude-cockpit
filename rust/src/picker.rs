@@ -12,7 +12,6 @@ pub enum Action {
     Add,
     Import,
     Sync(String),
-    Handoff(String),
     Delete(String),
     Refresh,
     Shell,
@@ -59,16 +58,16 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
             lines.push(format!("  {} a detached session is running", ui::color::orange(ui::glyph::spark())));
         }
         let row1: Vec<(&str, &str)> =
-            vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("h", "handoff"), ("m", "memory"), ("q", "quit")];
+            vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("m", "memory"), (",", "settings"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
-            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), ("/", "sessions"), (",", "settings")];
+            vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), ("/", "sessions")];
         if has_session {
             row2.push(("^B", "resume"));
         }
         lines.extend(layout::hint_grid(&[&row1, &row2], 16));
         ui::repaint(&lines);
 
-        let key = crate::input::gate_vim(read_key()?, &['h']);
+        let key = crate::input::gate_vim(read_key()?, &[]);
         if crate::input::vim_jump(&key, &mut selected, profiles.len(), 8, false) { continue; }
         let quit = (key.ctrl && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Char('q')
@@ -122,10 +121,6 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
             KeyCode::Char('s') => {
                 ui::show_cursor();
                 return Ok(Action::Sync(profiles[selected].name.clone()));
-            }
-            KeyCode::Char('h') => {
-                ui::show_cursor();
-                return Ok(Action::Handoff(profiles[selected].name.clone()));
             }
             KeyCode::Char('d') => {
                 ui::show_cursor();

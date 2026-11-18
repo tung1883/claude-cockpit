@@ -534,7 +534,6 @@ fn cockpit() -> Result<()> {
             Action::Open(n)
             | Action::Detail(n)
             | Action::Sync(n)
-            | Action::Handoff(n)
             | Action::Delete(n)
             | Action::Memory(n)
             | Action::Settings(n) => profiles.iter().position(|p| &p.name == n),
@@ -1148,12 +1147,6 @@ fn cockpit() -> Result<()> {
                     eprintln!("{}", ui::color::red(&format!("Error: {e}")));
                 }
                 picker::prompt_line("Press Enter to return to the menu...")?;
-            }
-            Action::Handoff(name) => {
-                // The session browser for this account; Enter on a session
-                // offers "Hand off" among its actions.
-                let m = mark.map(|m| m as i64).unwrap_or(-1);
-                sessions::run(&mut term, &profiles, m, sessions::Scope::Account(name.clone()))?;
             }
         }
     }
