@@ -153,7 +153,7 @@ fn folder_row_text(g: &session::SessionGroup) -> String {
 /// terminal title. Pick value is "recent:group:session".
 pub fn recent_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
     let recent = session::recent_sessions(groups, 5);
-    capped_section("Recent sessions", recent.len(), "", |i| {
+    let rows = capped_section("Recent sessions", recent.len(), "", |i| {
         let (gi, si) = recent[i];
         let s = &groups[gi].sessions[si];
         let (title, summary) = session::session_preview(&s.file);
@@ -167,7 +167,9 @@ pub fn recent_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {
             color::dim(&format!("{}·  {}", pad_to(&age, 14), folder))
         );
         (format!("recent:{gi}:{si}"), text)
-    })
+    });
+    session::flush_preview_cache();
+    rows
 }
 
 pub fn folder_rows(groups: &[session::SessionGroup]) -> Vec<ScrollRow> {

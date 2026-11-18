@@ -259,6 +259,7 @@ fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile],
         });
         out
     };
+    session::flush_preview_cache();
     let options: Vec<picker::ListOption> = group
         .sessions
         .iter()

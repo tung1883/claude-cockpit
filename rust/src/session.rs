@@ -140,6 +140,82 @@ pub struct SessionGroup {
 /// bounded tail slice (recap/last prompt) — those almost always live near
 /// the end of the file anyway, and a preview doesn't need perfect accuracy.
 pub fn session_preview(path: &std::path::Path) -> (String, String) {
+    let sig = std::fs::metadata(path).ok().map(|m| (modified_ms(&m), m.len()));
+    let key = path.to_string_lossy().to_string();
+    if let Some((ms, len)) = sig {
+        if let Some(hit) = previews().lock().ok().and_then(|c| c.map.get(&key).filter(|e| e.mtime_ms == ms && e.len == len).map(|e| (e.name.clone(), e.summary.clone()))) {
+            return hit;
+        }
+    }
+    let (name, mut summary) = compute_preview(path);
+    // Only the first few dozen characters are ever shown; don't keep (or write
+    // to disk) a whole pasted prompt.
+    if summary.chars().count() > 300 {
+        summary = summary.chars().take(300).collect();
+    }
+    if let (Some((ms, len)), Ok(mut c)) = (sig, previews().lock()) {
+        c.map.insert(key, PreviewEntry { mtime_ms: ms, len, name: name.clone(), summary: summary.clone() });
+        c.dirty = true;
+    }
+    (name, summary)
+}
+
+fn modified_ms(m: &std::fs::Metadata) -> u64 {
+    m.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// What a session list row shows for each transcript — title and a one-line
+/// recap — remembered on disk, keyed by the file's size and modified time, so a
+/// folder with hundreds of sessions does not re-read every transcript's tail on
+/// every visit. A session that was resumed (or renamed) changes size and mtime
+/// and is simply read again.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct PreviewEntry {
+    mtime_ms: u64,
+    len: u64,
+    name: String,
+    summary: String,
+}
+
+#[derive(Default)]
+struct PreviewCache {
+    map: std::collections::HashMap<String, PreviewEntry>,
+    dirty: bool,
+}
+
+fn previews_path() -> PathBuf {
+    paths::root().join("preview-cache.json")
+}
+
+fn previews() -> &'static std::sync::Mutex<PreviewCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<PreviewCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let map = fs::read_to_string(previews_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        std::sync::Mutex::new(PreviewCache { map, dirty: false })
+    })
+}
+
+/// Writes new preview entries to disk (a no-op when nothing changed). Call
+/// after a batch of `session_preview` calls.
+pub fn flush_preview_cache() {
+    let Ok(mut c) = previews().lock() else { return };
+    if !c.dirty {
+        return;
+    }
+    // Entries for sessions that no longer exist would pile up forever.
+    if c.map.len() > 3000 {
+        c.map.retain(|k, _| std::path::Path::new(k).exists());
+    }
+    if let Ok(json) = serde_json::to_string(&c.map) {
+        let path = previews_path();
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            c.dirty = false;
+        }
+    }
+}
+
+fn compute_preview(path: &std::path::Path) -> (String, String) {
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
     let mut session_name = String::new();
@@ -444,6 +520,25 @@ mod bench {
     use super::*;
     use std::time::Instant;
 
+    #[test]
+    fn preview_cache_follows_the_file() {
+        let path = std::env::temp_dir().join(format!("cockpit-preview-test-{}.jsonl", std::process::id()));
+        let line = |t: &str| format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{t}\"}}}}
+");
+        std::fs::write(&path, line("first prompt")).unwrap();
+        assert_eq!(session_preview(&path).1, "first prompt");
+        assert_eq!(session_preview(&path).1, "first prompt", "second call is served from the cache");
+        // a resumed session changes size/mtime and must be read again
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, line("second prompt").as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(session_preview(&path).1, "second prompt");
+        // only a short recap is kept
+        std::fs::write(&path, line(&"x".repeat(5000))).unwrap();
+        assert_eq!(session_preview(&path).1.chars().count(), 300);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Timing harness for the real profiles on this machine:
     /// `cargo test --release bench_hot -- --ignored --nocapture`
     #[test]
@@ -476,7 +571,13 @@ mod bench {
         for s in &biggest.sessions {
             let _ = session_preview(&s.file);
         }
-        println!("session_preview serial x{} in '{}': {:?}", biggest.sessions.len(), biggest.folder, t.elapsed());
+        println!("session_preview serial x{} in '{}' (cold or warm cache): {:?}", biggest.sessions.len(), biggest.folder, t.elapsed());
+        let t = Instant::now();
+        for s in &biggest.sessions {
+            let _ = compute_preview(&s.file);
+        }
+        println!("  same, always reading the files (no cache): {:?}", t.elapsed());
+        flush_preview_cache();
         let mut big: Vec<&SessionFile> = g.iter().flat_map(|g| g.sessions.iter()).collect();
         big.sort_by_key(|s| std::cmp::Reverse(std::fs::metadata(&s.file).map(|m| m.len()).unwrap_or(0)));
         if let Some(s) = big.first() {
