@@ -22,7 +22,7 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, Key
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,11 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     dirty: Arc<AtomicBool>,
+    /// Bumped whenever what the pane shows changes (output, resize, scroll). The
+    /// shared `dirty` flag only says "repaint something"; this says *which* pane
+    /// changed, so a frame can reuse the rendered rows of the panes that did not.
+    gen: Arc<AtomicU64>,
+    rows_cache: Mutex<Option<RowCache>>,
     /// What the pane's program reported over OSC 7501; written by the reader
     /// thread, read by the UI loop (status badge, notifications).
     reported: Arc<Mutex<osc7501::Reports>>,
@@ -78,6 +83,7 @@ fn send_to_pane(pane: &Pane, bytes: &[u8]) {
     if let Ok(mut p) = pane.parser.lock() {
         if p.screen().scrollback() > 0 {
             p.set_scrollback(0);
+            pane.gen.fetch_add(1, Ordering::Relaxed);
             pane.dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -307,6 +313,8 @@ fn spawn_pane_cmd(
     let dirty = Arc::new(AtomicBool::new(true));
     let parser_bg = parser.clone();
     let dirty_bg = dirty.clone();
+    let gen = Arc::new(AtomicU64::new(0));
+    let gen_bg = gen.clone();
     let reported = Arc::new(Mutex::new(osc7501::Reports::default()));
     let reported_bg = reported.clone();
     let writer_bg = writer.clone();
@@ -319,6 +327,7 @@ fn spawn_pane_cmd(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     process_output(&mut carry, &mut osc, &buf[..n], &parser_bg, &writer_bg, &reported_bg);
+                    gen_bg.fetch_add(1, Ordering::Relaxed);
                     dirty_bg.store(true, Ordering::Relaxed);
                 }
             }
@@ -335,7 +344,7 @@ fn spawn_pane_cmd(
         last_focus: 0,
         worktree: None,
     };
-    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
 
 /// Appends `;<sgr color params>` for one colour to an SGR sequence being built.
@@ -1144,6 +1153,7 @@ fn resize_pane(pane: &Pane, rows: u16, cols: u16) {
     if let Ok(mut p) = pane.parser.lock() {
         p.set_size(rows, cols);
     }
+    pane.gen.fetch_add(1, Ordering::Relaxed);
     pane.dirty.store(true, Ordering::Relaxed);
 }
 
@@ -1165,6 +1175,7 @@ fn relayout(panes: &[Pane], cols: u16, rows: u16) {
 
 fn mark_all(panes: &[Pane]) {
     for p in panes {
+        p.gen.fetch_add(1, Ordering::Relaxed);
         p.dirty.store(true, Ordering::Relaxed);
     }
 }
@@ -1715,6 +1726,27 @@ fn key_hints(pairs: &[(&str, &str)]) -> String {
 
 /// Builds one full frame (every screen line) plus the cursor escape: header,
 /// pane list beside the grid (labels + pane rows), rule and key hints.
+/// One pane's rendered rows, remembered between frames. Valid while the pane's
+/// generation and cell size are unchanged and no selection is drawn on it.
+struct RowCache {
+    gen: u64,
+    cols: u16,
+    rows: Arc<Vec<String>>,
+}
+
+impl RowCache {
+    fn lookup(cache: &Mutex<Option<RowCache>>, gen: u64, cols: u16, nrows: u16) -> Option<Arc<Vec<String>>> {
+        let c = cache.lock().ok()?;
+        let rc = c.as_ref()?;
+        (rc.gen == gen && rc.cols == cols && rc.rows.len() == nrows as usize).then(|| rc.rows.clone())
+    }
+    fn store(cache: &Mutex<Option<RowCache>>, gen: u64, cols: u16, rows: Arc<Vec<String>>) {
+        if let Ok(mut c) = cache.lock() {
+            *c = Some(RowCache { gen, cols, rows });
+        }
+    }
+}
+
 fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut SideState, toast: Option<&str>, leader: bool, sel: Option<Sel>) -> (Vec<String>, String) {
     let drawn = sidebar::drawn(panes);
     let full = sidebar::full_index(panes).is_some();
@@ -1736,6 +1768,30 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
             let off = guards[pos].screen().scrollback();
             Some((s, pos, history_len(&mut guards[pos]), off))
         });
+        // Every drawn pane's rows, rendered once per frame — or not at all when
+        // the pane has not changed since its last frame (e.g. only another pane
+        // is streaming, or only the toast/hints changed). A pane with a mouse
+        // selection is always re-rendered: the selection is part of its rows.
+        let rendered: Vec<Arc<Vec<String>>> = (0..n)
+            .map(|pos| {
+                let pane = &panes[drawn[pos]];
+                let selected_here = sel_view.is_some_and(|(_, spos, _, _)| spos == pos);
+                let gen = pane.gen.load(Ordering::Relaxed);
+                if !selected_here {
+                    if let Some(hit) = RowCache::lookup(&pane.rows_cache, gen, lay.pane_cols, lay.pane_rows) {
+                        return hit;
+                    }
+                }
+                let rows: Vec<String> = (0..lay.pane_rows)
+                    .map(|row| render_row(guards[pos].screen(), row, lay.pane_cols, sel_view.and_then(|(s, spos, len, off)| if spos == pos { s.cols_on_row(len - off + row as usize, lay.pane_cols) } else { None })))
+                    .collect();
+                let rows = Arc::new(rows);
+                if !selected_here {
+                    RowCache::store(&pane.rows_cache, gen, lay.pane_cols, rows.clone());
+                }
+                rows
+            })
+            .collect();
         for grow in 0..lay.grows {
             let labels: Vec<String> = (0..lay.gcols)
                 .map(|gc| {
@@ -1745,10 +1801,10 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
                 .collect();
             main.push(labels.join(SEP));
             for row in 0..lay.pane_rows {
-                let cells: Vec<String> = (0..lay.gcols)
+                let cells: Vec<&str> = (0..lay.gcols)
                     .map(|gc| {
                         let pos = grow * lay.gcols + gc;
-                        if pos < n { render_row(guards[pos].screen(), row, lay.pane_cols, sel_view.and_then(|(s, spos, len, off)| if spos == pos { s.cols_on_row(len - off + row as usize, lay.pane_cols) } else { None })) } else { blank.clone() }
+                        if pos < n { rendered[pos][row as usize].as_str() } else { blank.as_str() }
                     })
                     .collect();
                 main.push(cells.join(SEP));
@@ -1967,6 +2023,7 @@ fn scroll_pane(pane: &Pane, delta: isize) {
         let cur = p.screen().scrollback();
         let next = if delta >= 0 { cur.saturating_add(delta as usize) } else { cur.saturating_sub(delta.unsigned_abs()) };
         p.set_scrollback(next);
+        pane.gen.fetch_add(1, Ordering::Relaxed);
         pane.dirty.store(true, Ordering::Relaxed);
     }
 }
@@ -2910,5 +2967,16 @@ mod tests {
         }
         println!("render_row NEW: 200 frames of 60x200 in {:?} ({} bytes)", t.elapsed(), n2);
         assert_eq!(n, n2);
+    }
+
+    #[test]
+    fn row_cache_hits_only_while_unchanged() {
+        let cache: Mutex<Option<RowCache>> = Mutex::new(None);
+        assert!(RowCache::lookup(&cache, 1, 80, 2).is_none());
+        RowCache::store(&cache, 1, 80, Arc::new(vec!["a".into(), "b".into()]));
+        assert!(RowCache::lookup(&cache, 1, 80, 2).is_some());
+        assert!(RowCache::lookup(&cache, 2, 80, 2).is_none(), "pane changed");
+        assert!(RowCache::lookup(&cache, 1, 81, 2).is_none(), "pane resized (cols)");
+        assert!(RowCache::lookup(&cache, 1, 80, 3).is_none(), "pane resized (rows)");
     }
 }
