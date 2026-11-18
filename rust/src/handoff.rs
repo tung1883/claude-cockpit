@@ -23,7 +23,11 @@ fn find_session(profile_dir: &std::path::Path, session_id: &str) -> Option<PathB
     None
 }
 
-pub fn copy_session(from: &str, to: &str, session_id: &str) -> Result<(PathBuf, PathBuf)> {
+/// Copies a session to another profile and returns (source, target, thinking
+/// blocks stripped). Thinking signatures are bound to the account that made
+/// them, so the copy goes out without them or the other account rejects it
+/// ("thinking from another organization").
+pub fn copy_session(from: &str, to: &str, session_id: &str) -> Result<(PathBuf, PathBuf, usize)> {
     let from_dir = paths::profile_dir(from);
     let source = find_session(&from_dir, session_id).ok_or_else(|| anyhow::anyhow!("Session {session_id} was not found in profile '{from}'."))?;
     let relative = source.strip_prefix(&from_dir)?;
@@ -34,6 +38,8 @@ pub fn copy_session(from: &str, to: &str, session_id: &str) -> Result<(PathBuf, 
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::copy(&source, &target)?;
-    Ok((source, target))
+    let text = std::fs::read_to_string(&source)?;
+    let (out, stripped) = crate::transcript::strip_thinking(&text);
+    std::fs::write(&target, out)?;
+    Ok((source, target, stripped))
 }

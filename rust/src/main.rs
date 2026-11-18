@@ -138,8 +138,8 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
 
     ui::home_clear();
     match handoff::copy_session(from, &target, session_id) {
-        Ok(_) => {
-            println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'.")));
+        Ok((_, _, stripped)) => {
+            println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'{}.", strip_note(stripped))));
             let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
             if matches!(go.as_deref(), Some("")) {
                 let suspend = term.suspend();
@@ -209,6 +209,15 @@ fn browse_memory_dir(profiles: &[profiles::Profile], mark: i64, dir: &std::path:
 /// jumping straight into any one of them.
 /// Row label for a session: its terminal title, else a clipped first-resort
 /// summary, else the short id.
+/// Suffix for the hand-off confirmation when thinking blocks were removed.
+fn strip_note(stripped: usize) -> String {
+    if stripped == 0 {
+        String::new()
+    } else {
+        format!(" ({stripped} thinking block{} stripped — they only work on the account that made them)", if stripped == 1 { "" } else { "s" })
+    }
+}
+
 fn session_label(s: &session::SessionFile, title: &str, summary: &str) -> String {
     if !title.is_empty() {
         return title.to_string();
@@ -838,8 +847,8 @@ fn cockpit() -> Result<()> {
                             if let picker::ListChoice::Picked(candidate) = choice {
                                 ui::home_clear();
                                 match handoff::copy_session(&name, &candidate, &latest.id) {
-                                    Ok(_) => {
-                                        println!("{}", ui::color::green(&format!("Copied session {} to '{candidate}'.", latest.id)));
+                                    Ok((_, _, stripped)) => {
+                                        println!("{}", ui::color::green(&format!("Copied session {} to '{candidate}'{}.", latest.id, strip_note(stripped))));
                                         let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
                                         if matches!(go.as_deref(), Some("")) {
                                             let suspend = term.suspend();
@@ -1290,8 +1299,8 @@ fn main() -> Result<()> {
             let to = args.get(3).cloned().unwrap_or_default();
             profiles::get_profile(&from)?;
             profiles::get_profile(&to)?;
-            handoff::copy_session(&from, &to, &session_id).map(|_| {
-                println!("Copied session {session_id} to '{to}'. Run: claude-cockpit run {to} --resume {session_id}");
+            handoff::copy_session(&from, &to, &session_id).map(|(_, _, stripped)| {
+                println!("Copied session {session_id} to '{to}'{}. Run: claude-cockpit run {to} --resume {session_id}", strip_note(stripped));
             })
         }
         Some("statusline") => {
