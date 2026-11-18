@@ -338,22 +338,32 @@ fn spawn_pane_cmd(
     Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
 
-fn color_code(c: vt100::Color, fg: bool) -> String {
-    match c {
-        vt100::Color::Default => (if fg { "39" } else { "49" }).to_string(),
-        vt100::Color::Idx(n) if n < 8 => (if fg { 30 + n } else { 40 + n }).to_string(),
-        vt100::Color::Idx(n) if n < 16 => (if fg { 90 + (n - 8) } else { 100 + (n - 8) }).to_string(),
-        vt100::Color::Idx(n) => format!("{};5;{n}", if fg { 38 } else { 48 }),
-        vt100::Color::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", if fg { 38 } else { 48 }),
-    }
+/// Appends `;<sgr color params>` for one colour to an SGR sequence being built.
+fn push_color(out: &mut String, c: vt100::Color, fg: bool) {
+    use std::fmt::Write;
+    let _ = match c {
+        vt100::Color::Default => write!(out, ";{}", if fg { 39 } else { 49 }),
+        vt100::Color::Idx(n) if n < 8 => write!(out, ";{}", if fg { 30 + n } else { 40 + n }),
+        vt100::Color::Idx(n) if n < 16 => write!(out, ";{}", if fg { 90 + (n - 8) } else { 100 + (n - 8) }),
+        vt100::Color::Idx(n) => write!(out, ";{};5;{n}", if fg { 38 } else { 48 }),
+        vt100::Color::Rgb(r, g, b) => write!(out, ";{};2;{r};{g};{b}", if fg { 38 } else { 48 }),
+    };
 }
 
+/// Everything about a cell that changes the SGR escape in front of it.
+type CellStyle = (bool, bool, bool, bool, vt100::Color, vt100::Color);
+
+/// One row of a pane as terminal text. This runs for every row of every pane on
+/// every repaint (and Claude streaming output repaints constantly), so it works
+/// on the cell's attributes directly and writes into one buffer: the old version
+/// built a few temporary Strings per *cell* just to find out the style had not
+/// changed.
 fn render_row(screen: &vt100::Screen, row: u16, width: u16, selected: Option<(u16, u16)>) -> String {
-    let mut out = String::new();
-    // The SGR currently in effect; a new escape is emitted only when a cell's
-    // style differs from the previous one, so a mostly-plain row costs a
-    // handful of escapes instead of one per cell.
-    let mut current = String::new();
+    let mut out = String::with_capacity(width as usize + 32);
+    // The style in effect; a new escape is emitted only when a cell's style
+    // differs from the previous one, so a mostly-plain row costs a handful of
+    // escapes instead of one per cell.
+    let mut current: Option<CellStyle> = None;
     for col in 0..width {
         let Some(cell) = screen.cell(row, col) else {
             out.push(' ');
@@ -366,33 +376,33 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16, selected: Option<(u1
         if cell.is_wide_continuation() {
             continue;
         }
-        let mut codes = Vec::new();
-        if cell.bold() {
-            codes.push("1".to_string());
-        }
-        if cell.italic() {
-            codes.push("3".to_string());
-        }
-        if cell.underline() {
-            codes.push("4".to_string());
-        }
         // The mouse selection is drawn as reverse video (toggled, so already
         // inverse text stays visible).
-        if cell.inverse() != selected.is_some_and(|(a, b)| col >= a && col <= b) {
-            codes.push("7".to_string());
+        let inverse = cell.inverse() != selected.is_some_and(|(a, b)| col >= a && col <= b);
+        let style: CellStyle = (cell.bold(), cell.italic(), cell.underline(), inverse, cell.fgcolor(), cell.bgcolor());
+        if current != Some(style) {
+            out.push_str("\x1b[0");
+            if style.0 {
+                out.push_str(";1");
+            }
+            if style.1 {
+                out.push_str(";3");
+            }
+            if style.2 {
+                out.push_str(";4");
+            }
+            if style.3 {
+                out.push_str(";7");
+            }
+            push_color(&mut out, style.4, true);
+            push_color(&mut out, style.5, false);
+            out.push('m');
+            current = Some(style);
         }
-        codes.push(color_code(cell.fgcolor(), true));
-        codes.push(color_code(cell.bgcolor(), false));
-        let sgr = codes.join(";");
-        if sgr != current {
-            out.push_str(&format!("\x1b[0;{sgr}m"));
-            current = sgr;
-        }
-        let contents = cell.contents();
-        if contents.is_empty() {
-            out.push(' ');
+        if cell.has_contents() {
+            out.push_str(&cell.contents());
         } else {
-            out.push_str(&contents);
+            out.push(' ');
         }
     }
     out.push_str("\x1b[0m");
@@ -2793,5 +2803,112 @@ mod tests {
         assert_eq!(moved_by, 2); // new lines pushed history down by two...
         let sel = Sel { pane: 0, anchor: (before, 0), head: (before, 19) };
         assert_eq!(extract_selection(&mut p, &sel), shown.trim_end()); // ...but the selection still reads the same line
+    }
+
+
+    // The previous implementation, kept here to prove the rewrite renders identically.
+    fn color_code_old(c: vt100::Color, fg: bool) -> String {
+        match c {
+            vt100::Color::Default => (if fg { "39" } else { "49" }).to_string(),
+            vt100::Color::Idx(n) if n < 8 => (if fg { 30 + n } else { 40 + n }).to_string(),
+            vt100::Color::Idx(n) if n < 16 => (if fg { 90 + (n - 8) } else { 100 + (n - 8) }).to_string(),
+            vt100::Color::Idx(n) => format!("{};5;{n}", if fg { 38 } else { 48 }),
+            vt100::Color::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", if fg { 38 } else { 48 }),
+        }
+    }
+
+    fn render_row_old(screen: &vt100::Screen, row: u16, width: u16, selected: Option<(u16, u16)>) -> String {
+        let mut out = String::new();
+        let mut current = String::new();
+        for col in 0..width {
+            let Some(cell) = screen.cell(row, col) else {
+                out.push(' ');
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut codes = Vec::new();
+            if cell.bold() {
+                codes.push("1".to_string());
+            }
+            if cell.italic() {
+                codes.push("3".to_string());
+            }
+            if cell.underline() {
+                codes.push("4".to_string());
+            }
+            if cell.inverse() != selected.is_some_and(|(a, b)| col >= a && col <= b) {
+                codes.push("7".to_string());
+            }
+            codes.push(color_code_old(cell.fgcolor(), true));
+            codes.push(color_code_old(cell.bgcolor(), false));
+            let sgr = codes.join(";");
+            if sgr != current {
+                out.push_str(&format!("\x1b[0;{sgr}m"));
+                current = sgr;
+            }
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.push(' ');
+            } else {
+                out.push_str(&contents);
+            }
+        }
+        out.push_str("\x1b[0m");
+        out
+    }
+
+    #[test]
+    fn render_row_styles_and_wide_chars() {
+        let mut p = vt100::Parser::new(3, 16, 0);
+        p.process(b"plain \x1b[1;31mred\x1b[0m \x1b[48;2;1;2;3mrgb\x1b[0m\r\n\xe4\xbd\xa0\xe5\xa5\xbd ok");
+        let r0 = render_row(p.screen(), 0, 16, None);
+        assert!(r0.starts_with("\x1b[0;39;49mplain "), "{r0:?}");
+        assert!(r0.contains("\x1b[0;1;31;49mred"), "{r0:?}");
+        assert!(r0.contains("\x1b[0;39;48;2;1;2;3mrgb"), "{r0:?}");
+        assert!(r0.ends_with("\x1b[0m"));
+        // double-width glyphs: no filler for the continuation cell
+        let r1 = render_row(p.screen(), 1, 16, None);
+        assert!(r1.contains("你好 ok"), "{r1:?}");
+        // selection toggles reverse video
+        for sel in [None, Some((0, 2)), Some((3, 9))] {
+            for r in 0..3 {
+                assert_eq!(render_row(p.screen(), r, 16, sel), render_row_old(p.screen(), r, 16, sel));
+            }
+        }
+        let sel = render_row(p.screen(), 0, 16, Some((0, 2)));
+        assert!(sel.starts_with("\x1b[0;7;39;49m"), "{sel:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_render_row() {
+        let mut p = vt100::Parser::new(60, 200, 0);
+        for r in 0..60 {
+            let line = format!("\x1b[3{}m{}\x1b[0m \x1b[1;38;5;{}mbold text\x1b[0m\r\n", r % 7 + 1, "lorem ipsum ".repeat(12), r);
+            p.process(line.as_bytes());
+        }
+        for r in 0..60 {
+            assert_eq!(render_row(p.screen(), r, 200, None), render_row_old(p.screen(), r, 200, None));
+            assert_eq!(render_row(p.screen(), r, 200, Some((3, 40))), render_row_old(p.screen(), r, 200, Some((3, 40))));
+        }
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for _ in 0..200 {
+            for r in 0..60 {
+                n += render_row_old(p.screen(), r, 200, None).len();
+            }
+        }
+        println!("render_row OLD: 200 frames of 60x200 in {:?} ({} bytes)", t.elapsed(), n);
+        let t = std::time::Instant::now();
+        let mut n2 = 0usize;
+        for _ in 0..200 {
+            for r in 0..60 {
+                n2 += render_row(p.screen(), r, 200, None).len();
+            }
+        }
+        println!("render_row NEW: 200 frames of 60x200 in {:?} ({} bytes)", t.elapsed(), n2);
+        assert_eq!(n, n2);
     }
 }
