@@ -1200,7 +1200,9 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str) 
     let mut base: HashSet<(usize, usize)> = HashSet::new();
     ui::hide_cursor();
     loop {
-        let (tw, th) = crossterm::terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((100, 30));
+        // One row short of the terminal: a frame that fills every row scrolls the
+        // screen by one line on the last write (the header would be pushed off).
+        let (tw, th) = crossterm::terminal::size().map(|(w, h)| (w as usize, (h as usize).saturating_sub(1))).unwrap_or((100, 29));
         let vis = st.visible();
         if st.sel >= vis.len() {
             st.sel = vis.len().saturating_sub(1);
