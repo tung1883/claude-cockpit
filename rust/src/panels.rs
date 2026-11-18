@@ -1282,8 +1282,7 @@ fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::Pa
             format!("{PREFIX}{}", edit.buf),
             if error.is_empty() { String::new() } else { ui::color::red(&format!("   {error}")) },
         ];
-        ui::repaint(&lines);
-        ui::move_cursor(3, edit.col(PREFIX.len()));
+        ui::repaint_at(&lines, 3, edit.col(PREFIX.len()));
         let key = read_key()?;
         match key.code {
             KeyCode::Esc => break None,
@@ -1367,11 +1366,10 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
             (true, _) => ui::color::dim("   Enter create · Esc back"),
             (false, _) => ui::color::dim("   Enter confirm · Esc cancel"),
         });
-        ui::repaint(&lines);
         if on_name {
-            ui::move_cursor(5, name_edit.col(NAME_PREFIX.len()));
+            ui::repaint_at(&lines, 5, name_edit.col(NAME_PREFIX.len()));
         } else {
-            ui::move_cursor(3, dir.col(DIR_PREFIX.len()));
+            ui::repaint_at(&lines, 3, dir.col(DIR_PREFIX.len()));
         }
         let key = read_key()?;
         if on_name {

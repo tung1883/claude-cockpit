@@ -111,11 +111,6 @@ pub fn hide_cursor() {
 pub fn show_cursor() {
     write_raw("\x1b[?25h");
 }
-/// Move cursor to 1-based (row, col).
-pub fn move_cursor(row: usize, col: usize) {
-    write_raw(&format!("\x1b[{row};{col}H"));
-}
-
 /// Cuts `s` down to `max` visible columns, passing every ANSI SGR escape
 /// (`\x1b...m`) through untouched (so a color/reset code past the cutoff —
 /// e.g. a trailing reset) still survives) but dropping plain characters
@@ -220,6 +215,19 @@ pub fn repaint_diff(prev: &[String], lines: &[String]) -> String {
         out.push_str(&format!("\x1b[{};1H\x1b[0J", lines.len() + 1));
     }
     out
+}
+
+/// Paints `lines` and parks the visible cursor at 1-based (row, col) in ONE
+/// write: hide cursor, paint, move, show. Painting and moving in two writes
+/// lets the terminal draw a frame with the cursor sitting wherever the paint
+/// ended (the top-left, or the footer) — a visible second cursor while typing.
+pub fn repaint_at(lines: &[String], row: usize, col: usize) {
+    if !enabled() {
+        println!("{}", lines.join("
+"));
+        return;
+    }
+    write_raw(&format!("[?25l{}[{row};{col}H[?25h", repaint_body(lines)));
 }
 
 pub fn repaint(lines: &[String]) {
