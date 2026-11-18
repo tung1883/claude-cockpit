@@ -834,7 +834,7 @@ fn pick_pane_target(
         ) + &if show_box { format!("   {} queue", ui::color::dim("Tab")) } else { String::new() });
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &[]);
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);

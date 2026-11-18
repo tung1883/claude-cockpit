@@ -1,5 +1,6 @@
 use crate::paths;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Which channel `notify*.ps1` uses for a hook event — a single tri-state
 /// instead of two independent on/off toggles, since "both at once" wasn't
@@ -62,6 +63,11 @@ struct Settings {
     /// there rather than needing an explicit unhide action.
     #[serde(default)]
     hidden_notes_projects: Vec<String>,
+    /// j/k/h/l as navigation keys in lists (alongside the arrow keys).
+    /// Default on — that's how every list already behaved before this
+    /// became a setting.
+    #[serde(default = "default_true")]
+    vim_bindings: bool,
 }
 
 fn default_true() -> bool {
@@ -70,7 +76,7 @@ fn default_true() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { notes_enabled: false, session_wrapped: true, notify_mode: NotifyMode::default(), hidden_notes_projects: Vec::new() }
+        Settings { notes_enabled: false, session_wrapped: true, notify_mode: NotifyMode::default(), hidden_notes_projects: Vec::new(), vim_bindings: true }
     }
 }
 
@@ -106,6 +112,29 @@ pub fn set_session_wrapped(enabled: bool) {
     let mut settings = load();
     settings.session_wrapped = enabled;
     save(&settings);
+}
+
+// 0 = off, 1 = on, 2 = not read from disk yet. Navigation screens ask on every
+// keypress, so this caches the flag instead of re-reading settings.json each time.
+static VIM: AtomicU8 = AtomicU8::new(2);
+
+pub fn vim_bindings() -> bool {
+    match VIM.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = load().vim_bindings;
+            VIM.store(on as u8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub fn set_vim_bindings(enabled: bool) {
+    let mut settings = load();
+    settings.vim_bindings = enabled;
+    save(&settings);
+    VIM.store(enabled as u8, Ordering::Relaxed);
 }
 
 pub fn notify_mode() -> NotifyMode {

@@ -67,7 +67,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
         lines.extend(layout::hint_grid(&[&row1, &row2], 16));
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &['h']);
         let quit = (key.ctrl && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Char('q')
             || key.code == KeyCode::Esc;
@@ -163,7 +163,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
 pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Result<()> {
     use crate::settings::NotifyMode;
     const NOTIFY_ROW: usize = 2;
-    const GLOBAL_COUNT: usize = 3;
+    const GLOBAL_COUNT: usize = 4;
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let count = GLOBAL_COUNT + profiles.len();
     let mut selected = 0usize;
@@ -172,28 +172,24 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         let wrapped = crate::settings::session_wrapped();
         let notes = crate::settings::notes_enabled();
         let mode = crate::settings::notify_mode();
+        let vim = crate::settings::vim_bindings();
         let mode_text = if mode == NotifyMode::Off { ui::color::dim(mode.label()) } else { ui::color::green(mode.label()).to_string() };
-        let global_rows: [(&str, String); GLOBAL_COUNT] = [
-            (
-                "Launch sessions wrapped",
-                if wrapped {
-                    format!("{}   (/shell, panels, Ctrl+B detach)", ui::color::green("on"))
-                } else {
-                    format!("{}  (native Claude — full mouse/paste fidelity)", ui::color::dim("off"))
-                },
-            ),
-            (
-                "Notes (TODO.md + PLAN.md per project)",
-                if notes { ui::color::green("on").to_string() } else { ui::color::dim("off").to_string() },
-            ),
-            ("Notifications", format!("{}   (needs input / finished)", mode_text)),
+        let onoff = |on: bool| if on { ui::color::green("on").to_string() } else { ui::color::dim("off").to_string() };
+        // (label, value, note) — values are padded to one column so every
+        // "(...)" note starts at the same place.
+        let global_rows: [(&str, String, &str); GLOBAL_COUNT] = [
+            ("Launch sessions wrapped", onoff(wrapped), if wrapped { "(+ panels, /shell, detach)" } else { "(native Claude)" }),
+            ("Notes (TODO.md + PLAN.md per project)", onoff(notes), ""),
+            ("Notifications", mode_text, "(needs input / finished)"),
+            ("Vim bindings", onoff(vim), ""),
         ];
         let mut lines = layout::account_lines(profiles, selected_account, &stats);
         lines.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Settings")));
         lines.push(String::new());
-        for (i, (label, value)) in global_rows.iter().enumerate() {
+        for (i, (label, value, note)) in global_rows.iter().enumerate() {
             let pointer = if i == selected { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-            lines.push(format!(" {pointer} {}  {value}", layout::pad_to(label, 44)));
+            let note = if note.is_empty() { String::new() } else { ui::color::dim(note) };
+            lines.push(format!(" {pointer} {}  {}{note}", layout::pad_to(label, 44), layout::pad_to(value, 10)).trim_end().to_string());
         }
         lines.push(String::new());
         lines.push(ui::color::dim("  Profile settings (Claude Code)"));
@@ -212,7 +208,7 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         lines.push(ui::color::dim(&format!("↑/↓ move · Enter change · {}/Esc back", ui::glyph::back())));
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &[]);
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q')) || (key.ctrl && key.code == KeyCode::Char('c'));
         if back {
             ui::show_cursor();
@@ -227,6 +223,7 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
                         0 => crate::settings::set_session_wrapped(!wrapped),
                         1 => crate::settings::set_notes_enabled(!notes),
                         NOTIFY_ROW => crate::settings::set_notify_mode(mode.cycle(true)),
+                        3 => crate::settings::set_vim_bindings(!vim),
                         _ => {}
                     }
                 } else {
@@ -394,7 +391,7 @@ pub fn choose_from_list_lazy(
         ));
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &[]);
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
@@ -473,6 +470,9 @@ pub fn scroll_screen_ext(
         .unwrap_or(0);
     let mut top = 0usize;
     let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(header.len() + 5).max(5);
+    // Letters this screen gives its own meaning to (open-externally, command,
+    // row action) must survive the vim-navigation gate even when it's off.
+    let keep_keys: Vec<char> = [external_key, command_key.map(|(k, _)| k), row_action_key.map(|(k, _)| k)].into_iter().flatten().collect();
     ui::hide_cursor();
 
     // Which group header (if any) each selectable row belongs to, so
@@ -538,7 +538,7 @@ pub fn scroll_screen_ext(
         lines.push(format!(" {} move{open_hint}{ext_hint}{cmd_hint}{row_hint}    {} back", ui::color::dim("↑/↓"), ui::color::dim(&format!("{}/Esc", ui::glyph::back()))));
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &keep_keys);
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
@@ -693,7 +693,7 @@ pub fn choose_multi(
         ));
         ui::repaint(&lines);
 
-        let key = read_key()?;
+        let key = crate::input::gate_vim(read_key()?, &[]);
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);

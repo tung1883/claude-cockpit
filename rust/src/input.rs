@@ -11,6 +11,21 @@ pub struct Key {
     pub alt: bool,
 }
 
+/// j/k/h/l navigation is a Settings toggle. With it off, those letters are
+/// turned into a no-op (`Null`) on list screens. `keep` lists letters that are
+/// real actions on that screen (hide/handoff/Keep, ...) and must still pass.
+/// Only call this from navigation screens, never from text entry.
+pub fn gate_vim(mut key: Key, keep: &[char]) -> Key {
+    if !key.ctrl && !crate::settings::vim_bindings() {
+        if let KeyCode::Char(c @ ('j' | 'k' | 'h' | 'l')) = key.code {
+            if !keep.contains(&c) {
+                key.code = KeyCode::Null;
+            }
+        }
+    }
+    key
+}
+
 pub fn read_key() -> std::io::Result<Key> {
     loop {
         match event::read()? {
