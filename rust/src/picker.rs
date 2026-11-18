@@ -68,6 +68,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &['h']);
+        if crate::input::vim_jump(&key, &mut selected, profiles.len(), 8, false) { continue; }
         let quit = (key.ctrl && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Char('q')
             || key.code == KeyCode::Esc;
@@ -209,6 +210,7 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
+        if crate::input::vim_jump(&key, &mut selected, count, 8, true) { continue; }
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q')) || (key.ctrl && key.code == KeyCode::Char('c'));
         if back {
             ui::show_cursor();
@@ -392,6 +394,7 @@ pub fn choose_from_list_lazy(
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
+        if crate::input::vim_jump(&key, &mut selected, options.len(), 8, true) { continue; }
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
@@ -539,6 +542,7 @@ pub fn scroll_screen_ext(
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &keep_keys);
+        if crate::input::vim_jump(&key, &mut pos, selectable_idx.len(), 8, true) { continue; }
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
@@ -694,6 +698,7 @@ pub fn choose_multi(
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
+        if crate::input::vim_jump(&key, &mut selected, rows, 8, true) { continue; }
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);

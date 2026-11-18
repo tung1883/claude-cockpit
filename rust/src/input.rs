@@ -3,6 +3,7 @@
 // screen just calls this blocking read in a loop — there is no per-screen
 // enable/disable to get wrong, which is what caused the stdin-wedging bug.
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Key {
     pub code: KeyCode,
@@ -24,6 +25,34 @@ pub fn gate_vim(mut key: Key, keep: &[char]) -> Key {
         }
     }
     key
+}
+
+static LAST_G: AtomicBool = AtomicBool::new(false);
+
+/// Vim-style jumps for a list cursor: `gg` top, `G` bottom, Ctrl+d / Ctrl+u
+/// half a page. Only active with the Vim bindings setting on. Returns true when
+/// the key was one of these (the caller should just redraw). `allow_gg` is off
+/// on screens where a plain `g` already means something else.
+pub fn vim_jump(key: &Key, selected: &mut usize, len: usize, half: usize, allow_gg: bool) -> bool {
+    let g_prev = LAST_G.swap(false, Ordering::Relaxed);
+    if len == 0 || !crate::settings::vim_bindings() {
+        return false;
+    }
+    let last = len - 1;
+    match key.code {
+        KeyCode::Char('d') if key.ctrl => *selected = (*selected + half).min(last),
+        KeyCode::Char('u') if key.ctrl => *selected = selected.saturating_sub(half),
+        KeyCode::Char('G') if !key.ctrl => *selected = last,
+        KeyCode::Char('g') if !key.ctrl && allow_gg => {
+            if g_prev {
+                *selected = 0;
+            } else {
+                LAST_G.store(true, Ordering::Relaxed);
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 pub fn read_key() -> std::io::Result<Key> {

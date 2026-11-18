@@ -835,6 +835,7 @@ fn pick_pane_target(
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
+        if crate::input::vim_jump(&key, &mut selected, selectable_idx.len(), 8, true) { continue; }
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
