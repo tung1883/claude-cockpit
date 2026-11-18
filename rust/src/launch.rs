@@ -153,6 +153,12 @@ fn nonempty_content(path: &Path) -> Option<String> {
 }
 
 pub fn launch(profile: &str, args: &[String]) -> Result<i32> {
+    launch_in(profile, args, None)
+}
+
+/// Like `launch`, but runs Claude with `cwd` as its working directory (the
+/// cockpit's own folder when `None`).
+pub fn launch_in(profile: &str, args: &[String], cwd: Option<&Path>) -> Result<i32> {
     let target = claude_target();
     let mut full_args = args.to_vec();
     // Cockpit-managed, persisted system-prompt levels (see the Memory action
@@ -177,6 +183,9 @@ pub fn launch(profile: &str, args: &[String]) -> Result<i32> {
         c
     };
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     let result = cmd.status();
     if let Some(path) = &combined_path {
         let _ = std::fs::remove_file(path);
