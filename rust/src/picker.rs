@@ -240,17 +240,7 @@ pub fn settings_menu(profiles: &[Profile], selected_account: i64) -> std::io::Re
 }
 
 fn profile_settings_screen(profiles: &[Profile], profile_idx: usize, _stats: &[Stat]) -> std::io::Result<()> {
-    let profile_name = match profiles.get(profile_idx) {
-        Some(p) => p.name.clone(),
-        None => return Ok(()),
-    };
-    let path = crate::paths::profile_dir(&profile_name).join("settings.json");
-    if !path.exists() {
-        // Create empty settings.json so editor has a file to open
-        let _ = std::fs::write(&path, "{}\n");
-    }
-    let title = format!("{profile_name} › settings.json");
-    crate::editor::edit_file(&path, profiles, profile_idx as i64, Some(&title))
+    crate::account_settings::run(profiles, profile_idx)
 }
 
 pub struct ListOption {

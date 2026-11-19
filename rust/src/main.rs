@@ -1,3 +1,4 @@
+mod account_settings;
 mod clipboard;
 mod conpty;
 mod detail;
@@ -17,6 +18,7 @@ mod quota;
 mod session;
 mod sidebar;
 mod settings;
+mod settings_docs;
 mod statusline;
 mod pins;
 mod sessions;
