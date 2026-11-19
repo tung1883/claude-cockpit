@@ -55,6 +55,12 @@ fn same_path(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// `p` is `folder` or lies somewhere below it.
+fn under(p: &str, folder: &str) -> bool {
+    let (p, f) = (p.as_bytes(), folder.as_bytes());
+    p.len() >= f.len() && p[..f.len()].eq_ignore_ascii_case(f) && (p.len() == f.len() || p[f.len()] == b'/' || f.last() == Some(&b'/'))
+}
+
 /// `…/work/x` for paths under the usual work folder, `~/…` under home.
 fn short_path(p: &str) -> String {
     if let Some(home) = dirs::home_dir().map(|h| norm_path(&h.to_string_lossy())) {
@@ -573,17 +579,20 @@ impl Sess {
         self.file.to_string_lossy().to_string()
     }
     fn touches(&self, folder: &str) -> bool {
-        self.folders.iter().any(|(p, _)| same_path(p, folder))
+        self.folders.iter().any(|(p, _)| under(p, folder))
     }
     fn moved_into(&self, folder: &str) -> bool {
-        self.touches(folder) && !same_path(&self.started, folder)
+        self.touches(folder) && !under(&self.started, folder)
     }
 }
 
 struct Folder {
     path: String,
+    /// Sessions that touched this folder or any folder below it, newest first.
     sess: Vec<usize>,
     last: SystemTime,
+    /// How many folders in the list contain this one (0 = top level).
+    depth: usize,
 }
 
 struct Model {
@@ -597,6 +606,67 @@ struct Model {
 pub enum Scope {
     All,
     Account(String),
+}
+
+/// Rolls subfolders up into the folders above them and orders the list as a tree:
+/// top-level folders newest first, each followed by its subfolders (newest first,
+/// indented by `depth`). A folder's sessions include everything that touched a folder
+/// below it, so `claude-cockpit` counts its `rust/src` sessions too; a parent is
+/// never counted in its children (a session that touched `C:/` stays under `C:/`).
+fn nest(flat: Vec<Folder>) -> Vec<Folder> {
+    let n = flat.len();
+    // parent = the longest other folder that contains this one
+    let parent: Vec<Option<usize>> = (0..n)
+        .map(|i| (0..n).filter(|&j| j != i && !same_path(&flat[j].path, &flat[i].path) && under(&flat[i].path, &flat[j].path)).max_by_key(|&j| flat[j].path.len()))
+        .collect();
+    let mut sess: Vec<Vec<usize>> = flat.iter().map(|f| f.sess.clone()).collect();
+    let mut last: Vec<SystemTime> = flat.iter().map(|f| f.last).collect();
+    for i in 0..n {
+        let mut a = parent[i];
+        while let Some(j) = a {
+            let add = flat[i].sess.clone();
+            sess[j].extend(add);
+            last[j] = last[j].max(flat[i].last);
+            a = parent[j];
+        }
+    }
+    for v in sess.iter_mut() {
+        v.sort_unstable();
+        v.dedup(); // session indexes ascend with age, so this is newest first
+    }
+    let depth = |mut i: usize| {
+        let mut d = 0;
+        while let Some(j) = parent[i] {
+            d += 1;
+            i = j;
+        }
+        d
+    };
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    fn walk(i: usize, parent: &[Option<usize>], last: &[SystemTime], order: &mut Vec<usize>) {
+        order.push(i);
+        let mut kids: Vec<usize> = (0..parent.len()).filter(|&k| parent[k] == Some(i)).collect();
+        kids.sort_by(|&a, &b| last[b].cmp(&last[a]));
+        for k in kids {
+            walk(k, parent, last, order);
+        }
+    }
+    let mut roots: Vec<usize> = (0..n).filter(|&i| parent[i].is_none()).collect();
+    roots.sort_by(|&a, &b| last[b].cmp(&last[a]));
+    for r in roots {
+        walk(r, &parent, &last, &mut order);
+    }
+    let mut slots: Vec<Option<Folder>> = flat.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| {
+            let mut f = slots[i].take().unwrap();
+            f.sess = std::mem::take(&mut sess[i]);
+            f.last = last[i];
+            f.depth = depth(i);
+            f
+        })
+        .collect()
 }
 
 impl Model {
@@ -635,12 +705,11 @@ impl Model {
             for (p, _) in &s.folders {
                 match folders.iter_mut().find(|f| same_path(&f.path, p)) {
                     Some(f) => f.sess.push(i),
-                    None => folders.push(Folder { path: p.clone(), sess: vec![i], last: s.modified }),
+                    None => folders.push(Folder { path: p.clone(), sess: vec![i], last: s.modified, depth: 0 }),
                 }
             }
         }
-        // sessions are newest-first, so each folder's `last` is its first push
-        folders.sort_by(|a, b| b.last.cmp(&a.last));
+        let folders = nest(folders);
         let cwd = std::env::current_dir().map(|p| norm_path(&p.to_string_lossy())).unwrap_or_default();
         let scope_label = match scope {
             Scope::All => format!("all accounts · {} sessions · {} folders", sessions.len(), folders.len()),
@@ -964,6 +1033,33 @@ struct Ui {
     open_here: usize,
     open_else: usize,
     flash: String,
+    /// Folders (lowercased path) whose children are shown; everything else is folded.
+    expanded: HashSet<String>,
+    /// Cursor and scroll of the home list, restored when you come back from a folder.
+    home_pos: (usize, usize),
+}
+
+/// Pre-order folder indexes that are visible given which folders are expanded.
+fn visible_folders(folders: &[Folder], expanded: &HashSet<String>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut hidden_below: Option<usize> = None;
+    for (i, f) in folders.iter().enumerate() {
+        if let Some(d) = hidden_below {
+            if f.depth > d {
+                continue;
+            }
+            hidden_below = None;
+        }
+        out.push(i);
+        if has_children(folders, i) && !expanded.contains(&f.path.to_lowercase()) {
+            hidden_below = Some(f.depth);
+        }
+    }
+    out
+}
+
+fn has_children(folders: &[Folder], i: usize) -> bool {
+    folders.get(i + 1).is_some_and(|n| n.depth > folders[i].depth)
 }
 
 fn home_items(m: &Model, u: &Ui) -> Vec<Item> {
@@ -985,7 +1081,7 @@ fn home_items(m: &Model, u: &Ui) -> Vec<Item> {
         items.push(Item::More(false, elsewhere.len() - u.open_else));
     }
     items.push(Item::Head("Folders".to_string(), m.folders.len()));
-    for i in 0..m.folders.len() {
+    for i in visible_folders(&m.folders, &u.expanded) {
         items.push(Item::Folder(i));
     }
     items
@@ -1138,7 +1234,21 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
             Item::Folder(fi) => {
                 let f = &m.folders[*fi];
                 let ptr = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-                let name = pad(&clip(&short_path(&f.path), 44), 44);
+                let rel = if f.depth == 0 {
+                    short_path(&f.path)
+                } else {
+                    // below its parent: just the part after the parent's path
+                    (0..*fi).rev().find(|&k| m.folders[k].depth + 1 == f.depth && under(&f.path, &m.folders[k].path)).map(|k| f.path[m.folders[k].path.len()..].trim_start_matches('/').to_string()).unwrap_or_else(|| short_path(&f.path))
+                };
+                let mark = if !has_children(&m.folders, *fi) {
+                    " "
+                } else if u.expanded.contains(&f.path.to_lowercase()) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let shown = format!("{}{mark} {rel}", "  ".repeat(f.depth));
+                let name = pad(&clip(&shown, 44), 44);
                 let rest = format!("{}{}", pad(&plural(f.sess.len(), "session"), 14), age(f.last));
                 lines.push(format!(" {ptr} {}{}", if on { ui::color::orange_bold(&name) } else { name }, ui::color::dim(&rest)));
             }
@@ -1154,7 +1264,13 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
     lines.extend(strip(m, cur.and_then(|c| items.get(c)), &u.filter, tw));
     lines.push(ui::rule(None));
     let back = if u.screen == Screen::Home { "Esc" } else { "←/Esc" };
-    lines.extend(layout::hint_grid(&[&[("↑/↓", "move"), ("Enter", "open"), ("/", "filter"), ("Ctrl+F", "search all"), (back, "back")]], (tw / 5).clamp(16, 22)));
+    let on_folder = matches!(cur.and_then(|c| items.get(c)), Some(Item::Folder(_)));
+    let mut hs: Vec<(&str, &str)> = vec![("↑/↓", "move"), ("Enter", "open"), ("/", "filter"), ("Ctrl+F", "search all")];
+    if on_folder {
+        hs.push(("←/→", "fold"));
+    }
+    hs.push((back, "back"));
+    lines.extend(layout::hint_grid(&[&hs], (tw / hs.len()).clamp(14, 22)));
     if u.filtering {
         lines.push(format!("{} Filter: {}", ui::color::orange(ui::glyph::back()), u.filter));
         cursor = Some((lines.len(), 2 + 8 + u.filter.chars().count() + 1));
@@ -1176,7 +1292,7 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let header = layout::account_lines(profiles, mark, &stats);
     let mut m = Model::load(profiles, &scope);
-    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new() };
+    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0) };
     let mut was_indexing = indexing().is_some();
     ui::hide_cursor();
     loop {
@@ -1301,6 +1417,7 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
             KeyCode::End => u.sel = n.saturating_sub(1),
             KeyCode::Char('/') => {
                 if u.screen == Screen::Home {
+                    u.home_pos = (u.sel, u.top);
                     u.screen = Screen::Folder;
                     u.folder = None;
                     u.sel = 0;
@@ -1308,6 +1425,30 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                     u.filter.clear();
                 }
                 u.filtering = true;
+            }
+            // Fold / unfold folders: right opens the children (and steps into them once
+            // open), left closes them (or steps up to the parent). Enter opens a folder.
+            KeyCode::Right | KeyCode::Left | KeyCode::Char('l') | KeyCode::Char('h')
+                if u.screen == Screen::Home && matches!(sel.get(u.sel).and_then(|&i| items.get(i)), Some(Item::Folder(_))) =>
+            {
+                let Some(Item::Folder(fi)) = sel.get(u.sel).and_then(|&i| items.get(i)) else { continue };
+                let fi = *fi;
+                let path = m.folders[fi].path.to_lowercase();
+                let right = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                if right {
+                    if has_children(&m.folders, fi) && !u.expanded.insert(path) && u.sel + 1 < n {
+                        u.sel += 1; // already open: step to the first child
+                    }
+                } else if u.expanded.remove(&path) && has_children(&m.folders, fi) {
+                    // closed its children
+                } else if m.folders[fi].depth > 0 {
+                    // already closed: go up to the parent row
+                    if let Some(pk) = (0..fi).rev().find(|&k| m.folders[k].depth + 1 == m.folders[fi].depth) {
+                        if let Some(pos) = sel.iter().position(|&ix| matches!(items.get(ix), Some(Item::Folder(k)) if *k == pk)) {
+                            u.sel = pos;
+                        }
+                    }
+                }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let Some(it) = sel.get(u.sel).and_then(|&i| items.get(i)) else { continue };
@@ -1319,6 +1460,7 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                         ui::hide_cursor();
                     }
                     Item::Folder(fi) => {
+                        u.home_pos = (u.sel, u.top);
                         u.screen = Screen::Folder;
                         u.folder = Some(*fi);
                         u.filter.clear();
@@ -1341,9 +1483,9 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                         u.filter.clear();
                         u.sel = 0;
                     } else {
+                        // back to the home list exactly where you left it
                         u.screen = Screen::Home;
-                        u.sel = 0;
-                        u.top = 0;
+                        (u.sel, u.top) = u.home_pos;
                     }
                 } else {
                     ui::show_cursor();
@@ -1491,7 +1633,7 @@ mod tests {
             let hits = find(&m, &pool, q);
             println!("find {:>16?}: {:>3} hits in {:?}", q, hits.len(), t.elapsed());
         }
-        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new() };
+        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0) };
         let t = Instant::now();
         for _ in 0..200 {
             let _ = draw(&m, &mut u, &[], 120, 39);
@@ -1559,5 +1701,35 @@ mod tests {
         assert_eq!(titles(&m, "~xyz").len(), 0);
         assert_eq!(titles(&m, "build acct:work"), vec!["Fix build failure"], "terms combine with AND");
         assert_eq!(titles(&m, "/[unclosed").len(), 0, "an invalid regex is searched as plain text");
+    }
+
+    #[test]
+    fn subfolders_roll_up_into_parents() {
+        let t = SystemTime::now();
+        let f = |p: &str, sess: Vec<usize>| Folder { path: p.into(), sess, last: t, depth: 0 };
+        let out = nest(vec![f("C:/w/cockpit/rust/src", vec![2]), f("C:/w/cockpit", vec![0, 2]), f("C:/w/cockpit/rust", vec![1]), f("C:", vec![3]), f("C:/w/cockpitx", vec![4])]);
+        let get = |p: &str| out.iter().find(|x| x.path == p).unwrap();
+        assert_eq!(get("C:/w/cockpit").sess, vec![0, 1, 2], "own + rust + rust/src, once each");
+        assert_eq!(get("C:/w/cockpit/rust").sess, vec![1, 2]);
+        assert_eq!(get("C:/w/cockpit/rust/src").sess, vec![2]);
+        assert_eq!(get("C:").sess, vec![0, 1, 2, 3, 4], "a parent includes everything below it");
+        assert_eq!(get("C:/w/cockpitx").depth, 1, "sibling with a shared prefix is not a child of cockpit");
+        assert_eq!(get("C:/w/cockpit/rust/src").depth, 3);
+        assert!(under("C:/w/cockpit/x", "C:/w/cockpit") && !under("C:/w/cockpitx", "C:/w/cockpit"));
+    }
+
+    #[test]
+    fn folding_hides_descendants() {
+        let t = SystemTime::now();
+        let f = |p: &str, d: usize| Folder { path: p.into(), sess: vec![0], last: t, depth: d };
+        // pre-order: A, A/b, A/b/c, A/d, E
+        let fs = vec![f("A", 0), f("A/b", 1), f("A/b/c", 2), f("A/d", 1), f("E", 0)];
+        let mut open: HashSet<String> = HashSet::new();
+        assert_eq!(visible_folders(&fs, &open), vec![0, 4], "everything folded: top level only");
+        open.insert("a".to_string());
+        assert_eq!(visible_folders(&fs, &open), vec![0, 1, 3, 4], "A open, A/b still folded hides A/b/c");
+        open.insert("a/b".to_string());
+        assert_eq!(visible_folders(&fs, &open), vec![0, 1, 2, 3, 4]);
+        assert!(has_children(&fs, 0) && has_children(&fs, 1) && !has_children(&fs, 2) && !has_children(&fs, 4));
     }
 }
