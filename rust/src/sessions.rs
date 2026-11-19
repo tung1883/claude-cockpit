@@ -1719,6 +1719,43 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_matches_a_full_scan() {
+        let dir = std::env::temp_dir().join(format!("cockpit-incr-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let user = |cwd: &str, t: &str| format!("{{\"type\":\"user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"{t}\"}}}}\n");
+        let asst = |cwd: &str, t: &str| format!("{{\"type\":\"assistant\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{t}\"}}]}}}}\n");
+        std::fs::write(&p, user("C:\\\\proj", "first question") + &asst("C:\\\\proj", "first answer")).unwrap();
+        let a = scan_file(&p, None).unwrap();
+        // the session grows (and ends with a line that is still being written)
+        let mut grown = std::fs::read_to_string(&p).unwrap();
+        for i in 0..6 {
+            grown += &asst("C:\\\\proj\\\\sub", &format!("step {i}"));
+        }
+        grown += &user("C:\\\\proj\\\\sub", "last question");
+        std::fs::write(&p, &grown).unwrap();
+        let inc = scan_file(&p, Some((&a.meta, &a.text))).unwrap();
+        let full = scan_file(&p, None).unwrap();
+        assert_eq!(inc.text, full.text);
+        assert_eq!(inc.meta.msgs, full.meta.msgs);
+        assert_eq!(inc.meta.folders, full.meta.folders);
+        assert_eq!((inc.meta.first.as_str(), inc.meta.last.as_str()), ("first question", "last question"));
+        assert_eq!(inc.meta.scanned_to, full.meta.scanned_to);
+        // a half-written trailing line is left for the next pass
+        let partial = format!("{grown}{{\"type\":\"user\",\"message\":{{\"content\":\"half wri");
+        std::fs::write(&p, &partial).unwrap();
+        let with_partial = scan_file(&p, Some((&inc.meta, &inc.text))).unwrap();
+        assert_eq!(with_partial.meta.msgs, full.meta.msgs);
+        assert_eq!(with_partial.meta.scanned_to as usize, grown.len());
+        // the file was rewritten (not appended to): the old position no longer matches, so it is re-read
+        std::fs::write(&p, user("C:\\\\other", "rewritten") + &asst("C:\\\\other", "different")).unwrap();
+        let re = scan_file(&p, Some((&inc.meta, &inc.text))).unwrap();
+        assert_eq!(re.meta.started, "C:/other");
+        assert!(re.text.contains("rewritten") && !re.text.contains("step 3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn folding_hides_descendants() {
         let t = SystemTime::now();
         let f = |p: &str, d: usize| Folder { path: p.into(), sess: vec![0], last: t, depth: d };
