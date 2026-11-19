@@ -1441,7 +1441,8 @@ fn pin_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, header: &[
 
 pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<()> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
-    let header = layout::account_lines(profiles, mark, &stats);
+    let mut header = layout::account_lines(profiles, mark, &stats);
+    let mut header_w = ui::term_width();
     let mut m = Model::load(profiles, &scope);
     let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), ask: None, ask_buf: String::new() };
     let mut was_indexing = indexing().is_some();
@@ -1450,6 +1451,11 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
         // One row short of the terminal: a frame that fills every row scrolls the
         // screen by one line on the last write (the header would be pushed off).
         let (tw, th) = crossterm::terminal::size().map(|(w, h)| (w as usize, (h as usize).saturating_sub(1))).unwrap_or((100, 29));
+        // the header's rule is as wide as the terminal was when it was built
+        if tw != header_w {
+            header = layout::account_lines(profiles, mark, &stats);
+            header_w = tw;
+        }
         let (lines, cursor) = draw(&m, &mut u, &header, tw, th);
         match cursor {
             Some((row, col)) => ui::repaint_at(&lines, row, col),
