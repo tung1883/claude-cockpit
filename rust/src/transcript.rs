@@ -795,11 +795,80 @@ fn set_block(doc: &mut [Arc<L>], r: &Row, apply: impl FnOnce(&mut Value)) -> boo
 // ------------------------------------------------------------------ state
 
 enum PromptKind {
+    Pin(PinDraft),
     Goto,
     Search,
     Filter,
     Delete(DeletePlan),
     Leave,
+}
+
+/// What `p` is about to save: the part of the session and its text snapshot.
+struct PinDraft {
+    from_turn: usize,
+    to_turn: usize,
+    from_uuid: Option<String>,
+    to_uuid: Option<String>,
+    excerpt: String,
+}
+
+/// Text of the rows of turns `from..=to` (thinking skipped, long bodies cut), for a pin.
+fn pin_excerpt(st: &State, from: usize, to: usize) -> String {
+    const ROW_CAP: usize = 1500;
+    const TOTAL_CAP: usize = 30_000;
+    let mut out = String::new();
+    for r in st.rows.iter().filter(|r| r.turn >= from && r.turn <= to && r.kind != Kind::Think) {
+        let info = r.info(&st.doc);
+        let line = match r.kind {
+            Kind::Text => format!("{}: {}", r.who, cap_chars(info.text.trim(), ROW_CAP)),
+            Kind::Result => format!("[result] {}", cap_chars(&info.preview, 200)),
+            _ => format!("[{}] {}", r.kind.label(), cap_chars(&info.preview, 200)),
+        };
+        if out.chars().count() + line.chars().count() > TOTAL_CAP {
+            out.push_str("\n\n… (cut)");
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// Turn range, uuids and a default label for the pin of `set` (the rows' turns,
+/// from the first to the last).
+fn pin_draft(st: &State, set: &HashSet<(usize, usize)>) -> Option<(PinDraft, String)> {
+    let picked: Vec<&Row> = st.rows.iter().filter(|r| set.contains(&r.key())).collect();
+    let first = *picked.first()?;
+    let last = *picked.last()?;
+    let (from, to) = (picked.iter().map(|r| r.turn).min()?, picked.iter().map(|r| r.turn).max()?);
+    let label = st
+        .rows
+        .iter()
+        .find(|r| r.turn >= from && r.kind == Kind::Text)
+        .map(|r| flat(&r.info(&st.doc).text, 50))
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| st.title.clone());
+    let draft = PinDraft {
+        from_turn: from,
+        to_turn: to,
+        from_uuid: st.doc[first.line].uuid().map(|u| u.to_string()),
+        to_uuid: st.doc[last.line].uuid().map(|u| u.to_string()),
+        excerpt: pin_excerpt(st, from, to),
+    };
+    Some((draft, label))
+}
+
+/// Rows of the part a pin points at, found by message uuid first (still right
+/// after edits renumbered the turns), else by the saved turn numbers.
+fn pin_rows(st: &State, pin: &crate::pins::Pin) -> HashSet<(usize, usize)> {
+    let turn_of = |uuid: &Option<String>, fallback: Option<usize>| -> Option<usize> {
+        uuid.as_deref().and_then(|u| st.rows.iter().find(|r| st.doc[r.line].uuid() == Some(u)).map(|r| r.turn)).or(fallback)
+    };
+    let (Some(a), Some(b)) = (turn_of(&pin.from_uuid, pin.from_turn), turn_of(&pin.to_uuid, pin.to_turn)) else { return HashSet::new() };
+    let (a, b) = (a.min(b), a.max(b));
+    st.rows.iter().filter(|r| r.turn >= a && r.turn <= b).map(|r| r.key()).collect()
 }
 
 struct Prompt {
@@ -809,6 +878,7 @@ struct Prompt {
 }
 
 struct State {
+    acct: String,
     file: PathBuf,
     id: String,
     title: String,
@@ -830,7 +900,7 @@ struct State {
 }
 
 impl State {
-    fn load(file: &Path, id: &str, title: &str) -> std::io::Result<State> {
+    fn load(file: &Path, id: &str, title: &str, acct: &str) -> std::io::Result<State> {
         let text = std::fs::read_to_string(file)?;
         let doc = parse_doc(text);
         let agent_dir = file.with_extension("").join("subagents");
@@ -838,6 +908,7 @@ impl State {
         let turns0 = rows.iter().map(|r| r.turn).max().unwrap_or(0);
         let blocks0 = rows.len();
         Ok(State {
+            acct: acct.to_string(),
             file: file.to_path_buf(),
             id: id.to_string(),
             title: title.to_string(),
@@ -1164,9 +1235,9 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
         }
     }
     lines.push(ui::rule(None));
-    let cell = (term_w / 5).clamp(16, 22);
-    let r1: &[(&str, &str)] = &[("↑/↓", "move"), ("Space", "select"), ("d", "delete"), ("t", "truncate"), ("u", "undo")];
-    let r2: &[(&str, &str)] = &[("Enter", "edit"), ("v", "read full"), ("J", "JSON"), ("/", "search n/N"), ("f", "filter")];
+    let cell = (term_w / 6).clamp(14, 22);
+    let r1: &[(&str, &str)] = &[("↑/↓", "move"), ("Space", "select"), ("Ctrl+A", "select all"), ("d", "delete"), ("t", "truncate"), ("u", "undo")];
+    let r2: &[(&str, &str)] = &[("Enter", "edit"), ("v", "read full"), ("J", "JSON"), ("/", "search n/N"), ("f", "filter"), ("p", "pin part")];
     let r3: &[(&str, &str)] = &[("Ctrl+↑/↓", "top/bottom"), (":", "go to row"), ("w", "save"), ("←/Esc", "back"), ("Shift+↑/↓", "range")];
     lines.extend(layout::hint_grid(&[r1, r2, r3], cell));
 
@@ -1188,11 +1259,22 @@ fn count_lines(p: &Path) -> usize {
 
 // -------------------------------------------------------------- main loop
 
-pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str) -> std::io::Result<()> {
+/// `start` opens the editor on a pinned part: its rows are selected and the cursor sits on the first one.
+pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str, acct: &str, start: Option<&crate::pins::Pin>) -> std::io::Result<()> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let header = layout::account_lines(profiles, mark, &stats);
     let short = &id[..id.len().min(8)];
-    let mut st = State::load(file, id, &format!("{title} · {short}"))?;
+    let mut st = State::load(file, id, &format!("{title} · {short}"), acct)?;
+    if let Some(pin) = start.filter(|p| p.is_part()) {
+        let set = pin_rows(&st, pin);
+        if let Some(i) = st.rows.iter().position(|r| set.contains(&r.key())) {
+            st.sel = i;
+            st.flash = format!("{} selected", pin.range_label());
+        } else {
+            st.flash = "that part is no longer in the session".into();
+        }
+        st.picked = set;
+    }
     let mut prompt: Option<Prompt> = None;
     // Shift+arrows: range selection from where it started (`anchor`, an index
     // into the visible rows), on top of whatever was already selected (`base`).
@@ -1280,6 +1362,24 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str) 
                     let p = prompt.take().unwrap();
                     st.flash.clear();
                     match p.kind {
+                        PromptKind::Pin(d) => {
+                            let label = if p.buf.trim().is_empty() { st.title.clone() } else { p.buf.trim().to_string() };
+                            crate::pins::add(crate::pins::Pin {
+                                id: String::new(),
+                                acct: st.acct.clone(),
+                                session_id: st.id.clone(),
+                                title: st.title.split(" · ").next().unwrap_or(&st.title).to_string(),
+                                label,
+                                from_turn: Some(d.from_turn),
+                                to_turn: Some(d.to_turn),
+                                from_uuid: d.from_uuid,
+                                to_uuid: d.to_uuid,
+                                excerpt: d.excerpt,
+                                created_ms: 0,
+                            });
+                            st.flash = format!("pinned turns {}–{}", d.from_turn, d.to_turn);
+                            st.picked.clear();
+                        }
                         PromptKind::Goto => {
                             if !p.buf.trim().is_empty() {
                                 match goto_target(&st.rows, &vis, &p.buf) {
@@ -1428,6 +1528,35 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str) 
                 if let Some(ri) = cur_row {
                     read_full(&st, ri, &header)?;
                     ui::hide_cursor();
+                }
+            }
+            // select every row of the current list (again: clear)
+            KeyCode::Char('a') if key.ctrl => {
+                let all: Vec<(usize, usize)> = vis.iter().map(|&ri| st.rows[ri].key()).collect();
+                if !all.is_empty() && all.iter().all(|k| st.picked.contains(k)) {
+                    for k in &all {
+                        st.picked.remove(k);
+                    }
+                    st.flash = "selection cleared".into();
+                } else {
+                    st.picked.extend(all.iter().copied());
+                    st.flash = format!("{} selected", all.len());
+                }
+            }
+            // pin the selected rows' part of the session (the current row if none are selected)
+            KeyCode::Char('p') => {
+                let mut set = st.picked.clone();
+                if set.is_empty() {
+                    if let Some(ri) = cur_row {
+                        set.insert(st.rows[ri].key());
+                    }
+                }
+                match pin_draft(&st, &set) {
+                    Some((draft, label)) => {
+                        let q = format!("Pin turns {}–{} as: ", draft.from_turn, draft.to_turn);
+                        prompt = Some(Prompt { q, buf: label, kind: PromptKind::Pin(draft) });
+                    }
+                    None => st.flash = "nothing to pin".into(),
                 }
             }
             KeyCode::Char(':') => prompt = Some(Prompt { q: "Go to turn (42 or 42.3): ".into(), buf: String::new(), kind: PromptKind::Goto }),
@@ -1667,7 +1796,7 @@ mod tests {
         println!("  single-thread full Value parse of every line: {:?} ({n} ok)", ts.elapsed());
         drop((text, d));
         let t0 = std::time::Instant::now();
-        let st = State::load(Path::new(&p), "x", "t").unwrap();
+        let st = State::load(Path::new(&p), "x", "t", "a").unwrap();
         println!("State::load: {:?}", t0.elapsed());
         let t1 = std::time::Instant::now();
         let snap = st.doc.clone();
@@ -1743,5 +1872,46 @@ mod tests {
         assert_eq!(p[6], "[image]");
         assert!(rows[0].lower(&d).contains("hello   world"));
         assert!(rows[4].lower(&d).starts_with("tool_use bash "));
+    }
+
+    #[test]
+    fn pins_are_found_again_by_uuid_after_turns_shift() {
+        let d = doc();
+        let rows = build_rows(&d, Path::new("."));
+        let mut st = State {
+            acct: "a".into(),
+            file: PathBuf::new(),
+            id: "s".into(),
+            title: "t".into(),
+            agent_dir: PathBuf::new(),
+            doc: d,
+            rows,
+            hist: Vec::new(),
+            picked: HashSet::new(),
+            drop_agents: Vec::new(),
+            dirty: false,
+            sel: 0,
+            top: 0,
+            query: String::new(),
+            filter: String::new(),
+            flash: String::new(),
+            turns0: 4,
+            blocks0: 4,
+        };
+        let set: HashSet<(usize, usize)> = st.rows.iter().filter(|r| r.turn >= 2 && r.turn <= 3).map(|r| r.key()).collect();
+        let (draft, label) = pin_draft(&st, &set).unwrap();
+        assert_eq!((draft.from_turn, draft.to_turn), (2, 3));
+        assert!(draft.excerpt.contains("[tool] Bash") && draft.excerpt.contains("[result] a.txt"), "{}", draft.excerpt);
+        assert!(!label.is_empty());
+        let pin = crate::pins::Pin { id: "x".into(), acct: "a".into(), session_id: "s".into(), title: "t".into(), label: "l".into(), from_turn: Some(draft.from_turn), to_turn: Some(draft.to_turn), from_uuid: draft.from_uuid.clone(), to_uuid: draft.to_uuid.clone(), excerpt: draft.excerpt.clone(), created_ms: 0 };
+        assert_eq!(pin_rows(&st, &pin), set);
+        // drop the first turn: everything renumbers, the pin still finds the same rows by uuid
+        let gone: HashSet<(usize, usize)> = st.rows.iter().filter(|r| r.turn == 1).map(|r| r.key()).collect();
+        let plan = plan_delete(&st.rows, &gone);
+        delete_blocks(&mut st.doc, &st.rows, &plan.set);
+        st.rows = build_rows(&st.doc, Path::new("."));
+        let now = pin_rows(&st, &pin);
+        assert_eq!(now.len(), set.len());
+        assert!(st.rows.iter().filter(|r| now.contains(&r.key())).all(|r| r.turn >= 1 && r.turn <= 2), "renumbered");
     }
 }

@@ -18,6 +18,7 @@ mod session;
 mod sidebar;
 mod settings;
 mod statusline;
+mod pins;
 mod sessions;
 mod sync;
 mod transcript;
@@ -385,7 +386,7 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
                 if let Some(file) = group.sessions.iter().find(|s| s.id == id) {
                     let (name, summary) = session::session_preview(&file.file);
                     let title = session_label(file, &name, &summary);
-                    transcript::run(profiles, mark, &file.file, &id, &title)?;
+                    transcript::run(profiles, mark, &file.file, &id, &title, from, None)?;
                     // fall through: stay on action menu
                 }
             }

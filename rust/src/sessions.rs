@@ -600,6 +600,7 @@ struct Model {
     folders: Vec<Folder>,
     cwd: String,
     scope_label: String,
+    pins: Vec<crate::pins::Pin>,
 }
 
 #[derive(Clone)]
@@ -715,7 +716,11 @@ impl Model {
             Scope::All => format!("all accounts · {} sessions · {} folders", sessions.len(), folders.len()),
             Scope::Account(a) => format!("account {a} · {} sessions · {} folders", sessions.len(), folders.len()),
         };
-        Model { sessions, folders, cwd, scope_label }
+        let pins = crate::pins::load().into_iter().filter(|p| match scope {
+            Scope::All => true,
+            Scope::Account(a) => &p.acct == a,
+        });
+        Model { sessions, folders, cwd, scope_label, pins: pins.collect() }
     }
 }
 
@@ -924,6 +929,28 @@ fn age(t: SystemTime) -> String {
     session::relative_age(Some(t))
 }
 
+/// Cuts `s` to `n` visible columns, passing colour escapes through.
+fn clip_visible_to(s: &str, n: usize) -> String {
+    let mut out = String::new();
+    let mut vis = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2 == 'm' {
+                    break;
+                }
+            }
+        } else if vis < n {
+            out.push(c);
+            vis += 1;
+        }
+    }
+    out
+}
+
 fn badge(s: &Sess, folder: Option<&str>) -> &'static str {
     match folder {
         Some(f) if s.moved_into(f) => "↦ moved here",
@@ -939,20 +966,23 @@ fn acct_color(a: &str, t: &str) -> String {
     }
 }
 
-fn session_row(s: &Sess, on: bool, folder: Option<&str>, q: &str, width: usize) -> String {
+fn session_row(s: &Sess, on: bool, marked: bool, folder: Option<&str>, q: &str, width: usize) -> String {
     let bd = badge(s, folder);
-    let title_w = width.saturating_sub(3 + 9 + 7 + if bd.is_empty() { 0 } else { bd.chars().count() + 2 } + 1).max(12);
+    let title_w = width.saturating_sub(3 + 2 + 9 + 7 + if bd.is_empty() { 0 } else { bd.chars().count() + 2 } + 1).max(12);
     let title = clip(&s.title, title_w);
     let ptr = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
     let tag = if bd.is_empty() { String::new() } else { format!("  {}", ui::color::yellow(bd)) };
+    // fixed 2-column mark so selecting a row never shifts its text
+    let mk = if marked { format!("{} ", ui::color::orange("✓")) } else { "  ".to_string() };
     if on {
-        format!(" {ptr} {}{tag}", ui::color::orange_bold(&format!("{}{}{}", pad(&age(s.modified), 9), pad(&s.acct, 7), title)))
+        format!(" {ptr} {mk}{}{tag}", ui::color::orange_bold(&format!("{}{}{}", pad(&age(s.modified), 9), pad(&s.acct, 7), title)))
     } else {
-        format!(" {ptr} {}{}{}{tag}", ui::color::dim(&pad(&age(s.modified), 9)), acct_color(&s.acct, &pad(&s.acct, 7)), highlight(&title, q))
+        format!(" {ptr} {mk}{}{}{}{tag}", ui::color::dim(&pad(&age(s.modified), 9)), acct_color(&s.acct, &pad(&s.acct, 7)), highlight(&title, q))
     }
 }
 
 enum Item {
+    Pin(usize),
     Head(String, usize),
     Sess(usize, Option<String>),
     More(bool, usize),
@@ -986,6 +1016,17 @@ fn strip(m: &Model, item: Option<&Item>, q: &str, width: usize) -> Vec<String> {
             };
             out.push(row("match", if sn.is_empty() { ui::color::dim("—") } else { ui::color::yellow(&highlight(&clip(&sn, width.saturating_sub(14)), q)) }));
             out.push(row("resume", format!("here → {}{}", short_path(&m.cwd), ui::color::dim(&format!("    or in started folder → {}", short_path(&s.started))))));
+        }
+        Some(Item::Pin(pi)) => {
+            let pin = &m.pins[*pi];
+            let live = m.sessions.iter().find(|s| s.acct == pin.acct && s.id == pin.session_id);
+            out.push(rule(&clip(&pin.label, 64)));
+            out.push(row("session", format!("{}   {}", clip(&pin.title, 40), ui::color::dim(&format!("{} · {}", pin.acct, if live.is_some() { "still there" } else { "deleted — the saved text below is all that is left" })))));
+            out.push(row("part", format!("{}{}", pin.range_label(), if pin.is_part() { ui::color::dim("   (Enter → open it selected in the transcript editor)") } else { String::new() })));
+            let lines = crate::pins::wrap(&pin.excerpt, width.saturating_sub(14));
+            for (i, l) in lines.iter().take(3).enumerate() {
+                out.push(row(if i == 0 { "saved" } else { "" }, clip(l, width.saturating_sub(14))));
+            }
         }
         Some(Item::Folder(fi)) => {
             let f = &m.folders[*fi];
@@ -1037,6 +1078,21 @@ struct Ui {
     expanded: HashSet<String>,
     /// Cursor and scroll of the home list, restored when you come back from a folder.
     home_pos: (usize, usize),
+    /// Sessions marked with Space (by transcript path), for deleting several at once.
+    picked: HashSet<String>,
+    /// A question waiting for an answer at the bottom of the screen, and the text typed so far.
+    ask: Option<Ask>,
+    ask_buf: String,
+}
+
+/// What the bottom prompt is asking.
+enum Ask {
+    /// Delete these sessions (indexes into `Model::sessions`)? y/n.
+    Delete(Vec<usize>),
+    /// Pin this whole session: type a label.
+    PinSession(usize),
+    /// Rename this pin: type the new label.
+    RenamePin(String),
 }
 
 /// Pre-order folder indexes that are visible given which folders are expanded.
@@ -1066,7 +1122,12 @@ fn home_items(m: &Model, u: &Ui) -> Vec<Item> {
     let here: Vec<usize> = (0..m.sessions.len()).filter(|&i| m.sessions[i].touches(&m.cwd)).collect();
     let shown: HashSet<usize> = here.iter().take(u.open_here).copied().collect();
     let elsewhere: Vec<usize> = (0..m.sessions.len()).filter(|i| !here.contains(i) && !shown.contains(i)).collect();
-    let mut items = vec![Item::Head(format!("This folder · {}", short_path(&m.cwd)), here.len())];
+    let mut items: Vec<Item> = Vec::new();
+    if !m.pins.is_empty() {
+        items.push(Item::Head("Pinned".to_string(), m.pins.len()));
+        items.extend((0..m.pins.len()).map(Item::Pin));
+    }
+    items.push(Item::Head(format!("This folder · {}", short_path(&m.cwd)), here.len()));
     for &i in here.iter().take(u.open_here) {
         items.push(Item::Sess(i, Some(m.cwd.clone())));
     }
@@ -1165,7 +1226,7 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
         for (k, h) in hits.iter().skip(u.stop).take(vp).enumerate() {
             let on = u.stop + k == u.ssel;
             let s = &m.sessions[h.s];
-            lines.push(session_row(s, on, Some(&m.cwd), &u.q, tw));
+            lines.push(session_row(s, on, false, Some(&m.cwd), &u.q, tw));
             let fl = s.folders.iter().map(|(p, _)| short_path(p)).collect::<Vec<_>>().join("  +  ");
             let dot = if s.touches(&m.cwd) { ui::color::orange("● ") } else { "  ".to_string() };
             let sn = if h.snip.is_empty() { String::new() } else { format!("  ·  {}", ui::color::yellow(&highlight(&clip(&h.snip, 40), &u.q))) };
@@ -1252,7 +1313,20 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
                 let rest = format!("{}{}", pad(&plural(f.sess.len(), "session"), 14), age(f.last));
                 lines.push(format!(" {ptr} {}{}", if on { ui::color::orange_bold(&name) } else { name }, ui::color::dim(&rest)));
             }
-            Item::Sess(si, ctx) => lines.push(session_row(&m.sessions[*si], on, ctx.as_deref(), &u.filter, tw)),
+            Item::Sess(si, ctx) => lines.push(session_row(&m.sessions[*si], on, u.picked.contains(&m.sessions[*si].key()), ctx.as_deref(), &u.filter, tw)),
+            Item::Pin(pi) => {
+                let pin = &m.pins[*pi];
+                let ptr = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+                let gone = !m.sessions.iter().any(|s| s.acct == pin.acct && s.id == pin.session_id);
+                let tail = format!("{} · {} · {}{}", pin.range_label(), clip(&pin.title, 28), pin.acct, if gone { " · session deleted" } else { "" });
+                let label = clip(&pin.label, 30);
+                let line = if on {
+                    ui::color::orange_bold(&format!("{}{}", pad(&label, 32), tail))
+                } else {
+                    format!("{}{}", pad(&label, 32), ui::color::dim(&tail))
+                };
+                lines.push(format!(" {ptr} {}{}", ui::color::orange("★ "), clip_visible_to(&line, tw.saturating_sub(7))));
+            }
         }
     }
     if items.len() > end {
@@ -1265,13 +1339,36 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
     lines.push(ui::rule(None));
     let back = if u.screen == Screen::Home { "Esc" } else { "←/Esc" };
     let on_folder = matches!(cur.and_then(|c| items.get(c)), Some(Item::Folder(_)));
+    let on_sess = matches!(cur.and_then(|c| items.get(c)), Some(Item::Sess(..)));
+    let on_pin = matches!(cur.and_then(|c| items.get(c)), Some(Item::Pin(_)));
     let mut hs: Vec<(&str, &str)> = vec![("↑/↓", "move"), ("Enter", "open"), ("/", "filter"), ("Ctrl+F", "search all")];
     if on_folder {
         hs.push(("←/→", "fold"));
     }
+    if on_sess {
+        hs.extend([("Space", "select"), ("d", "delete"), ("p", "pin")]);
+    }
+    if on_pin {
+        hs.push(("d", "unpin"));
+    }
     hs.push((back, "back"));
     lines.extend(layout::hint_grid(&[&hs], (tw / hs.len()).clamp(14, 22)));
-    if u.filtering {
+    if let Some(ask) = &u.ask {
+        let q = match ask {
+            Ask::Delete(v) => {
+                let multi = v.iter().filter(|&&i| m.sessions[i].folders.len() > 1).count();
+                format!("Delete {} session{}{}? (y/n) ", v.len(), if v.len() == 1 { "" } else { "s" }, if multi > 0 { format!(" ({multi} touched several folders; removed from all)") } else { String::new() })
+            }
+            Ask::PinSession(_) => "Pin session as: ".to_string(),
+            Ask::RenamePin(_) => "Rename pin: ".to_string(),
+        };
+        if matches!(ask, Ask::Delete(_)) {
+            lines.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::yellow(&q)));
+        } else {
+            lines.push(format!("{} {q}{}", ui::color::orange(ui::glyph::back()), u.ask_buf));
+            cursor = Some((lines.len(), 2 + q.chars().count() + u.ask_buf.chars().count() + 1));
+        }
+    } else if u.filtering {
         lines.push(format!("{} Filter: {}", ui::color::orange(ui::glyph::back()), u.filter));
         cursor = Some((lines.len(), 2 + 8 + u.filter.chars().count() + 1));
     } else {
@@ -1288,11 +1385,65 @@ fn open_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, s: &Sess)
     crate::open_folder_sessions(term, profiles, mark, &s.acct, &group, Some(&s.id))
 }
 
+/// What the pin menu wants the browser to do next.
+enum PinOutcome {
+    Nothing,
+    Rename,
+    Changed,
+}
+
+/// The menu for one pin: read the saved text, open its part in the transcript
+/// editor (selected), open the session's own menu, rename or unpin.
+fn pin_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, header: &[String], m: &Model, pin: &crate::pins::Pin) -> anyhow::Result<PinOutcome> {
+    use crate::picker::{self, ListChoice, ListOption};
+    let live = m.sessions.iter().find(|s| s.acct == pin.acct && s.id == pin.session_id).cloned();
+    let mut options = vec![ListOption { label: "View saved text".into(), value: "view".into(), note: Some("read the part as it was pinned".into()) }];
+    if live.is_some() {
+        if pin.is_part() {
+            options.push(ListOption { label: "Open part in editor".into(), value: "edit".into(), note: Some(format!("transcript editor with {} selected", pin.range_label())) });
+        }
+        options.push(ListOption { label: "Open session".into(), value: "open".into(), note: Some("resume, hand off, view, …".into()) });
+    }
+    options.push(ListOption { label: "Rename pin".into(), value: "rename".into(), note: None });
+    options.push(ListOption { label: "Unpin".into(), value: "unpin".into(), note: Some("forget this pin (the session stays)".into()) });
+    let heading = format!("{}  ·  {}", pin.label, pin.range_label());
+    let ListChoice::Picked(act) = picker::choose_from_list(profiles, mark, &heading, None, &options, None)? else { return Ok(PinOutcome::Nothing) };
+    match act.as_str() {
+        "view" => {
+            let mut h = header.to_vec();
+            h.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&pin.label)));
+            h.push(ui::color::dim(&format!("   {} · {} · {}", pin.title, pin.acct, pin.range_label())));
+            h.push(String::new());
+            let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100).saturating_sub(8).min(110);
+            let rows: Vec<picker::ScrollRow> = crate::pins::wrap(&pin.excerpt, width).into_iter().map(|l| picker::ScrollRow::info(format!("   {l}"))).collect();
+            picker::scroll_screen(&h, &rows, None, None)?;
+            Ok(PinOutcome::Nothing)
+        }
+        "edit" => {
+            if let Some(s) = &live {
+                crate::transcript::run(profiles, mark, &s.file, &s.id, &s.title, &s.acct, Some(pin))?;
+            }
+            Ok(PinOutcome::Changed)
+        }
+        "open" => {
+            if let Some(s) = &live {
+                open_menu(term, profiles, mark, s)?;
+            }
+            Ok(PinOutcome::Changed)
+        }
+        "rename" => Ok(PinOutcome::Rename),
+        _ => {
+            crate::pins::remove(&pin.id);
+            Ok(PinOutcome::Changed)
+        }
+    }
+}
+
 pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<()> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let header = layout::account_lines(profiles, mark, &stats);
     let mut m = Model::load(profiles, &scope);
-    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0) };
+    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), ask: None, ask_buf: String::new() };
     let mut was_indexing = indexing().is_some();
     ui::hide_cursor();
     loop {
@@ -1324,6 +1475,70 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
             std::process::exit(130);
         }
         u.flash.clear();
+
+        // ---- bottom prompt (delete confirmation / label)
+        if let Some(ask) = u.ask.take() {
+            match ask {
+                Ask::Delete(v) => {
+                    if !raw.ctrl && matches!(raw.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                        let n = v.len();
+                        for &i in &v {
+                            let s = &m.sessions[i];
+                            let sf = SessionFile { id: s.id.clone(), file: s.file.clone(), modified: s.modified };
+                            let _ = session::delete_session(&crate::paths::profile_dir(&s.acct), &sf);
+                        }
+                        u.picked.clear();
+                        m = Model::load(profiles, &scope);
+                        u.flash = format!("deleted {n} session{}", if n == 1 { "" } else { "s" });
+                    } else {
+                        u.flash = "cancelled".into();
+                    }
+                }
+                other => match raw.code {
+                    KeyCode::Esc => u.ask_buf.clear(),
+                    KeyCode::Enter => {
+                        let label = u.ask_buf.trim().to_string();
+                        match other {
+                            Ask::PinSession(si) => {
+                                let s = &m.sessions[si];
+                                crate::pins::add(crate::pins::Pin {
+                                    id: String::new(),
+                                    acct: s.acct.clone(),
+                                    session_id: s.id.clone(),
+                                    title: s.title.clone(),
+                                    label: if label.is_empty() { s.title.clone() } else { label },
+                                    from_turn: None,
+                                    to_turn: None,
+                                    from_uuid: None,
+                                    to_uuid: None,
+                                    excerpt: format!("{}\n\n… …\n\n{}", s.first, s.last),
+                                    created_ms: 0,
+                                });
+                                u.flash = "pinned".into();
+                            }
+                            Ask::RenamePin(id) => {
+                                if !label.is_empty() {
+                                    crate::pins::rename(&id, &label);
+                                }
+                            }
+                            Ask::Delete(_) => {}
+                        }
+                        u.ask_buf.clear();
+                        m = Model::load(profiles, &scope);
+                    }
+                    KeyCode::Backspace => {
+                        u.ask_buf.pop();
+                        u.ask = Some(other);
+                    }
+                    KeyCode::Char(c) if !raw.ctrl => {
+                        u.ask_buf.push(c);
+                        u.ask = Some(other);
+                    }
+                    _ => u.ask = Some(other),
+                },
+            }
+            continue;
+        }
 
         // ---- search screen: letters are text
         if u.screen == Screen::Search {
@@ -1415,6 +1630,38 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
             KeyCode::PageDown => u.sel = (u.sel + 5).min(n.saturating_sub(1)),
             KeyCode::Home => u.sel = 0,
             KeyCode::End => u.sel = n.saturating_sub(1),
+            KeyCode::Char(' ') if matches!(sel.get(u.sel).and_then(|&i| items.get(i)), Some(Item::Sess(..))) => {
+                if let Some(Item::Sess(si, _)) = sel.get(u.sel).and_then(|&i| items.get(i)) {
+                    let k = m.sessions[*si].key();
+                    if !u.picked.remove(&k) {
+                        u.picked.insert(k);
+                    }
+                }
+            }
+            KeyCode::Char('d') if matches!(sel.get(u.sel).and_then(|&i| items.get(i)), Some(Item::Sess(..)) | Some(Item::Pin(_))) => {
+                match sel.get(u.sel).and_then(|&i| items.get(i)) {
+                    Some(Item::Pin(pi)) => {
+                        crate::pins::remove(&m.pins[*pi].id);
+                        m = Model::load(profiles, &scope);
+                        u.flash = "unpinned".into();
+                    }
+                    Some(Item::Sess(si, _)) => {
+                        // the marked sessions, or just this one when none are marked
+                        let mut v: Vec<usize> = (0..m.sessions.len()).filter(|&i| u.picked.contains(&m.sessions[i].key())).collect();
+                        if v.is_empty() {
+                            v.push(*si);
+                        }
+                        u.ask = Some(Ask::Delete(v));
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Char('p') if matches!(sel.get(u.sel).and_then(|&i| items.get(i)), Some(Item::Sess(..))) => {
+                if let Some(Item::Sess(si, _)) = sel.get(u.sel).and_then(|&i| items.get(i)) {
+                    u.ask_buf = m.sessions[*si].title.clone();
+                    u.ask = Some(Ask::PinSession(*si));
+                }
+            }
             KeyCode::Char('/') => {
                 if u.screen == Screen::Home {
                     u.home_pos = (u.sel, u.top);
@@ -1473,6 +1720,18 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                         } else {
                             u.open_else = 20;
                         }
+                    }
+                    Item::Pin(pi) => {
+                        let pin = m.pins[*pi].clone();
+                        match pin_menu(term, profiles, mark, &header, &m, &pin)? {
+                            PinOutcome::Rename => {
+                                u.ask_buf = pin.label.clone();
+                                u.ask = Some(Ask::RenamePin(pin.id));
+                            }
+                            PinOutcome::Changed => m = Model::load(profiles, &scope),
+                            PinOutcome::Nothing => {}
+                        }
+                        ui::hide_cursor();
                     }
                     Item::Head(..) => {}
                 }
@@ -1633,7 +1892,7 @@ mod tests {
             let hits = find(&m, &pool, q);
             println!("find {:>16?}: {:>3} hits in {:?}", q, hits.len(), t.elapsed());
         }
-        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0) };
+        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), ask: None, ask_buf: String::new() };
         let t = Instant::now();
         for _ in 0..200 {
             let _ = draw(&m, &mut u, &[], 120, 39);
@@ -1671,6 +1930,7 @@ mod tests {
             s
         };
         Model {
+            pins: Vec::new(),
             sessions: vec![
                 mk("work", "Fix build failure", &["C:/work/cockpit", "C:/work/cockpit/rust/src"], "cargo build fails"),
                 mk("main2", "Hiding data in files", &["C:/work/stegosaur"], "steganography ideas"),
