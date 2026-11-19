@@ -121,19 +121,26 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
         picker::prompt_line("Press Enter...")?;
         return Ok(());
     }
-    let target_options: Vec<picker::ListOption> = others
+    // Most headroom first: a target with a known low usage ranks above one that is
+    // nearly full, and one with no reading goes last.
+    let mut ranked: Vec<(&profiles::Profile, Option<quota::Quota>)> = others.iter().map(|p| (*p, quota::load(&p.name))).collect();
+    ranked.sort_by(|a, b| {
+        let key = |q: &Option<quota::Quota>| q.as_ref().map(quota::usage).unwrap_or(f64::MAX);
+        key(&a.1).partial_cmp(&key(&b.1)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let target_options: Vec<picker::ListOption> = ranked
         .iter()
-        .map(|p| {
+        .map(|(p, q)| {
             let count = layout::account_stat(&p.name).count;
             let count_label = layout::pad_to(&format!("{count} sessions"), 12);
-            let note = match quota::load(&p.name) {
-                Some(q) => format!("{count_label}·  {:.0}% used", quota::usage(&q)),
+            let note = match q {
+                Some(q) => format!("{count_label}·  {}", quota::describe(q)),
                 None => format!("{count_label}·  usage unknown"),
             };
             picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(note) }
         })
         .collect();
-    let target = match picker::choose_from_list(profiles, mark, "Copy session into…", None, &target_options, None)? {
+    let target = match picker::choose_from_list(profiles, mark, "Copy session into…", Some("most headroom first"), &target_options, None)? {
         picker::ListChoice::Picked(t) => t,
         _ => return Ok(()),
     };
