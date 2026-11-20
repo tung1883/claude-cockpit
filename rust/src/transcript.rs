@@ -84,7 +84,7 @@ impl L {
             Ok(h) => (h.ty.unwrap_or_default(), h.uuid, h.parent),
             Err(_) => (String::new(), None, None),
         };
-        let v = if ty == "user" || ty == "assistant" { serde_json::from_str(text).ok() } else { None };
+        let v = if matches!(ty.as_str(), "user" | "assistant" | "system") { serde_json::from_str(text).ok() } else { None };
         L { raw, ty, uuid, parent, v, dirty: false }
     }
     fn raw(&self) -> &str {
@@ -182,6 +182,8 @@ enum Kind {
     Mcp,
     Agent,
     Result,
+    /// A harness notice stored as a `system` line (safeguard stops, fallbacks…).
+    Notice,
 }
 
 impl Kind {
@@ -193,6 +195,7 @@ impl Kind {
             Kind::Mcp => "mcp",
             Kind::Agent => "agent",
             Kind::Result => "↳ res",
+            Kind::Notice => "note",
         }
     }
     fn filter_name(self) -> &'static str {
@@ -203,6 +206,7 @@ impl Kind {
             Kind::Mcp => "mcp",
             Kind::Agent => "agent",
             Kind::Result => "tool_result",
+            Kind::Notice => "notice",
         }
     }
 }
@@ -269,6 +273,7 @@ fn compute_info(l: &L, blk: usize, kind: Kind, name: &str) -> Info {
                 flat(&format!("{server} · {tool}  {}", input()), 300)
             }
             Kind::Tool => flat(&format!("{name}  {}", input()), 300),
+            Kind::Notice => flat(&body, 300),
             Kind::Result => {
                 if info.chars > 20_000 {
                     info.big = Some(format!("{} KB", info.chars / 1000));
@@ -369,6 +374,12 @@ fn result_text(c: &Value) -> String {
 /// (a typed user prompt) is presented as one synthetic text block.
 fn for_each_block(l: &L, mut f: impl FnMut(usize, &Value)) {
     let Some(v) = &l.v else { return };
+    if l.ty() == "system" {
+        if let Some(t) = notice_text(v) {
+            f(0, &serde_json::json!({"type": "text", "text": t}));
+        }
+        return;
+    }
     match v.get("message").and_then(|m| m.get("content")) {
         Some(Value::String(s)) => {
             let b = serde_json::json!({"type": "text", "text": s});
@@ -381,6 +392,17 @@ fn for_each_block(l: &L, mut f: impl FnMut(usize, &Value)) {
         }
         _ => {}
     }
+}
+
+/// Text of a `system` line worth showing: the harness's informational notices
+/// and model-refusal records. Other system lines (timings, boundaries) are noise.
+fn notice_text(v: &Value) -> Option<String> {
+    let sub = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    if !(sub == "informational" || sub.starts_with("model_refusal")) || v.get("isMeta").and_then(|x| x.as_bool()) == Some(true) {
+        return None;
+    }
+    let get = |k: &str| v.get(k).and_then(|c| c.as_str()).map(str::trim).filter(|c| !c.is_empty());
+    get("content").or_else(|| get("apiRefusalExplanation")).map(str::to_string)
 }
 
 /// One block cloned out of its line (to edit or read in full).
@@ -436,6 +458,29 @@ fn build_rows(doc: &[Arc<L>], agent_dir: &Path) -> Vec<Row> {
     let mut sub = 0usize;
     let mut last_user: Option<bool> = None;
     for (li, l) in doc.iter().enumerate() {
+        if l.ty() == "system" {
+            // Notices hang off the turn they follow (no new turn of their own);
+            // ones before the first message are turn 0.
+            if l.v.as_ref().and_then(notice_text).is_some() {
+                rows.push(Row {
+                    line: li,
+                    blk: 0,
+                    turn,
+                    sub,
+                    user: false,
+                    who: "System",
+                    kind: Kind::Notice,
+                    name: String::new(),
+                    tid: String::new(),
+                    agent_id: None,
+                    agent_prompt: String::new(),
+                    info: Default::default(),
+                    lower: Default::default(),
+                });
+                sub += 1;
+            }
+            continue;
+        }
         if !is_message_line(l) {
             continue;
         }
@@ -570,7 +615,9 @@ fn plan_delete(rows: &[Row], picked: &HashSet<(usize, usize)>) -> DeletePlan {
 fn delete_blocks(doc: &mut Doc, rows: &[Row], set: &HashSet<(usize, usize)>) -> usize {
     let mut needles: Vec<String> = Vec::new();
     for r in rows.iter().filter(|r| set.contains(&r.key())) {
-        if !r.tid.is_empty() {
+        if r.kind == Kind::Notice {
+            continue;
+        } else if !r.tid.is_empty() {
             needles.push(r.tid.clone());
         } else {
             let info = r.info(doc);
@@ -587,6 +634,10 @@ fn delete_blocks(doc: &mut Doc, rows: &[Row], set: &HashSet<(usize, usize)>) -> 
     for (li, mut blks) in by_line {
         blks.sort_unstable_by(|a, b| b.cmp(a));
         let line = Arc::make_mut(&mut doc[li]);
+        if line.ty() == "system" {
+            removed.insert(li);
+            continue;
+        }
         let Some(v) = line.v.as_mut() else { continue };
         let Some(content) = v.get_mut("message").and_then(|m| m.get_mut("content")) else { continue };
         match content {
@@ -1180,7 +1231,7 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
             let kind = pad(r.kind.label(), 6);
             let (kind, tail) = match r.kind {
                 Kind::Tool | Kind::Mcp | Kind::Agent => (ui::color::cyan(&kind), if in_preview { tail } else { ui::color::cyan(&tail) }),
-                Kind::Result | Kind::Think => (ui::color::dim(&kind), if in_preview { tail } else { ui::color::dim(&tail) }),
+                Kind::Result | Kind::Think | Kind::Notice => (ui::color::dim(&kind), if in_preview { tail } else { ui::color::dim(&tail) }),
                 Kind::Text => (kind, tail),
             };
             let extra = if extra.is_empty() { extra } else { ui::color::yellow(&extra) };
@@ -1593,6 +1644,10 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str, 
 /// pretty JSON for tool input, or the whole block's JSON with `whole`.
 fn edit_block(st: &mut State, ri: usize, whole: bool, profiles: &[Profile], mark: i64) -> std::io::Result<()> {
     let r = &st.rows[ri];
+    if r.kind == Kind::Notice {
+        st.flash = "notices are read-only — v reads, d deletes".into();
+        return Ok(());
+    }
     let Some(block) = block_at(&st.doc[r.line], r.blk) else { return Ok(()) };
     let block = &block;
     let json_mode = whole || r.kind == Kind::Tool || r.kind == Kind::Mcp || r.kind == Kind::Agent;
@@ -1834,6 +1889,31 @@ mod tests {
         let rows = build_rows(&d, Path::new("."));
         let whos: Vec<&str> = rows.iter().map(|r| r.who).collect();
         assert_eq!(whos, vec!["You", "Claude", "Claude", "You", "Tool"]);
+    }
+
+    #[test]
+    fn system_notices_show_and_delete() {
+        let mut d: Doc = [
+            r#"{"type":"user","uuid":"a","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"system","subtype":"informational","uuid":"n","parentUuid":"a","content":"safeguards stopped the response above"}"#,
+            r#"{"type":"system","subtype":"model_refusal_no_fallback","uuid":"m","parentUuid":"n","content":"","apiRefusalExplanation":"cyber"}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"t","parentUuid":"m"}"#,
+        ]
+        .iter()
+        .map(|s| Arc::new(L::parse(s)))
+        .collect();
+        let rows = build_rows(&d, Path::new("."));
+        assert_eq!(rows.iter().map(|r| r.kind).collect::<Vec<_>>(), vec![Kind::Text, Kind::Notice, Kind::Notice]);
+        let early: Doc = [r#"{"type":"system","subtype":"informational","uuid":"z","content":"early"}"#, r#"{"type":"user","uuid":"a","message":{"role":"user","content":"hi"}}"#]
+            .iter()
+            .map(|s| Arc::new(L::parse(s)))
+            .collect();
+        let er = build_rows(&early, Path::new("."));
+        assert_eq!((er[0].kind, er[0].turn, er[1].turn), (Kind::Notice, 0, 1));
+        assert_eq!(rows[2].info(&d).preview, "cyber");
+        let plan = plan_delete(&rows, &[rows[1].key()].into_iter().collect());
+        assert_eq!(delete_blocks(&mut d, &rows, &plan.set), 1);
+        assert_eq!(build_rows(&d, Path::new(".")).len(), 2);
     }
 
     #[test]
