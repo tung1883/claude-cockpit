@@ -1612,13 +1612,23 @@ fn resolve_dir_input(input: &str, cwd: &std::path::Path) -> std::path::PathBuf {
     if p.is_absolute() { p } else { cwd.join(expanded) }
 }
 
-/// The folders offered under a directory field: those matching what is typed.
+/// Marker and trailing space around a folder name in the grid, plus its
+/// separator.
+const FOLDER_CELL_EXTRA: usize = 5;
+/// Space left of the folder grid.
+const FOLDER_INDENT: usize = 3;
+
+/// The folders offered under a directory field: those matching what is typed,
+/// in a grid.
 #[derive(Default)]
 struct Folders {
     /// The text the list was made for.
     input: Option<String>,
     names: Vec<String>,
     selected: usize,
+    /// The arrows move through the grid; otherwise Left/Right belong to the
+    /// text field.
+    browsing: bool,
 }
 
 impl Folders {
@@ -1630,51 +1640,107 @@ impl Folders {
         let dir = if parent.is_empty() { cwd.to_path_buf() } else { resolve_dir_input(parent, cwd) };
         self.names = dirpick::matches(&dir, name);
         self.selected = 0;
+        self.browsing = false;
         self.input = Some(input.to_string());
     }
 
+    fn grid(&self, width: usize) -> (usize, usize) {
+        dirpick::grid(&self.names, width.saturating_sub(FOLDER_INDENT + 1), FOLDER_CELL_EXTRA)
+    }
+
     /// Handles Tab (open the selected folder), Shift+Tab (one folder up) and
-    /// Up/Down (select). Returns false for any other key.
+    /// the grid keys: Up/Down enter it, then the arrows move, Enter opens and
+    /// Esc goes back to typing. Returns false for any key left to the field.
     fn key(&mut self, code: KeyCode, edit: &mut LineEdit) -> bool {
+        self.key_at(code, edit, ui::term_width())
+    }
+
+    fn key_at(&mut self, code: KeyCode, edit: &mut LineEdit, width: usize) -> bool {
         let count = self.names.len();
+        let to = match code {
+            KeyCode::Up => Some(dirpick::Move::Up),
+            KeyCode::Down => Some(dirpick::Move::Down),
+            KeyCode::Left => Some(dirpick::Move::Left),
+            KeyCode::Right => Some(dirpick::Move::Right),
+            _ => None,
+        };
         match code {
-            KeyCode::Tab => {
-                if let Some(name) = self.names.get(self.selected) {
-                    *edit = LineEdit::new(&dirpick::accept(&edit.buf, name));
+            KeyCode::Tab => self.open(edit),
+            KeyCode::Enter if self.browsing => self.open(edit),
+            KeyCode::BackTab => {
+                *edit = LineEdit::new(&dirpick::up(&edit.buf));
+                self.browsing = false;
+            }
+            KeyCode::Esc if self.browsing => self.browsing = false,
+            KeyCode::Up | KeyCode::Down if !self.browsing => self.browsing = count > 0,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if self.browsing => {
+                if let Some(to) = to {
+                    self.selected = dirpick::step(self.selected, count, self.grid(width).0, to);
                 }
             }
-            KeyCode::BackTab => *edit = LineEdit::new(&dirpick::up(&edit.buf)),
-            KeyCode::Up if count > 0 => self.selected = (self.selected + count - 1) % count,
-            KeyCode::Down if count > 0 => self.selected = (self.selected + 1) % count,
-            KeyCode::Up | KeyCode::Down => {}
-            _ => return false,
+            // Resize arrives as Null and must not end browsing.
+            KeyCode::Null => return false,
+            _ => {
+                self.browsing = false;
+                return false;
+            }
         }
         true
     }
 
-    /// The list and its key hint, to draw under the field.
+    fn open(&mut self, edit: &mut LineEdit) {
+        if let Some(name) = self.names.get(self.selected) {
+            *edit = LineEdit::new(&dirpick::accept(&edit.buf, name));
+        }
+        self.browsing = false;
+    }
+
+    /// The grid and its key hint, to draw under the field.
     fn lines(&self) -> Vec<String> {
-        let room = crossterm::terminal::size().map(|(_, h)| (h as usize).saturating_sub(11)).unwrap_or(10);
-        let range = dirpick::window(self.names.len(), self.selected, room);
+        let (width, height) = crossterm::terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((80, 21));
+        self.lines_at(width, height.saturating_sub(11))
+    }
+
+    fn lines_at(&self, width: usize, room: usize) -> Vec<String> {
+        let (cols, cell) = self.grid(width);
+        let total = self.names.len().div_ceil(cols);
+        let range = dirpick::window(total, self.selected / cols, room);
+        let indent = " ".repeat(FOLDER_INDENT);
         let mut lines = Vec::new();
         if range.start > 0 {
-            lines.push(ui::color::dim(&format!("     ↑ {} more", range.start)));
+            lines.push(ui::color::dim(&format!("{indent}  ↑ {} more", range.start * cols)));
         }
-        for i in range.clone() {
-            let name = format!("{}{}", self.names[i], std::path::MAIN_SEPARATOR);
-            lines.push(if i == self.selected {
-                format!("   {} {}", ui::color::orange(ui::glyph::pointer()), ui::color::orange_bold(&name))
-            } else {
-                format!("     {name}")
-            });
+        for row in range.clone() {
+            let mut line = indent.clone();
+            for (i, folder) in self.names.iter().enumerate().skip(row * cols).take(cols) {
+                let room = cell.saturating_sub(FOLDER_CELL_EXTRA - 1);
+                let short = if folder.chars().count() > room {
+                    format!("{}…", folder.chars().take(room.saturating_sub(1)).collect::<String>())
+                } else {
+                    folder.clone()
+                };
+                let name = format!("{short}{}", std::path::MAIN_SEPARATOR);
+                let item = if i == self.selected {
+                    let name = if self.browsing { ui::color::orange_bold(&name) } else { name };
+                    format!("{} {name}", ui::color::orange(ui::glyph::pointer()))
+                } else {
+                    format!("  {name}")
+                };
+                line.push_str(&layout::pad_to(&item, cell));
+            }
+            lines.push(line.trim_end().to_string());
         }
-        if range.end < self.names.len() {
-            lines.push(ui::color::dim(&format!("     ↓ {} more", self.names.len() - range.end)));
+        if range.end < total {
+            lines.push(ui::color::dim(&format!("{indent}  ↓ {} more", self.names.len() - range.end * cols)));
         }
         if self.names.is_empty() {
             lines.push(ui::color::dim("     (no folder matches)"));
         }
-        lines.push(ui::color::dim("   Tab open · Shift+Tab up · ↑/↓ choose"));
+        lines.push(ui::color::dim(if self.browsing {
+            "   ←↑↓→ move · Enter/Tab open · Esc back to typing"
+        } else {
+            "   Tab open · Shift+Tab up · ↑/↓ browse"
+        }));
         lines
     }
 }
@@ -3306,6 +3372,29 @@ mod tests {
         assert_eq!(click_report(all, Utf8, 4, 9), Some(b"\x1b[M %*\x1b[M#%*".to_vec()));
         assert_eq!(click_report(MouseProtocolMode::Press, Sgr, 0, 0), Some(b"\x1b[<0;1;1M".to_vec()));
         assert_eq!(click_report(MouseProtocolMode::None, Sgr, 0, 0), None);
+    }
+
+    #[test]
+    fn arrows_belong_to_the_text_until_the_folder_grid_is_entered() {
+        let mut folders = Folders { names: ["a", "b", "c", "d", "e"].map(String::from).to_vec(), ..Default::default() };
+        let mut edit = LineEdit::new("x/");
+        // Width 22 leaves 18 columns: three cells of 6.
+        let mut press = |f: &mut Folders, code| f.key_at(code, &mut edit, 22);
+        assert!(!press(&mut folders, KeyCode::Left));
+        assert!(press(&mut folders, KeyCode::Down));
+        assert_eq!((folders.browsing, folders.selected), (true, 0));
+        assert!(press(&mut folders, KeyCode::Right));
+        assert!(press(&mut folders, KeyCode::Down));
+        assert_eq!(folders.selected, 4);
+        assert!(press(&mut folders, KeyCode::Esc));
+        assert!(!folders.browsing);
+        assert!(!press(&mut folders, KeyCode::Esc), "the second Esc cancels the prompt");
+        press(&mut folders, KeyCode::Up);
+        assert!(!press(&mut folders, KeyCode::Char('z')) && !folders.browsing);
+        press(&mut folders, KeyCode::Up);
+        assert!(press(&mut folders, KeyCode::Enter));
+        assert_eq!(edit.buf, "x/e/");
+        assert_eq!(folders.lines_at(22, 10).len(), 3, "two rows and the hint");
     }
 
     #[test]

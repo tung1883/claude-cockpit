@@ -71,9 +71,69 @@ pub fn window(count: usize, selected: usize, room: usize) -> std::ops::Range<usi
     start..(start + room).min(count)
 }
 
+/// Widest a grid cell gets; longer names are cut short.
+const MAX_CELL: usize = 24;
+
+/// How many columns the names make in `width` terminal columns, and how wide
+/// each cell is: the longest name plus `extra` (marker, separator, spacing).
+pub fn grid(names: &[String], width: usize, extra: usize) -> (usize, usize) {
+    let longest = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let cell = (longest + extra).min(MAX_CELL).min(width.max(1));
+    ((width / cell.max(1)).max(1), cell)
+}
+
+/// A move in a grid that reads left to right, then down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Move {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Where `selected` lands among `count` entries laid out in `cols` columns.
+/// Moving past an edge stays put; down into a short last row takes its end.
+pub fn step(selected: usize, count: usize, cols: usize, to: Move) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let (last, cols) = (count - 1, cols.max(1));
+    match to {
+        Move::Left => selected.saturating_sub(1),
+        Move::Right => (selected + 1).min(last),
+        Move::Up if selected >= cols => selected - cols,
+        Move::Down if selected + cols <= last => selected + cols,
+        Move::Down if selected / cols < last / cols => last,
+        Move::Up | Move::Down => selected,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_grid_fits_the_width_and_caps_long_names() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(grid(&names(&["src", "target"]), 80, 4), (8, 10));
+        assert_eq!(grid(&names(&[&"x".repeat(80)]), 100, 4), (4, MAX_CELL));
+        assert_eq!(grid(&names(&["abc"]), 5, 4), (1, 5));
+        assert_eq!(grid(&[], 80, 4).1, 4);
+    }
+
+    #[test]
+    fn grid_moves_stay_inside_the_entries() {
+        // 0 1 2 / 3 4 5 / 6
+        assert_eq!(step(1, 7, 3, Move::Down), 4);
+        assert_eq!(step(4, 7, 3, Move::Down), 6);
+        assert_eq!(step(6, 7, 3, Move::Down), 6);
+        assert_eq!(step(4, 7, 3, Move::Up), 1);
+        assert_eq!(step(1, 7, 3, Move::Up), 1);
+        assert_eq!(step(0, 7, 3, Move::Left), 0);
+        assert_eq!(step(2, 7, 3, Move::Right), 3);
+        assert_eq!(step(6, 7, 3, Move::Right), 6);
+        assert_eq!(step(0, 0, 3, Move::Down), 0);
+    }
 
     #[test]
     fn splits_at_the_last_separator() {
