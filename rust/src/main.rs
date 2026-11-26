@@ -2,6 +2,7 @@ mod account_settings;
 mod clipboard;
 mod conpty;
 mod detail;
+mod dirpick;
 mod editor;
 mod input;
 mod inspect;
