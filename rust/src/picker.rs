@@ -18,6 +18,7 @@ pub enum Action {
     Memory(String),
     Panels(String),
     ResumeSession,
+    Restore,
     Settings(String),
     Sessions,
 }
@@ -42,7 +43,7 @@ fn notes_onboarding(profiles: &[Profile], selected: usize, stats: &[Stat]) -> st
 /// The main account picker. One blocking `read_key()` call per loop
 /// iteration — raw mode was already enabled once for the whole process by
 /// `ui::Terminal::enter`, so there's no per-screen mode toggling here at all.
-pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> std::io::Result<Action> {
+pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_saved: bool) -> std::io::Result<Action> {
     if profiles.is_empty() {
         return Ok(Action::Add);
     }
@@ -57,12 +58,15 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
             lines.push(String::new());
             lines.push(format!("  {} a detached session is running", ui::color::orange(ui::glyph::spark())));
         }
-        let row1: Vec<(&str, &str)> =
+        let mut row1: Vec<(&str, &str)> =
             vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("m", "memory"), (",", "settings"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
             vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), ("/", "sessions")];
         if has_session {
             row2.push(("^B", "resume"));
+        }
+        if has_saved {
+            row1.push(("o", "restore"));
         }
         lines.extend(layout::hint_grid(&[&row1, &row2], 16));
         ui::repaint(&lines);
@@ -129,6 +133,10 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool) -> st
             KeyCode::Char('r') => {
                 ui::show_cursor();
                 return Ok(Action::Refresh);
+            }
+            KeyCode::Char('o') if has_saved => {
+                ui::show_cursor();
+                return Ok(Action::Restore);
             }
             KeyCode::Char('g') => {
                 ui::show_cursor();
@@ -442,6 +450,12 @@ pub fn scroll_screen(header: &[String], rows: &[ScrollRow], start: Option<&str>,
     scroll_screen_ext(header, rows, start, external_key, None, None)
 }
 
+/// `scroll_screen` opened on row `at` (an index into `rows`, which need not
+/// have a value), with a few lines of context above it.
+pub fn scroll_screen_at(header: &[String], rows: &[ScrollRow], at: usize) -> std::io::Result<ListChoice> {
+    scroll_list(header, rows, None, Some(at), None, None, None)
+}
+
 /// Like `scroll_screen`, but with a second, selection-independent key (e.g.
 /// "c" to close a feature) that returns `ListChoice::Command` regardless of
 /// which row is highlighted, and/or a third, row-scoped key (e.g. "h" to
@@ -456,12 +470,25 @@ pub fn scroll_screen_ext(
     command_key: Option<(char, &str)>,
     row_action_key: Option<(char, &str)>,
 ) -> std::io::Result<ListChoice> {
+    scroll_list(header, rows, start, None, external_key, command_key, row_action_key)
+}
+
+fn scroll_list(
+    header: &[String],
+    rows: &[ScrollRow],
+    start: Option<&str>,
+    at: Option<usize>,
+    external_key: Option<char>,
+    command_key: Option<(char, &str)>,
+    row_action_key: Option<(char, &str)>,
+) -> std::io::Result<ListChoice> {
     let selectable_idx: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
     let any_pickable = rows.iter().any(|r| r.value.is_some());
     let mut pos = start
         .and_then(|s| selectable_idx.iter().position(|&i| rows[i].value.as_deref() == Some(s)))
+        .or_else(|| at.and_then(|a| selectable_idx.iter().position(|&i| i == a)))
         .unwrap_or(0);
-    let mut top = 0usize;
+    let mut top = at.map_or(0, |a| a.saturating_sub(3));
     let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(header.len() + 5).max(5);
     // Letters this screen gives its own meaning to (open-externally, command,
     // row action) must survive the vim-navigation gate even when it's off.

@@ -16,8 +16,10 @@ use crate::conpty;
 use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
+use crate::workspace::{self, SavedPane, Start};
 use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui, worktree};
 use anyhow::Result;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use std::collections::HashSet;
@@ -47,6 +49,10 @@ struct Pane {
     sysprompt_tmp: Option<std::path::PathBuf>,
     /// Whether this pane runs Claude (vs. a plain shell).
     claude: bool,
+    /// The Claude session the pane was started with, and the file where the
+    /// session reports its id when `/clear` or `/resume` changes it.
+    session_id: Option<String>,
+    track: Option<std::path::PathBuf>,
     /// When set, a Ctrl+L is due to be sent to this (Claude) pane — see
     /// `RESIZE_NUDGE`.
     nudge_at: Mutex<Option<std::time::Instant>>,
@@ -107,9 +113,23 @@ fn send_to_pane(pane: &Pane, bytes: &[u8]) {
     }
 }
 
+impl Pane {
+    /// What the saved layout keeps of this pane.
+    fn saved(&self) -> SavedPane {
+        SavedPane {
+            profile: self.meta.profile.clone(),
+            project: self.meta.project.clone(),
+            shell: !self.claude,
+            mode: self.meta.mode,
+            session_id: self.track.as_deref().and_then(workspace::read_track).or_else(|| self.session_id.clone()),
+            worktree: self.meta.worktree.clone(),
+        }
+    }
+}
+
 impl Drop for Pane {
     fn drop(&mut self) {
-        if let Some(path) = &self.sysprompt_tmp {
+        for path in [&self.sysprompt_tmp, &self.track].into_iter().flatten() {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -125,6 +145,15 @@ impl HasMeta for Pane {
 }
 
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+/// "What terminal are you?" (primary device attributes), in both spellings.
+/// The bundled console (`conpty.rs`) asks it as a pane starts and holds the
+/// child back for about 3 s when nobody answers.
+const ATTRIBUTES_QUERIES: [&[u8]; 2] = [b"\x1b[c", b"\x1b[0c"];
+/// A VT220 with ANSI color.
+const ATTRIBUTES_REPLY: &[u8] = b"\x1b[?62;22c";
+/// Output kept from one read to the next, to see a query split between them:
+/// all but the last byte of the longest.
+const CARRY: usize = 3;
 
 /// Feeds one chunk of PTY output to the pane's screen and answers every
 /// Cursor Position Report request ("\x1b[6n") in it with the cursor
@@ -154,7 +183,8 @@ fn process_output(
     reported: &Mutex<osc7501::Reports>,
 ) {
     let mut scan = std::mem::take(carry);
-    let mut fed = scan.len(); // everything before this index was parsed last time
+    let carried = scan.len(); // everything before this index was seen last time
+    let mut fed = carried; // everything before this index has been parsed
     scan.extend_from_slice(chunk);
     let mut replies: Vec<Vec<u8>> = Vec::new();
     if let Ok(mut p) = parser.lock() {
@@ -176,9 +206,13 @@ fn process_output(
             r.apply(ev);
         }
     }
-    // Keep only a partial tail: never enough bytes to re-match a query
-    // this call already answered.
-    let keep = scan.len().min(CURSOR_QUERY.len() - 1);
+    // After the status reply: a program that asks several things ends with
+    // this one and takes its answer to mean no more are coming. Only a query
+    // that ends in this chunk counts, so none is answered twice.
+    let attributes = (carried..scan.len()).filter(|&last| ATTRIBUTES_QUERIES.iter().any(|q| scan[..=last].ends_with(q)));
+    replies.extend(attributes.map(|_| ATTRIBUTES_REPLY.to_vec()));
+    // Keep only a partial tail.
+    let keep = scan.len().min(CARRY);
     carry.extend_from_slice(&scan[scan.len() - keep..]);
     if replies.is_empty() {
         return;
@@ -195,6 +229,15 @@ fn process_output(
 /// one (the pane then runs in the worktree folder; its project stays the repo
 /// so the pane list groups it with the repo's other panes).
 fn spawn_target(t: &Target, cols: u16, rows: u16) -> Result<Pane> {
+    if let Some(r) = &t.restore {
+        let mut pane = match r.start {
+            Start::Shell => spawn_shell_pane(&t.profile, &r.dir, cols, rows)?,
+            _ => spawn_claude_pane(&t.profile, &r.dir, &r.start, cols, rows)?,
+        };
+        pane.meta.project = r.saved.project.clone();
+        pane.meta.worktree = r.saved.worktree.clone();
+        return Ok(pane);
+    }
     let Some(spec) = &t.worktree else {
         return spawn_pane(&t.profile, &t.dir, cols, rows);
     };
@@ -218,7 +261,7 @@ fn spawn_target(t: &Target, cols: u16, rows: u16) -> Result<Pane> {
 fn ask_worktree(profile: &str, dir: &std::path::Path, queued: &[String]) -> Result<Option<Target>> {
     let Some(repo) = worktree::repo_root(dir) else { return Ok(None) };
     let spec = prompt_worktree(&repo, queued)?;
-    Ok(spec.map(|spec| Target { profile: profile.to_string(), dir: dir.to_path_buf(), worktree: Some(spec) }))
+    Ok(spec.map(|spec| Target { profile: profile.to_string(), dir: dir.to_path_buf(), worktree: Some(spec), restore: None }))
 }
 
 /// The worktree name prompt: Name (typed), From (Tab switches between the
@@ -283,8 +326,20 @@ fn prompt_worktree(repo: &std::path::Path, queued: &[String]) -> Result<Option<W
 /// Starts a Claude session for `profile` in `project`. The pane comes back
 /// hidden and unnumbered; `register` + `sidebar::set_mode` place it.
 fn spawn_pane(profile: &str, project: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
-    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, project);
-    spawn_pane_cmd(cmd, sysprompt_tmp, true, profile, project, cols, rows)
+    spawn_claude_pane(profile, project, &Start::Fresh(uuid::Uuid::new_v4().to_string()), cols, rows)
+}
+
+/// A Claude pane that starts or resumes the session `start` names.
+fn spawn_claude_pane(profile: &str, dir: &std::path::Path, start: &Start, cols: u16, rows: u16) -> Result<Pane> {
+    let track = workspace::new_track_path();
+    let (cmd, sysprompt_tmp) = launch::claude_pty_command(profile, dir, start, &track);
+    let mut pane = spawn_pane_cmd(cmd, sysprompt_tmp, true, profile, dir, cols, rows)?;
+    pane.session_id = match start {
+        Start::Fresh(id) | Start::Resume(id) => Some(id.clone()),
+        Start::Shell => None,
+    };
+    pane.track = Some(track);
+    Ok(pane)
 }
 
 /// A pane running a plain interactive shell instead of Claude, listed under
@@ -320,7 +375,7 @@ fn spawn_pane_cmd(
     let writer_bg = writer.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut carry = Vec::with_capacity(CURSOR_QUERY.len());
+        let mut carry = Vec::with_capacity(CARRY);
         let mut osc = osc7501::Scanner::default();
         loop {
             match reader.read(&mut buf) {
@@ -344,7 +399,7 @@ fn spawn_pane_cmd(
         last_focus: 0,
         worktree: None,
     };
-    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, session_id: None, track: None, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
 
 /// Appends `;<sgr color params>` for one colour to an SGR sequence being built.
@@ -630,11 +685,13 @@ struct Target {
     profile: String,
     dir: std::path::PathBuf,
     worktree: Option<WorktreeSpec>,
+    /// Set when reopening a saved pane; it then decides folder and session.
+    restore: Option<workspace::Planned>,
 }
 
 impl Target {
     fn plain(profile: &str, dir: std::path::PathBuf) -> Target {
-        Target { profile: profile.to_string(), dir, worktree: None }
+        Target { profile: profile.to_string(), dir, worktree: None, restore: None }
     }
 }
 
@@ -1026,7 +1083,34 @@ pub fn run_split_profiles(profiles: &[Profile], profile_names: &[String]) -> Res
 /// interactive picker (`pick_pane_target`, → to pick another project)
 /// needs underneath.
 fn run_split_targets(profiles: &[Profile], targets: &[Target]) -> Result<Option<Session>> {
-    let cwd = std::env::current_dir()?;
+    start_split(profiles, targets, std::env::current_dir()?, None)
+}
+
+/// What `start_split` needs beyond the targets when reopening a saved layout.
+struct Restoring {
+    claim: workspace::Claim,
+    /// The target to focus.
+    focus: usize,
+    /// Why panes were left out, shown once the split is up.
+    notes: Vec<String>,
+}
+
+/// Reopens a saved layout. It is deleted once the new panes are saved.
+pub fn restore(profiles: &[Profile], saved: &workspace::Saved) -> Result<Option<Session>> {
+    let claim = workspace::Claim::new(&saved.path).ok_or_else(|| anyhow::anyhow!("that layout is no longer available"))?;
+    let (planned, focus, notes) = workspace::plan(&saved.workspace, &workspace::Disk, || uuid::Uuid::new_v4().to_string());
+    if planned.is_empty() {
+        return Err(anyhow::anyhow!("nothing to restore: {}", notes.join("; ")));
+    }
+    let cwd = if saved.workspace.cwd.is_dir() { saved.workspace.cwd.clone() } else { std::env::current_dir()? };
+    let targets: Vec<Target> = planned
+        .into_iter()
+        .map(|r| Target { restore: Some(r.clone()), ..Target::plain(&r.saved.profile, r.dir) })
+        .collect();
+    start_split(profiles, &targets, cwd, Some(Restoring { claim, focus, notes }))
+}
+
+fn start_split(profiles: &[Profile], targets: &[Target], cwd: std::path::PathBuf, mut restoring: Option<Restoring>) -> Result<Option<Session>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let cap = shown_cap(cols, rows);
     let (_, gw) = grid_area(cols);
@@ -1042,12 +1126,28 @@ fn run_split_targets(profiles: &[Profile], targets: &[Target]) -> Result<Option<
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("pane spawn panicked")))).collect()
     });
     let mut panes: Vec<Pane> = Vec::with_capacity(targets.len());
-    for pane in spawned {
+    let mut keeper = Keeper::new(cwd.clone());
+    let mut focus = 0usize;
+    for (i, (target, pane)) in targets.iter().zip(spawned).enumerate() {
         match pane {
             Ok(p) => {
+                if restoring.as_ref().is_some_and(|r| r.focus == i) {
+                    focus = panes.len();
+                }
                 // The first `cap` are drawn, the rest wait in the list.
                 let idx = register(&mut panes, p);
-                panes[idx].meta.mode = if idx < cap { Mode::Small } else { Mode::Hidden };
+                panes[idx].meta.mode = match &target.restore {
+                    Some(r) => r.saved.mode,
+                    None if idx < cap => Mode::Small,
+                    None => Mode::Hidden,
+                };
+            }
+            // A restored pane that cannot start stays saved for next time.
+            Err(e) if restoring.is_some() => {
+                if let (Some(r), Some(planned)) = (&mut restoring, &target.restore) {
+                    r.notes.push(format!("{}: {e}", planned.saved.profile));
+                    keeper.lost.push(planned.saved.clone());
+                }
             }
             Err(e) => {
                 for p in &mut panes {
@@ -1057,17 +1157,66 @@ fn run_split_targets(profiles: &[Profile], targets: &[Target]) -> Result<Option<
             }
         }
     }
-    let mut focus = 0usize;
-    sidebar::focus_pane(&mut panes, &mut focus, 0);
+    let mut toast = None;
+    if let Some(r) = restoring {
+        if panes.is_empty() {
+            // The claim is dropped unfinished, so the layout survives.
+            return Err(anyhow::anyhow!("nothing could be restored: {}", r.notes.join("; ")));
+        }
+        toast = (!r.notes.is_empty()).then(|| format!("not restored: {}", r.notes.join("; ")));
+        keeper.claim = Some(r.claim);
+    }
+    let target = focus;
+    sidebar::focus_pane(&mut panes, &mut focus, target);
+    settle(&mut panes, &mut focus, cols, rows);
 
     ui::hide_cursor();
     // The shared `cwd` here (not each pane's own project) is what F9/`
     // shell`'s drop-to-shell and F7's "add a pane" default to — cockpit's
     // own launch directory, not whichever project a given pane happens to
     // be running in.
-    let exit = run_loop(&mut panes, &mut focus, profiles, &cwd);
+    let exit = run_loop(&mut panes, &mut focus, profiles, &cwd, &mut keeper, toast);
     ui::show_cursor();
-    finish(panes, focus, cwd, exit)
+    finish(panes, focus, cwd, keeper, exit)
+}
+
+/// How often a running split writes its layout.
+const SAVE_EVERY: Duration = Duration::from_secs(1);
+
+/// Keeps a split's saved layout (see `workspace.rs`) in step with its panes.
+struct Keeper {
+    store: Option<workspace::Store>,
+    /// The folder cockpit ran in.
+    cwd: std::path::PathBuf,
+    /// Panes that are gone but stay saved: their program failed.
+    lost: Vec<SavedPane>,
+    /// The layout this split was restored from, deleted once saved again.
+    claim: Option<workspace::Claim>,
+    saved_at: Option<std::time::Instant>,
+}
+
+impl Keeper {
+    fn new(cwd: std::path::PathBuf) -> Keeper {
+        Keeper { store: workspace::Store::create_in(&workspace::dir()), cwd, lost: Vec::new(), claim: None, saved_at: None }
+    }
+
+    fn save(&mut self, panes: &[Pane], focus: usize) {
+        self.saved_at = Some(std::time::Instant::now());
+        let Some(store) = &mut self.store else { return };
+        let saved = panes.iter().map(Pane::saved).chain(self.lost.iter().cloned()).collect();
+        if store.save(&workspace::Workspace { cwd: self.cwd.clone(), focus, panes: saved }) {
+            if let Some(claim) = self.claim.take() {
+                claim.finish();
+            }
+        }
+    }
+
+    /// `save`, at most once per `SAVE_EVERY`.
+    fn tick(&mut self, panes: &[Pane], focus: usize) {
+        if self.saved_at.map_or(true, |at| at.elapsed() >= SAVE_EVERY) {
+            self.save(panes, focus);
+        }
+    }
 }
 
 /// A detached split/session handed back to the cockpit: its panes' PTYs and
@@ -1078,6 +1227,7 @@ pub struct Session {
     panes: Vec<Pane>,
     focus: usize,
     cwd: std::path::PathBuf,
+    keeper: Keeper,
 }
 
 impl Session {
@@ -1103,9 +1253,9 @@ enum LoopExit {
 
 /// Turns a run-loop outcome into either a live `Session` (detach) or a clean
 /// teardown (quit / error), killing children in the latter cases.
-fn finish(mut panes: Vec<Pane>, focus: usize, cwd: std::path::PathBuf, exit: Result<LoopExit>) -> Result<Option<Session>> {
+fn finish(mut panes: Vec<Pane>, focus: usize, cwd: std::path::PathBuf, keeper: Keeper, exit: Result<LoopExit>) -> Result<Option<Session>> {
     match exit {
-        Ok(LoopExit::Detach) => Ok(Some(Session { panes, focus, cwd })),
+        Ok(LoopExit::Detach) => Ok(Some(Session { panes, focus, cwd, keeper })),
         Ok(LoopExit::Quit) => {
             for pane in &mut panes {
                 let _ = pane.child.kill();
@@ -1129,7 +1279,7 @@ pub fn resume(mut session: Session, profiles: &[Profile]) -> Result<Option<Sessi
     settle(&mut session.panes, &mut session.focus, cols, rows);
     ui::hide_cursor();
     let cwd = session.cwd.clone();
-    let exit = run_loop(&mut session.panes, &mut session.focus, profiles, &cwd);
+    let exit = run_loop(&mut session.panes, &mut session.focus, profiles, &cwd, &mut session.keeper, None);
     ui::show_cursor();
     match exit {
         Ok(LoopExit::Detach) => Ok(Some(session)),
@@ -1406,7 +1556,7 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
                             error = p;
                         } else {
                             let resolved = resolve_dir_input(&dir.buf, cwd);
-                            break Some(Target { profile: profile.to_string(), dir: resolved, worktree: Some(WorktreeSpec { name, base: bases[base_i].clone() }) });
+                            break Some(Target { profile: profile.to_string(), dir: resolved, worktree: Some(WorktreeSpec { name, base: bases[base_i].clone() }), restore: None });
                         }
                     }
                 }
@@ -2016,6 +2166,49 @@ const WHEEL_LINES: usize = 3;
 /// pane's top or bottom edge.
 const AUTOSCROLL_EVERY: Duration = Duration::from_millis(50);
 
+/// One wheel notch at pane cell (`col`, `row`), 0-based, as the program in the
+/// pane asked to be told about the mouse; None when it did not ask.
+fn wheel_report(mode: MouseProtocolMode, encoding: MouseProtocolEncoding, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+    let button: u16 = if up { 64 } else { 65 };
+    let (x, y) = (col.saturating_add(1), row.saturating_add(1));
+    Some(match encoding {
+        MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        // The older forms send each value as one character, offset by 32.
+        MouseProtocolEncoding::Default => {
+            let byte = |v: u16| v.saturating_add(32).min(255) as u8;
+            vec![0x1b, b'[', b'M', byte(button), byte(x), byte(y)]
+        }
+        MouseProtocolEncoding::Utf8 => {
+            let ch = |v: u16| char::from_u32(u32::from(v) + 32).unwrap_or(' ');
+            format!("\x1b[M{}{}{}", ch(button), ch(x), ch(y)).into_bytes()
+        }
+    })
+}
+
+/// The wheel over `pane` at cell (`col`, `row`). A program that takes the mouse
+/// (fullscreen Claude Code) keeps its own history and scrolls it itself, so it
+/// gets the event; otherwise the pane's history scrolls.
+fn wheel_pane(pane: &Pane, up: bool, col: u16, row: u16) {
+    let report = pane.parser.lock().ok().and_then(|p| {
+        let screen = p.screen();
+        wheel_report(screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), up, col, row)
+    });
+    match report {
+        // Written directly: it is not typing, so none of `send_to_pane`'s
+        // handling applies.
+        Some(bytes) => {
+            if let Ok(mut w) = pane.writer.lock() {
+                let _ = w.write_all(&bytes);
+                let _ = w.flush();
+            }
+        }
+        None => scroll_pane(pane, if up { WHEEL_LINES as isize } else { -(WHEEL_LINES as isize) }),
+    }
+}
+
 /// Scrolls `pane`'s history by `delta` lines (positive = back in time), clamped
 /// to what the vt100 buffer holds.
 fn scroll_pane(pane: &Pane, delta: isize) {
@@ -2290,12 +2483,14 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
 /// Asks the terminal for focus-in/out reports while the split runs, so a
 /// pane the user is looking at does not raise a notification only while the
 /// window is actually in front.
-fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
+fn run_loop(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path, keeper: &mut Keeper, toast: Option<String>) -> Result<LoopExit> {
     focus_reports(true);
     // Without mouse capture the terminal turns the wheel into Up/Down keys (in
     // the alternate screen), which scrolled through Claude's input history.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    let result = run_loop_inner(panes, focus, profiles, cwd);
+    let result = run_loop_inner(panes, focus, profiles, cwd, keeper, toast);
+    // Before the caller kills anything: what is open now is what comes back.
+    keeper.save(panes, *focus);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     focus_reports(false);
     result
@@ -2307,7 +2502,7 @@ fn focus_reports(on: bool) {
     let _ = out.flush();
 }
 
-fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path) -> Result<LoopExit> {
+fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd: &std::path::Path, keeper: &mut Keeper, toast: Option<String>) -> Result<LoopExit> {
     let mut ctl = Ctl {
         typed: String::new(),
         side: SideState { focus: false, cursor: String::new(), collapsed: HashSet::new(), scroll: 0 },
@@ -2321,7 +2516,11 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         pointer: (0, 0),
         last_autoscroll: std::time::Instant::now(),
     };
+    if let Some(t) = toast {
+        ctl.say(t);
+    }
     loop {
+        keeper.tick(panes, *focus);
         // Send the post-resize Ctrl+L to any Claude pane whose resize has
         // settled (see `RESIZE_NUDGE`).
         let now = std::time::Instant::now();
@@ -2551,10 +2750,13 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                     let lay = make_layout(cols, rows, drawn.len().max(1));
                     match m.kind {
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                            let delta = if m.kind == MouseEventKind::ScrollUp { WHEEL_LINES as isize } else { -(WHEEL_LINES as isize) };
-                            // The pane under the pointer, else the focused one.
-                            let target = pane_cell(&lay, &drawn, m.column, m.row).map(|c| c.0).unwrap_or(*focus);
-                            scroll_pane(&panes[target], delta);
+                            // The pane under the pointer, else the focused one; off
+                            // a pane's text (a label, the list) its top left cell.
+                            let (target, row, col) = match pane_cell(&lay, &drawn, m.column, m.row) {
+                                Some((idx, row, col)) => (idx, row.unwrap_or(0), col),
+                                None => (*focus, 0, 0),
+                            };
+                            wheel_pane(&panes[target], m.kind == MouseEventKind::ScrollUp, col, row);
                             ctl.force = true;
                         }
                         // Selecting text is done here, since mouse capture
@@ -2621,7 +2823,11 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         let mut i = 0;
         let mut removed = false;
         while i < panes.len() {
-            if matches!(panes[i].child.try_wait(), Ok(Some(_))) {
+            if let Ok(Some(status)) = panes[i].child.try_wait() {
+                // A clean exit is the user closing it; a failed one stays saved.
+                if !status.success() {
+                    keeper.lost.push(panes[i].saved());
+                }
                 if remove_pane(panes, focus, i) {
                     return Ok(LoopExit::Quit);
                 }
@@ -2697,6 +2903,47 @@ mod tests {
     #[test]
     fn ordinary_output_is_never_answered() {
         assert!(feed(&[b"hello\x1b[31mred\x1b[0m\r\n", b"\x1b[6", b"m"]).is_empty());
+    }
+
+    #[test]
+    fn device_attributes_are_answered_once_however_the_query_is_split() {
+        let reply = ATTRIBUTES_REPLY.to_vec();
+        for query in ATTRIBUTES_QUERIES {
+            let data = [b"hi", query, b"there"].concat();
+            assert_eq!(feed(&[&data]), vec![reply.clone()]);
+            for cut in 1..data.len() {
+                assert_eq!(feed(&[&data[..cut], &data[cut..]]), vec![reply.clone()], "cut at {cut}");
+            }
+            let bytes: Vec<&[u8]> = data.chunks(1).collect();
+            assert_eq!(feed(&bytes), vec![reply.clone()]);
+        }
+    }
+
+    #[test]
+    fn secondary_attributes_and_replies_are_not_answered() {
+        assert!(feed(&[b"\x1b[>c\x1b[>0c\x1b[?62;22c\x1b[1c"]).is_empty());
+    }
+
+    #[test]
+    fn the_attributes_answer_comes_after_the_other_answers() {
+        // What Claude Code sends together as it starts.
+        let writes = feed(&[b"\x1b[>0q\x1b[?u\x1b]7501;?\x1b\\\x1b[c\x1b[6n"]);
+        assert_eq!(writes, vec![b"\x1b[1;1R".to_vec(), osc7501::QUERY_REPLY.to_vec(), ATTRIBUTES_REPLY.to_vec()]);
+    }
+
+    #[test]
+    fn the_wheel_is_reported_only_to_a_program_that_takes_the_mouse() {
+        // What a fullscreen program sends to ask for the mouse, in SGR form.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let report = |p: &vt100::Parser, up| wheel_report(p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding(), up, 4, 9);
+        assert_eq!(report(&parser, true), None);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(report(&parser, true), Some(b"\x1b[<64;5;10M".to_vec()));
+        assert_eq!(report(&parser, false), Some(b"\x1b[<65;5;10M".to_vec()));
+        parser.process(b"\x1b[?1006l");
+        assert_eq!(report(&parser, true), Some(vec![0x1b, b'[', b'M', 96, 37, 42]));
+        parser.process(b"\x1b[?1000l");
+        assert_eq!(report(&parser, true), None);
     }
 
     #[test]

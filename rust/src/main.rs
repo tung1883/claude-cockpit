@@ -21,11 +21,14 @@ mod settings;
 mod settings_docs;
 mod statusline;
 mod pins;
+mod plugin;
 mod sessions;
 mod sync;
+mod toc;
 mod transcript;
 mod handoff;
 mod ui;
+mod workspace;
 mod worktree;
 
 use anyhow::Result;
@@ -480,6 +483,72 @@ fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// The start-up question about the newest saved layout: true to restore it.
+/// "Not now" keeps it for the home screen's `o`.
+fn ask_restore(profiles: &[profiles::Profile], mark: i64, saved: &workspace::Saved) -> Result<bool> {
+    let n = saved.workspace.panes.len();
+    let heading = format!("Restore {n} pane{}?", if n == 1 { "" } else { "s" });
+    let hint = format!("{} · {}", session::relative_age(Some(saved.modified)), workspace::describe(&saved.workspace));
+    let option = |label: &str, value: &str, note: &str| picker::ListOption { label: label.into(), value: value.into(), note: Some(note.into()) };
+    let options = [
+        option("Yes", "yes", "reopen the panes"),
+        option("Not now", "later", "keep it: o on the home screen"),
+        option("Discard", "discard", "forget this layout (the sessions stay)"),
+    ];
+    Ok(match picker::choose_from_list(profiles, mark, &heading, Some(&hint), &options, None)? {
+        picker::ListChoice::Picked(v) if v == "yes" => true,
+        picker::ListChoice::Picked(v) if v == "discard" => {
+            workspace::discard(&saved.path);
+            false
+        }
+        _ => false,
+    })
+}
+
+/// The saved layouts, newest first: Enter picks one, `d` discards it.
+fn pick_layout(profiles: &[profiles::Profile], mark: i64) -> Result<Option<workspace::Saved>> {
+    loop {
+        let mut saved = workspace::list();
+        if saved.is_empty() {
+            return Ok(None);
+        }
+        let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+        let mut header = layout::account_lines(profiles, mark, &stats);
+        header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Restore panes")));
+        header.push(String::new());
+        let width = ui::term_width().saturating_sub(6);
+        let rows: Vec<picker::ScrollRow> = saved
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let text = format!("{:<10} {}", session::relative_age(Some(s.modified)), workspace::describe(&s.workspace));
+                picker::ScrollRow::pick(text.chars().take(width).collect::<String>(), i.to_string())
+            })
+            .collect();
+        match picker::scroll_screen_ext(&header, &rows, None, None, None, Some(('d', "discard")))? {
+            picker::ListChoice::Picked(v) => return Ok(v.parse().ok().filter(|&i| i < saved.len()).map(|i: usize| saved.swap_remove(i))),
+            picker::ListChoice::RowAction(_, v) => {
+                if let Some(s) = v.parse::<usize>().ok().and_then(|i| saved.get(i)) {
+                    workspace::discard(&s.path);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn restore_layout(profiles: &[profiles::Profile], saved: &workspace::Saved, session: &mut Option<panels::Session>) -> Result<()> {
+    match panels::restore(profiles, saved) {
+        Ok(s) => *session = s,
+        Err(e) => {
+            ui::home_clear();
+            eprintln!("{}", ui::color::red(&format!("Restore failed: {e}")));
+            picker::prompt_line("Press Enter...")?;
+        }
+    }
+    Ok(())
+}
+
 /// Detail-view data (plugin/skill/MCP scan + session grouping) keyed by
 /// profile name, filled in by a background thread started at cockpit
 /// startup so it's usually already sitting there by the time you press →
@@ -517,6 +586,8 @@ fn cockpit() -> Result<()> {
     // here so the cockpit can offer to resume it. Dropped (killing its panes)
     // when the cockpit exits.
     let mut session: Option<panels::Session> = None;
+    // A layout left by an earlier run is offered once, at the start.
+    let mut offer_restore = true;
 
     loop {
         let profiles = profiles::list_profiles()?;
@@ -539,7 +610,16 @@ fn cockpit() -> Result<()> {
         }
 
         cursor = cursor.min(profiles.len() - 1);
-        let action = picker::pick_profile(&profiles, cursor, session.is_some())?;
+        if std::mem::take(&mut offer_restore) {
+            if let Some(saved) = workspace::list().into_iter().next() {
+                if ask_restore(&profiles, cursor as i64, &saved)? {
+                    restore_layout(&profiles, &saved, &mut session)?;
+                    continue;
+                }
+            }
+        }
+        let has_saved = !workspace::list().is_empty();
+        let action = picker::pick_profile(&profiles, cursor, session.is_some(), has_saved)?;
         let mark = match &action {
             Action::Open(n)
             | Action::Detail(n)
@@ -587,6 +667,16 @@ fn cockpit() -> Result<()> {
                         eprintln!("{}", ui::color::red(&format!("Split view error: {e}")));
                         picker::prompt_line("Press Enter...")?;
                     }
+                }
+            }
+            Action::Restore => {
+                if session.is_some() {
+                    ui::home_clear();
+                    println!("{}\n", ui::banner());
+                    println!("{}", ui::color::dim("Panes are still running: resume them (Ctrl+B) and quit them first."));
+                    picker::prompt_line("Press Enter...")?;
+                } else if let Some(saved) = pick_layout(&profiles, cursor as i64)? {
+                    restore_layout(&profiles, &saved, &mut session)?;
                 }
             }
             Action::ResumeSession => {
@@ -1265,6 +1355,11 @@ fn main() -> Result<()> {
             handoff::copy_session(&from, &to, &session_id).map(|(_, _, stripped)| {
                 println!("Copied session {session_id} to '{to}'{}. Run: claude-cockpit run {to} --resume {session_id}", strip_note(stripped));
             })
+        }
+        // The plugin's SessionStart hook (see workspace.rs).
+        Some("session-track") => {
+            workspace::track_from_stdin();
+            Ok(())
         }
         Some("statusline") => {
             statusline::main();

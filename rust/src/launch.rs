@@ -1,4 +1,5 @@
-use crate::{notes, paths, session, ui};
+use crate::workspace::{self, Start};
+use crate::{notes, paths, plugin, session, ui};
 use anyhow::Result;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -14,11 +15,11 @@ struct Target {
 /// Same resolved Claude binary as `launch()`, but as a `portable_pty`
 /// CommandBuilder instead of a `std::process::Command` — for panels.rs,
 /// which needs a PTY-attached child rather than one that simply inherits
-/// this process's own stdio. Composes the profile/project system prompts
-/// the same way `launch()` does (no per-session sidecar, since panes start
-/// fresh); returns the temp file's path alongside so the caller can delete
-/// it when the pane closes.
-pub(crate) fn claude_pty_command(profile: &str, cwd: &Path) -> (portable_pty::CommandBuilder, Option<PathBuf>) {
+/// this process's own stdio. Composes the system prompts the same way
+/// `launch()` does (the per-session one only when resuming); returns the temp
+/// file's path alongside so the caller can delete it when the pane closes.
+/// `track` is where the session reports its id (see `workspace.rs`).
+pub(crate) fn claude_pty_command(profile: &str, cwd: &Path, start: &Start, track: &Path) -> (portable_pty::CommandBuilder, Option<PathBuf>) {
     let target = claude_target();
     let mut cmd = if target.shell {
         let mut c = portable_pty::CommandBuilder::new("cmd");
@@ -32,16 +33,34 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path) -> (portable_pty::Co
         }
         c
     };
-    let sysprompt = write_system_prompt_file(profile, None);
+    let resumed = match start {
+        Start::Resume(id) => {
+            cmd.arg("--resume");
+            cmd.arg(id);
+            Some(id.as_str())
+        }
+        Start::Fresh(id) => {
+            cmd.arg("--session-id");
+            cmd.arg(id);
+            None
+        }
+        Start::Shell => None,
+    };
+    let sysprompt = write_system_prompt_file(profile, resumed);
     if let Some(path) = &sysprompt {
         cmd.arg("--append-system-prompt-file");
         cmd.arg(path);
+    }
+    if let Some(dir) = plugin::dir() {
+        cmd.arg("--plugin-dir");
+        cmd.arg(dir);
     }
     cmd.cwd(cwd);
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
     // Tells the notify hook scripts that cpit raises its own notifications
     // for this pane (see notify.rs), so they stay quiet.
     cmd.env("CPIT_PANES", "1");
+    cmd.env(workspace::TRACK_ENV, track);
     (cmd, sysprompt)
 }
 
@@ -61,6 +80,8 @@ pub(crate) fn shell_pty_command(cwd: &Path) -> portable_pty::CommandBuilder {
     };
     let mut cmd = portable_pty::CommandBuilder::new(program);
     cmd.cwd(cwd);
+    // Inherited when cpit itself runs inside a pane; not this pane's.
+    cmd.env_remove(workspace::TRACK_ENV);
     cmd
 }
 
@@ -152,6 +173,12 @@ fn nonempty_content(path: &Path) -> Option<String> {
     if text.trim().is_empty() { None } else { Some(text) }
 }
 
+/// Whether these arguments start a session. A subcommand (`mcp list`) gets no
+/// plugin flag.
+fn takes_plugin(args: &[String]) -> bool {
+    args.first().map_or(true, |a| a.starts_with('-'))
+}
+
 pub fn launch(profile: &str, args: &[String]) -> Result<i32> {
     launch_in(profile, args, None)
 }
@@ -172,6 +199,12 @@ pub fn launch_in(profile: &str, args: &[String], cwd: Option<&Path>) -> Result<i
         full_args.push("--append-system-prompt-file".to_string());
         full_args.push(path.to_string_lossy().to_string());
     }
+    if takes_plugin(args) {
+        if let Some(dir) = plugin::dir() {
+            full_args.push("--plugin-dir".to_string());
+            full_args.push(dir.to_string_lossy().to_string());
+        }
+    }
     let mut cmd = if target.shell {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(&target.command);
@@ -183,6 +216,8 @@ pub fn launch_in(profile: &str, args: &[String], cwd: Option<&Path>) -> Result<i
         c
     };
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
+    // Not a pane: it must not report into one cpit may be running inside.
+    cmd.env_remove(workspace::TRACK_ENV);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -259,4 +294,17 @@ pub fn open_shell(cwd: &Path) -> Result<()> {
 fn split_command(s: &str) -> Vec<String> {
     let re = Regex::new(r#"[^\s"]+|"[^"]*""#).unwrap(); // matches launch.js's split-on-quoted-words
     re.find_iter(s).map(|m| m.as_str().trim_matches('"').to_string()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_sessions_take_the_plugin() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(takes_plugin(&args(&[])));
+        assert!(takes_plugin(&args(&["--resume", "x"])));
+        assert!(!takes_plugin(&args(&["mcp", "list"])));
+    }
 }

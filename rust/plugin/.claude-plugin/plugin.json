@@ -1,0 +1,5 @@
+{
+  "name": "cpit",
+  "version": "0.1.0",
+  "description": "claude-cockpit companion: /toc lists the session's prompts and jumps to them"
+}

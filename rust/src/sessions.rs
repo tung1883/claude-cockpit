@@ -370,7 +370,7 @@ fn text_path() -> PathBuf {
     crate::paths::root().join("session-text.json")
 }
 
-fn write_atomic(path: &Path, json: &str) {
+pub(crate) fn write_atomic(path: &Path, json: &str) {
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, path);

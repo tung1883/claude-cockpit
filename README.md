@@ -155,6 +155,51 @@ The handoff copies the JSONL transcript locally. The next Claude turn will resen
 
 The cockpit's statusline hook writes `.cockpit-quota.json` into each profile's config dir on every render, recording the last-seen 5h/7d usage percentages (it can only see this while Claude is running and calling the statusline command — it has no visibility into a running Claude process otherwise). When you exit Claude and that cache says the profile you were just in hit ≥95% on either window, the cockpit picks whichever other profile has the lowest cached usage, copies the session you were just running to it, and asks whether to resume it there immediately.
 
+## Transcript editor (cpit)
+
+Open a session from the sessions browser to edit it block by block.
+
+- `/` searches the full text of every block, `n` / `N` move between matches, `f`
+  filters. `v` reads a whole block and opens at the match.
+- `o` opens the outline: one line per prompt, slash command or `!` command, with
+  the number of tool calls and edited files, plus compactions, notices and pinned
+  parts. `Enter` jumps there.
+
+## Table of contents in a live session (cpit)
+
+Sessions started by cpit load a small Claude Code plugin. Type `/toc` for a pane
+listing your prompts, slash commands and `!` commands, each with its tool and
+edited-file counts, and a preview of the selected one.
+
+- `↑` / `↓` move, starting at the newest and going round at either end. `Enter` opens the detail: the prompt,
+  everything Claude replied to it and the edited files. There `↑` / `↓` scroll,
+  `Enter` scrolls the conversation to the prompt and `Esc` goes back.
+- `s` searches prompts and edited file names; `Enter` goes to the matches, and
+  `s` there clears the filter.
+- `Esc` closes the pane. To search the whole conversation, use Claude Code's own
+  `Ctrl+O` then `/`.
+- Jumping needs Claude Code's fullscreen mode; otherwise the detail says why it
+  could not. The pane docks beside the chat from 110 columns, else it sits
+  above the prompt without the preview.
+- After a compaction only the later prompts are listed. The transcript editor's
+  outline (`o`) has all of them.
+- It needs a Claude Code version with plugin hooks modules. Set
+  `CPIT_NO_PLUGIN=1` to start without it.
+
+## Restoring panes (cpit)
+
+cpit saves which panes are open: account, folder, worktree, layout and the
+Claude session each is in (following `/clear` and `/resume`). At the next start
+it asks whether to restore them; `o` on the home screen lists saved layouts
+(`d` discards one).
+
+- `Ctrl+Q`, closing the window, a crash or a reboot keep every pane. A pane you
+  close (`F8`) or that exits normally (`/exit`) is dropped; one that fails stays.
+- A pane whose folder, worktree or account is gone is skipped, with the reason.
+- Only panes are saved, not sessions opened with session wrapping turned off.
+- Following `/clear` and `/resume` uses a hook in cpit's plugin, so it is off
+  with `CPIT_NO_PLUGIN=1`.
+
 ## Statusline
 
 Claude Code statusline commands receive JSON on stdin. Configure the `statusLine` command in the profile’s `settings.json` to invoke `src/statusline.js`, for example on Windows:

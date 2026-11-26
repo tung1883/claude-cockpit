@@ -12,7 +12,7 @@ use crate::input::{self, read_key};
 use crate::layout::{self, Stat};
 use crate::picker::{self, ListChoice, ListOption, ScrollRow};
 use crate::profiles::Profile;
-use crate::ui;
+use crate::{toc, ui};
 use crossterm::event::KeyCode;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +25,8 @@ const DET: usize = 6;
 const ROW_TEXT_CAP: usize = 20_000;
 /// Lines the full-text reader will wrap before saying "truncated".
 const READ_CAP: usize = 400_000;
+/// Rows of key hints under the detail pane.
+const HINT_ROWS: usize = 4;
 
 // ------------------------------------------------------------------ model
 
@@ -289,8 +291,13 @@ impl Row {
     fn info(&self, doc: &[Arc<L>]) -> &Info {
         self.info.get_or_init(|| compute_info(&doc[self.line], self.blk, self.kind, &self.name))
     }
+    /// Search text: the whole block, not the capped copy the preview and the
+    /// detail pane use.
     fn lower(&self, doc: &[Arc<L>]) -> &str {
-        self.lower.get_or_init(|| format!("{} {} {}", self.kind.filter_name(), self.name, self.info(doc).text).to_lowercase())
+        self.lower.get_or_init(|| {
+            let body = block_at(&doc[self.line], self.blk).map(|b| block_body(&b)).unwrap_or_default();
+            format!("{} {} {body}", self.kind.filter_name(), self.name).to_lowercase()
+        })
     }
     /// A row standing in for one block, to address it when editing.
     fn probe(line: usize, blk: usize, kind: Kind) -> Row {
@@ -1128,6 +1135,47 @@ fn wrap_text(text: &str, width: usize, max_lines: usize) -> (Vec<String>, bool) 
     (out, false)
 }
 
+/// First wrapped line showing a case-insensitive match of `q`, including one
+/// that the wrapping split over two lines.
+fn match_line(lines: &[String], q: &str) -> Option<usize> {
+    if q.is_empty() {
+        return None;
+    }
+    let q = q.to_lowercase();
+    let mut next = lines.first()?.to_lowercase();
+    for i in 0..lines.len() {
+        let after = lines.get(i + 1).map(|l| l.to_lowercase()).unwrap_or_default();
+        let cur = std::mem::replace(&mut next, after);
+        if cur.contains(&q) {
+            return Some(i);
+        }
+        // Split at a space (dropped by the wrapping) or in the middle of a word.
+        if !next.contains(&q) && (format!("{cur} {next}").contains(&q) || format!("{cur}{next}").contains(&q)) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The full reader's wrapped text: at most `limit` lines, or `limit` lines past
+/// the first match of `q` when that lies further down. Returns the lines,
+/// whether any were left out, and the matching line.
+fn reader_lines(body: &str, width: usize, q: &str, limit: usize) -> (Vec<String>, bool, Option<usize>) {
+    if q.is_empty() || !body.to_lowercase().contains(&q.to_lowercase()) {
+        let (lines, cut) = wrap_text(body, width, limit);
+        return (lines, cut, None);
+    }
+    let (mut lines, _) = wrap_text(body, width, usize::MAX);
+    let at = match_line(&lines, q);
+    let keep = match at {
+        Some(a) if a >= limit => a + limit,
+        _ => limit,
+    };
+    let cut = lines.len() > keep;
+    lines.truncate(keep);
+    (lines, cut, at)
+}
+
 /// Splits `s` around case-insensitive matches of `q` and paints the matches
 /// yellow. ASCII-only so the byte offsets of the lowercased copy line up.
 fn highlight(s: &str, q: &str) -> String {
@@ -1184,8 +1232,8 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
     lines.push(ui::color::dim(&clip(&meta, term_w)));
     lines.push(String::new());
 
-    // footer: detail pane + rule + 3 hint rows + prompt/flash row
-    let foot = DET + 1 + 3 + 1;
+    // footer: detail pane + rule + hint rows + prompt/flash row
+    let foot = DET + 1 + HINT_ROWS + 1;
     let used = lines.len();
     let vp = term_h.saturating_sub(used + foot + 2).max(3);
 
@@ -1290,7 +1338,9 @@ fn draw(st: &State, header: &[String], prompt: Option<&Prompt>, vis: &[usize], t
     let r1: &[(&str, &str)] = &[("↑/↓", "move"), ("Space", "select"), ("Ctrl+A", "select all"), ("d", "delete"), ("t", "truncate"), ("u", "undo")];
     let r2: &[(&str, &str)] = &[("Enter", "edit"), ("v", "read full"), ("J", "JSON"), ("/", "search n/N"), ("f", "filter"), ("p", "pin part")];
     let r3: &[(&str, &str)] = &[("Ctrl+↑/↓", "top/bottom"), (":", "go to row"), ("w", "save"), ("←/Esc", "back"), ("Shift+↑/↓", "range")];
-    lines.extend(layout::hint_grid(&[r1, r2, r3], cell));
+    let r4: &[(&str, &str)] = &[("o", "outline")];
+    let hints: [&[(&str, &str)]; HINT_ROWS] = [r1, r2, r3, r4];
+    lines.extend(layout::hint_grid(&hints, cell));
 
     let mut cursor: Option<(usize, usize)> = None;
     match prompt {
@@ -1341,7 +1391,7 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str, 
             st.sel = vis.len().saturating_sub(1);
         }
         let used = header.len() + 3;
-        let vp = th.saturating_sub(used + DET + 1 + 3 + 1 + 2).max(3);
+        let vp = th.saturating_sub(used + DET + 1 + HINT_ROWS + 1 + 2).max(3);
         if st.sel < st.top {
             st.top = st.sel;
         }
@@ -1610,6 +1660,10 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str, 
                     None => st.flash = "nothing to pin".into(),
                 }
             }
+            KeyCode::Char('o') => {
+                open_outline(&mut st, cur_row, &header)?;
+                ui::hide_cursor();
+            }
             KeyCode::Char(':') => prompt = Some(Prompt { q: "Go to turn (42 or 42.3): ".into(), buf: String::new(), kind: PromptKind::Goto }),
             KeyCode::Char('/') => prompt = Some(Prompt { q: "Search (full text incl. tool payloads): ".into(), buf: st.query.clone(), kind: PromptKind::Search }),
             KeyCode::Char('f') => prompt = Some(Prompt { q: "Filter (kind:tool_use  kind:mcp  name:Bash  text — empty clears): ".into(), buf: st.filter.clone(), kind: PromptKind::Filter }),
@@ -1638,6 +1692,90 @@ pub fn run(profiles: &[Profile], mark: i64, file: &Path, id: &str, title: &str, 
             _ => {}
         }
     }
+}
+
+/// The table of contents of the (in-memory) transcript.
+fn outline_of(st: &State) -> Vec<toc::Entry> {
+    toc::outline(st.rows.iter().map(|r| {
+        let line = &st.doc[r.line];
+        let call = matches!(r.kind, Kind::Tool | Kind::Mcp | Kind::Agent).then(|| block_at(line, r.blk).and_then(|b| toc::edited_file(&b)));
+        let notice = if r.kind == Kind::Notice { line.v.as_ref().and_then(notice_text) } else { None };
+        toc::RowRef { turn: r.turn, line: r.line, value: line.v.as_ref(), notice, call }
+    }))
+}
+
+/// For each outline entry, the labels of the pinned parts starting inside it.
+fn outline_pins(st: &State, entries: &[toc::Entry], pins: &[crate::pins::Pin]) -> Vec<Vec<String>> {
+    let mut marks = vec![Vec::new(); entries.len()];
+    for pin in pins.iter().filter(|p| p.is_part() && p.acct == st.acct && p.session_id == st.id) {
+        let set = pin_rows(st, pin);
+        let first = st.rows.iter().position(|r| set.contains(&r.key()));
+        if let Some(i) = first.and_then(|row| toc::entry_at(entries, row)) {
+            marks[i].push(pin.label.clone());
+        }
+    }
+    marks
+}
+
+/// Moves the cursor to row `row`, dropping the filter if it hides that row.
+fn goto_row(st: &mut State, row: usize) {
+    let mut vis = st.visible();
+    if !vis.contains(&row) {
+        st.filter.clear();
+        st.flash = "filter cleared to show it".into();
+        vis = st.visible();
+    }
+    if let Some(n) = vis.iter().position(|&ri| ri == row) {
+        st.sel = n;
+        st.top = n.saturating_sub(2);
+    }
+}
+
+/// The outline screen (`o`): opens on the entry holding the cursor, Enter jumps.
+fn open_outline(st: &mut State, cur: Option<usize>, header: &[String]) -> std::io::Result<()> {
+    let entries = outline_of(st);
+    if entries.is_empty() {
+        st.flash = "nothing to outline".into();
+        return Ok(());
+    }
+    let pins = outline_pins(st, &entries, &crate::pins::load());
+    let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100);
+    let mut h = header.to_vec();
+    h.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold("Outline")));
+    h.push(ui::color::dim(&clip(&format!("   {} · {} entries", st.title, entries.len()), tw)));
+    h.push(String::new());
+    let rows: Vec<ScrollRow> = entries
+        .iter()
+        .zip(&pins)
+        .map(|(e, pins)| {
+            let mut counts = Vec::new();
+            if e.tools > 0 {
+                counts.push(format!("{} tool{}", e.tools, if e.tools == 1 { "" } else { "s" }));
+            }
+            if e.files > 0 {
+                counts.push(format!("{} file{}", e.files, if e.files == 1 { "" } else { "s" }));
+            }
+            let mut tail = if counts.is_empty() { String::new() } else { format!("  ({})", counts.join(", ")) };
+            for p in pins {
+                tail.push_str(&format!("  ★ {}", clip(p, 24)));
+            }
+            let label = clip(&e.label, tw.saturating_sub(12 + tail.chars().count()).max(20));
+            let label = match e.kind {
+                toc::EntryKind::Prompt => label,
+                toc::EntryKind::Command | toc::EntryKind::Shell => ui::color::cyan(&label),
+                toc::EntryKind::Compaction => ui::color::yellow(&format!("── {label} ──")),
+                toc::EntryKind::Notice => ui::color::dim(&label),
+            };
+            ScrollRow::pick(format!("{:>5}  {label}{}", e.turn, ui::color::dim(&tail)), e.row.to_string())
+        })
+        .collect();
+    let start = cur.and_then(|row| toc::entry_at(&entries, row)).map(|i| entries[i].row.to_string());
+    if let ListChoice::Picked(v) = picker::scroll_screen(&h, &rows, start.as_deref(), None)? {
+        if let Ok(row) = v.parse() {
+            goto_row(st, row);
+        }
+    }
+    Ok(())
 }
 
 /// Opens one block in the in-app editor — plain text for text/result/thinking,
@@ -1733,17 +1871,21 @@ fn read_full(st: &State, ri: usize, header: &[String]) -> std::io::Result<()> {
         block_body(block)
     };
     let (tw, _) = crossterm::terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((100, 30));
-    let (wrapped, cut) = wrap_text(&body, tw.saturating_sub(8).min(110), READ_CAP / 80);
+    let (wrapped, cut, at) = reader_lines(&body, tw.saturating_sub(8).min(110), &st.query, READ_CAP / 80);
+    let found = at.map(|a| format!(" · \"{}\" at line {}", st.query, a + 1)).unwrap_or_default();
     let mut h = header.to_vec();
     h.push(format!(
         "{} {}",
         ui::color::orange(ui::glyph::back()),
         ui::color::bold(&format!("{} {}{}", r.label(), r.kind.filter_name(), if r.name.is_empty() { String::new() } else { format!(" · {}", r.name) }))
     ));
-    h.push(ui::color::dim(&format!("   {} · {} chars · {} lines{}", r.who, r.info(&st.doc).chars, wrapped.len(), if cut { " (shown part)" } else { "" })));
+    h.push(ui::color::dim(&format!("   {} · {} chars · {} lines{}{found}", r.who, r.info(&st.doc).chars, wrapped.len(), if cut { " (shown part)" } else { "" })));
     h.push(String::new());
-    let rows: Vec<ScrollRow> = wrapped.into_iter().map(|l| ScrollRow::info(format!("   {l}"))).collect();
-    picker::scroll_screen(&h, &rows, None, None)?;
+    let rows: Vec<ScrollRow> = wrapped.into_iter().map(|l| ScrollRow::info(format!("   {}", highlight(&l, &st.query)))).collect();
+    match at {
+        Some(a) => picker::scroll_screen_at(&h, &rows, a)?,
+        None => picker::scroll_screen(&h, &rows, None, None)?,
+    };
     Ok(())
 }
 
@@ -1874,6 +2016,63 @@ mod tests {
         let mut d2 = st.doc.clone();
         truncate_doc(&mut d2, &st.rows, snap_turn(&st.rows, 30));
         println!("truncate@30: {} -> {} lines", st.doc.len(), d2.len());
+    }
+
+    #[test]
+    fn search_reaches_past_the_preview_cap() {
+        let long = format!("{}needle_far_down", "x ".repeat(ROW_TEXT_CAP));
+        let line = serde_json::json!({"type":"user","uuid":"a","message":{"role":"user","content":long}}).to_string();
+        let file = std::env::temp_dir().join(format!("cockpit-search-{}.jsonl", std::process::id()));
+        std::fs::write(&file, line).unwrap();
+        let mut st = State::load(&file, "id", "t", "acct").unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(!st.rows[0].info(&st.doc).text.contains("needle_far_down"), "preview stays capped");
+        st.query = "NEEDLE_far".into();
+        assert!(st.hit(&st.rows[0]));
+        st.filter = "needle_far_down".into();
+        assert_eq!(st.visible(), vec![0]);
+    }
+
+    #[test]
+    fn reader_finds_the_matching_line() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(match_line(&lines(&["one", "Two three"]), "two"), Some(1));
+        assert_eq!(match_line(&lines(&["alpha beta", "gamma"]), "beta gamma"), Some(0));
+        assert_eq!(match_line(&lines(&["abcdef", "ghij"]), "efgh"), Some(0));
+        assert_eq!(match_line(&lines(&["one"]), "zzz"), None);
+        assert_eq!(match_line(&lines(&["one"]), ""), None);
+        assert_eq!(match_line(&[], "a"), None);
+    }
+
+    #[test]
+    fn reader_keeps_a_match_beyond_the_line_limit() {
+        let body = format!("{}needle\n{}", "row\n".repeat(50), "tail\n".repeat(50));
+        let (lines, cut, at) = reader_lines(&body, 40, "needle", 10);
+        assert_eq!((lines.len(), cut, at), (60, true, Some(50)));
+        let (lines, cut, at) = reader_lines(&body, 40, "", 10);
+        assert_eq!((lines.len(), cut, at), (10, true, None));
+    }
+
+    #[test]
+    fn outline_lists_prompts_with_counts_and_pins() {
+        let lines = [
+            r#"{"type":"user","uuid":"a","message":{"role":"user","content":"add a flag"}}"#,
+            r#"{"type":"assistant","uuid":"b","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs"}}]}}"#,
+            r#"{"type":"user","uuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"user","uuid":"d","message":{"role":"user","content":"now test it"}}"#,
+        ];
+        let file = std::env::temp_dir().join(format!("cockpit-outline-{}.jsonl", std::process::id()));
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let mut st = State::load(&file, "sid", "t", "acct").unwrap();
+        let _ = std::fs::remove_file(&file);
+        let entries = outline_of(&st);
+        let got: Vec<_> = entries.iter().map(|e| (e.row, e.label.as_str(), e.tools, e.files)).collect();
+        assert_eq!(got, vec![(0, "add a flag", 1, 1), (3, "now test it", 0, 0)]);
+        let pin = crate::pins::Pin { id: String::new(), acct: "acct".into(), session_id: "sid".into(), title: "t".into(), label: "mine".into(), from_turn: Some(2), to_turn: Some(2), from_uuid: Some("b".into()), to_uuid: Some("b".into()), excerpt: String::new(), created_ms: 0 };
+        assert_eq!(outline_pins(&st, &entries, &[pin]), vec![vec!["mine".to_string()], vec![]]);
+        st.filter = "name:Edit".into();
+        goto_row(&mut st, 3);
+        assert_eq!((st.filter.as_str(), st.sel), ("", 3));
     }
 
     #[test]
