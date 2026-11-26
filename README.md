@@ -102,7 +102,7 @@ claude-cockpit sessions --all
 
 Adding an account creates its isolated profile; authenticate it with `/login` when Claude opens.
 
-Use `handoff` (or `h` inside the cockpit) to continue a transcript under another account. The cockpit also does this on its own: the statusline hook caches the last quota reading it saw for a profile, and after Claude exits with that profile at its 5h/7d cap, the cockpit copies the just-run session to whichever other profile has the most headroom and offers to resume it there. It can't interrupt a *running* Claude process mid-turn — stdio is inherited straight through to the terminal while Claude runs — so detection happens right after that process exits, not live.
+Use `handoff` (or `h` inside the cockpit) to continue a transcript under another account. The cockpit also does this on its own: the statusline hook caches the last quota reading it saw for a profile, and after Claude exits with that profile at its 5h/7d cap, the cockpit copies the just-run session to whichever other profile has the most headroom and offers to resume it there. With plain Claude, stdio is inherited straight through to the terminal, so this happens right after that process exits. cpit's panes check while Claude runs (see Auto-handoff).
 
 Each profile has its own credentials, sessions, plugins, and settings under:
 
@@ -153,7 +153,9 @@ The handoff copies the JSONL transcript locally. The next Claude turn will resen
 
 ### Auto-handoff
 
-The cockpit's statusline hook writes `.cockpit-quota.json` into each profile's config dir on every render, recording the last-seen 5h/7d usage percentages (it can only see this while Claude is running and calling the statusline command — it has no visibility into a running Claude process otherwise). When you exit Claude and that cache says the profile you were just in hit ≥95% on either window, the cockpit picks whichever other profile has the lowest cached usage, copies the session you were just running to it, and asks whether to resume it there immediately.
+The cockpit's statusline hook writes `.cockpit-quota.json` into each profile's config dir on every render, recording the last-seen 5h/7d usage percentages (it can only see this while Claude is running and calling the statusline command — it has no visibility into a running Claude process otherwise). When you exit Claude and that cache says the profile you were just in hit ≥95% on either window, the cockpit picks whichever other profile has the lowest cached usage, copies the session you were just running to it, and asks whether to resume it there immediately. A window whose reset time has passed no longer counts.
+
+That is how plain Claude works. In cpit's panes the cache is checked every few seconds instead: a pane whose account hits the limit is marked `limit` and announced once. `Ctrl+\` then `o` hands the focused pane's session to another account and resumes it in the same place; it works on any Claude pane, at any time. It refuses if the target account already has a copy of that session.
 
 ## Transcript editor (cpit)
 
@@ -186,14 +188,31 @@ edited-file counts, and a preview of the selected one.
 - It needs a Claude Code version with plugin hooks modules. Set
   `CPIT_NO_PLUGIN=1` to start without it.
 
-## Panes: typing and folders (cpit)
+## Panes: opening (cpit)
+
+With session wrapping on, everything that opens Claude (an account, resume, hand-off) opens a pane, beside the running ones if there are any.
+
+- The add-pane picker (`p`, or `F7` in a split) has three columns: account,
+  folder, session. `←` / `→` change column. `Enter` on an account or folder
+  starts a new session; on a session it resumes it. `/` searches every
+  account's sessions, `w` marks a folder for a new worktree.
+- A session that is already open is focused instead of opened twice.
+- `Ctrl+\` then `m` opens the main screen as a pane. What you open from it
+  becomes another pane; `q` closes it. It is not saved with the layout.
+- `Ctrl+B` (or `Ctrl+\` then `d`) goes to the full main screen and leaves the
+  panes running.
+
+## Panes: typing, mouse and folders (cpit)
 
 - Pasting several lines into a pane arrives as one paste, not one submit per
   line.
 - Ctrl+`←` / `→` move by a word; other modified movement keys reach the program
   too.
-- Directory prompts list the folders under what you typed: `↑` / `↓` choose,
-  `Tab` opens the chosen one, Shift+`Tab` goes up, `Enter` confirms.
+- Clicking in the focused pane reaches its program; clicking another pane only
+  focuses it. Dragging selects and copies.
+- Directory prompts show the folders under what you typed in a grid. `Tab` opens
+  the highlighted one, Shift+`Tab` goes up, `Enter` confirms. `↑` / `↓` enter
+  the grid: there the arrows move, `Enter` opens and `Esc` returns to typing.
 
 ## Restoring panes (cpit)
 
