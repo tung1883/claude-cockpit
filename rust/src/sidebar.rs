@@ -10,7 +10,7 @@ use crate::{layout, ui::color};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Small,
     Full,
@@ -46,7 +46,7 @@ pub struct PaneMeta {
 }
 
 /// A pane's git worktree (see `worktree.rs`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeInfo {
     /// Name given by the user; the folder name and the part after `worktree-`.
     pub name: String,
