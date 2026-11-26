@@ -21,7 +21,7 @@ use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
 use crate::workspace::{self, SavedPane, Start};
-use crate::{input::read_key, launch, layout, profiles::Profile, session, settings, ui, worktree};
+use crate::{handoff, input::read_key, launch, layout, picker, profiles::Profile, quota, session, settings, ui, worktree};
 use anyhow::Result;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
@@ -439,6 +439,7 @@ fn spawn_pane_cmd(
         status: Status::Unknown,
         last_focus: 0,
         worktree: None,
+        limited: false,
     };
     Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, session_id: None, track: None, home: None, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
@@ -1371,12 +1372,15 @@ struct Keeper {
     lost: Vec<SavedPane>,
     /// The layout this split was restored from, deleted once saved again.
     claim: Option<workspace::Claim>,
+    /// Usage limits already announced, by account. Kept here so detaching
+    /// does not announce them again.
+    told: std::collections::HashMap<String, u64>,
     saved_at: Option<std::time::Instant>,
 }
 
 impl Keeper {
     fn new(cwd: std::path::PathBuf) -> Keeper {
-        Keeper { store: workspace::Store::create_in(&workspace::dir()), cwd, lost: Vec::new(), claim: None, saved_at: None }
+        Keeper { store: workspace::Store::create_in(&workspace::dir()), cwd, lost: Vec::new(), claim: None, told: Default::default(), saved_at: None }
     }
 
     fn save(&mut self, panes: &[Pane], focus: usize) {
@@ -1533,6 +1537,13 @@ fn settle(panes: &mut [Pane], focus: &mut usize, cols: u16, rows: u16) {
 /// profile + project + kind. Returns its index.
 fn register(panes: &mut Vec<Pane>, mut pane: Pane) -> usize {
     pane.meta.id = sidebar::next_id(panes);
+    name_pane(panes, &mut pane);
+    panes.push(pane);
+    panes.len() - 1
+}
+
+/// Titles `pane`, numbered within its profile + project + kind among `panes`.
+fn name_pane(panes: &[Pane], pane: &mut Pane) {
     let kind = if pane.home.is_some() {
         "home"
     } else if pane.meta.shell {
@@ -1550,8 +1561,79 @@ fn register(panes: &mut Vec<Pane>, mut pane: Pane) -> usize {
         }
         n += 1;
     }
-    panes.push(pane);
-    panes.len() - 1
+}
+
+/// How often the panes' accounts are checked for a usage limit.
+const QUOTA_EVERY: Duration = Duration::from_secs(5);
+
+/// Marks the panes whose account is at its limit and returns the accounts that
+/// newly reached it, and whether any mark changed.
+fn check_limits(panes: &mut [Pane], told: &mut std::collections::HashMap<String, u64>) -> (Vec<String>, bool) {
+    let mut limits: std::collections::BTreeMap<String, Option<u64>> = Default::default();
+    let (mut news, mut changed) = (Vec::new(), false);
+    for pane in panes.iter_mut().filter(|p| p.claude) {
+        let account = pane.meta.profile.clone();
+        let limit = *limits.entry(account.clone()).or_insert_with(|| {
+            let limit = quota::load(&account).and_then(|q| quota::limit(&q));
+            if quota::announce(told, &account, limit) {
+                news.push(account.clone());
+            }
+            limit
+        });
+        changed |= pane.meta.limited != limit.is_some();
+        pane.meta.limited = limit.is_some();
+    }
+    (news, changed)
+}
+
+/// Moves the focused pane's session to another account: copies it, starts it
+/// there in the same place, and only then closes the old pane. Returns a
+/// message worth showing.
+fn hand_off_pane(panes: &mut [Pane], focus: usize, profiles: &[Profile]) -> Result<Option<String>> {
+    let old = &panes[focus];
+    if !old.claude {
+        return Ok(Some("only a Claude pane can be handed off".to_string()));
+    }
+    let from = old.meta.profile.clone();
+    let Some(id) = old.saved().session_id else { return Ok(Some("this pane has not reported its session".to_string())) };
+    let mark = profiles.iter().position(|p| p.name == from).map_or(-1, |i| i as i64);
+    if old.meta.status == Status::Working {
+        let option = |label: &str, value: &str| picker::ListOption { label: label.into(), value: value.into(), note: None };
+        let options = [option("No, let it finish", "no"), option("Yes, hand it off now", "yes")];
+        let answer = picker::choose_from_list(profiles, mark, "This pane is still working. Hand it off anyway?", Some("what it has not written yet is lost"), &options, None)?;
+        if !matches!(answer, picker::ListChoice::Picked(v) if v == "yes") {
+            return Ok(None);
+        }
+    }
+    if !profiles.iter().any(|p| p.name != from) {
+        return Ok(Some("need a second account to hand off into".to_string()));
+    }
+    let Some(to) = crate::pick_handoff_target(profiles, mark, &from)? else { return Ok(None) };
+    let (copy, stripped) = match handoff::copy_session(&from, &to, &id) {
+        Ok((_, copy, stripped)) => (copy, stripped),
+        Err(e) => return Ok(Some(format!("handoff failed: {e}"))),
+    };
+    // Claude finds a session by the folder it started in.
+    let place = old.meta.worktree.as_ref().map_or(&old.meta.project, |w| &w.path);
+    let dir = sessions::started_folder(&copy)
+        .map(|d| std::path::PathBuf::from(d.replace('/', std::path::MAIN_SEPARATOR_STR)))
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(|| place.clone());
+    let (rows, cols) = old.parser.lock().map(|p| p.screen().size()).unwrap_or((24, 80));
+    let mut new = match spawn_claude_pane(&to, &dir, &Start::Resume(id), cols, rows) {
+        Ok(pane) => pane,
+        Err(e) => {
+            // Left behind, the copy would block the next attempt.
+            let _ = std::fs::remove_file(&copy);
+            return Ok(Some(format!("handoff failed: {e}")));
+        }
+    };
+    new.meta = PaneMeta { profile: to.clone(), limited: false, status: Status::Unknown, title: String::new(), ..old.meta.clone() };
+    name_pane(panes, &mut new);
+    let mut replaced = std::mem::replace(&mut panes[focus], new);
+    let _ = replaced.child.kill();
+    let note = if stripped == 0 { String::new() } else { format!(" ({stripped} thinking blocks stripped)") };
+    Ok(Some(format!("handed off from {from} to {to}{note}")))
 }
 
 /// Puts a freshly spawned pane on screen: small (or full when another pane is
@@ -2190,7 +2272,7 @@ fn pane_label(p: &Pane, width: usize, focused: bool, full: bool, scrolled: usize
     if scrolled > 0 {
         suffix.push_str(&format!("  ↑{scrolled} lines back"));
     }
-    let badge = sidebar::status_badge(p.meta.status);
+    let badge = sidebar::badge(&p.meta);
     let badge_w = badge.map_or(0, |(t, _)| t.chars().count() + 1);
     let head = format!(" {} · {}", p.meta.title, sidebar::project_name(&p.meta.project));
     let mut text = format!("{head}{wt}{suffix}");
@@ -2332,6 +2414,13 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
         shown_cap(cols, rows),
         panes.len()
     );
+    // Stays until the limit resets or the pane moves: the toast is brief.
+    let mut limited: Vec<&str> = panes.iter().filter(|p| p.meta.limited).map(|p| p.meta.profile.as_str()).collect();
+    limited.sort_unstable();
+    limited.dedup();
+    if !limited.is_empty() {
+        head.push_str(&format!("   {}", ui::color::red(&format!("● {} at limit: Ctrl+\\ o", limited.join(", ")))));
+    }
     if blocked > 0 {
         head.push_str(&format!("   {}", ui::color::red(&format!("● {blocked} blocked"))));
     }
@@ -2354,6 +2443,7 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
                 ("x", "close"),
                 ("w", "waiting"),
                 ("b", "sidebar"),
+                ("o", "hand off"),
                 ("m", "main screen"),
                 ("d", "home"),
                 ("1-9", "jump"),
@@ -2660,6 +2750,8 @@ enum Act {
     Detach,
     /// The main screen as a pane.
     Home,
+    /// Move the focused pane's session to another account.
+    HandOff,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2691,6 +2783,7 @@ fn leader_action(code: KeyCode) -> Option<Act> {
             'b' => Some(Act::Sidebar),
             'd' => Some(Act::Detach),
             'm' => Some(Act::Home),
+            'o' => Some(Act::HandOff),
             d @ '1'..='9' => Some(Act::Jump(d as usize - '0' as usize)),
             _ => None,
         },
@@ -2749,6 +2842,8 @@ struct Ctl {
     pointer: (u16, u16),
     /// Events already read while looking for a paste, still to be handled.
     pending: VecDeque<Event>,
+    /// When the panes' usage limits were last checked.
+    limits_checked: Option<std::time::Instant>,
     last_autoscroll: std::time::Instant,
 }
 
@@ -2773,6 +2868,15 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
     match a {
         // Leaving the split is the run loop's job, which sees this key first.
         Act::Detach => {}
+        Act::HandOff => {
+            if let Some(t) = hand_off_pane(panes, *focus, profiles)? {
+                ctl.say(t);
+            }
+            ui::hide_cursor(); // the pickers show it again
+            settle(panes, focus, cols, rows);
+            // The new account's marks, without waiting for the next check.
+            ctl.limits_checked = None;
+        }
         Act::Home => match add_home_pane(panes, focus, cwd) {
             Ok(Some(t)) => ctl.say(t),
             Ok(None) => {}
@@ -2910,6 +3014,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         click: false,
         pointer: (0, 0),
         pending: VecDeque::new(),
+        limits_checked: None,
         last_autoscroll: std::time::Instant::now(),
     };
     if let Some(t) = toast {
@@ -2927,6 +3032,17 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                     let _ = w.write_all(&[0x0c]);
                     let _ = w.flush();
                 }
+            }
+        }
+        if ctl.limits_checked.map_or(true, |at| now.duration_since(at) >= QUOTA_EVERY) {
+            ctl.limits_checked = Some(now);
+            let (reached, changed) = check_limits(panes, &mut keeper.told);
+            ctl.force |= changed;
+            for account in reached {
+                let message = format!("{account} hit its limit: Ctrl+\\ o to hand off");
+                notify::send(settings::notify_mode(), notify::Kind::NeedsInput, &message);
+                ctl.say(message);
+                ctl.force = true;
             }
         }
         if let Some(message) = serve_home_pane(panes, focus, cwd) {

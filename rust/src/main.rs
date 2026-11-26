@@ -130,6 +130,28 @@ fn run_handoff(profiles: &[profiles::Profile], mark: i64, from: &str, session_id
         picker::prompt_line("Press Enter...")?;
         return Ok(None);
     }
+    let Some(target) = pick_handoff_target(profiles, mark, from)? else { return Ok(None) };
+
+    ui::home_clear();
+    match handoff::copy_session(from, &target, session_id) {
+        Ok((_, _, stripped)) => {
+            println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'{}.", strip_note(stripped))));
+            let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
+            if matches!(go.as_deref(), Some("")) {
+                return Ok(Some(OpenRequest::resume(&target, session_id)));
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", ui::color::red(&format!("Error: {e}")));
+            picker::prompt_line("Press Enter...")?;
+        }
+    }
+    Ok(None)
+}
+
+/// Asks which account to copy a session of `from` into.
+pub(crate) fn pick_handoff_target(profiles: &[profiles::Profile], mark: i64, from: &str) -> Result<Option<String>> {
+    let others: Vec<&profiles::Profile> = profiles.iter().filter(|p| p.name != from).collect();
     // Most headroom first: a target with a known low usage ranks above one that is
     // nearly full, and one with no reading goes last.
     let mut ranked: Vec<(&profiles::Profile, Option<quota::Quota>)> = others.iter().map(|p| (*p, quota::load(&p.name))).collect();
@@ -149,26 +171,10 @@ fn run_handoff(profiles: &[profiles::Profile], mark: i64, from: &str, session_id
             picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(note) }
         })
         .collect();
-    let target = match picker::choose_from_list(profiles, mark, "Copy session into…", Some("most headroom first"), &target_options, None)? {
-        picker::ListChoice::Picked(t) => t,
-        _ => return Ok(None),
-    };
-
-    ui::home_clear();
-    match handoff::copy_session(from, &target, session_id) {
-        Ok((_, _, stripped)) => {
-            println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'{}.", strip_note(stripped))));
-            let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
-            if matches!(go.as_deref(), Some("")) {
-                return Ok(Some(OpenRequest::resume(&target, session_id)));
-            }
-        }
-        Err(e) => {
-            eprintln!("{}", ui::color::red(&format!("Error: {e}")));
-            picker::prompt_line("Press Enter...")?;
-        }
-    }
-    Ok(None)
+    Ok(match picker::choose_from_list(profiles, mark, "Copy session into…", Some("most headroom first"), &target_options, None)? {
+        picker::ListChoice::Picked(t) => Some(t),
+        _ => None,
+    })
 }
 
 /// A small file browser over one of Claude Code's own auto-memory
@@ -532,7 +538,7 @@ fn restore_layout(profiles: &[profiles::Profile], saved: &workspace::Saved, sess
 }
 
 /// Opens what a menu asked for: a pane when sessions are wrapped (added to the
-/// running ones, if any), else plain Claude. Once nothing is left running, an
+/// running ones, if any), else plain Claude. After plain Claude exits, an
 /// account that hit its limit is offered a hand-off, which is opened in turn.
 fn dispatch(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, request: OpenRequest, session: &mut Option<panels::Session>) -> Result<()> {
     if let Some(requests) = open::home_pane() {
@@ -565,8 +571,8 @@ fn dispatch(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, 
             launch::launch_in(&request.profile, &request.claude_args(), request.dir.as_deref())?;
             drop(suspend); // restore alt screen + raw mode before the next repaint
         }
-        // Skipped while panes are only detached (still running).
-        if session.is_none() {
+        // Panes watch for limits themselves (see `panels.rs`).
+        if !settings::session_wrapped() && session.is_none() {
             next = offer_limit_handoff(profiles, mark, &request.profile)?;
         }
     }

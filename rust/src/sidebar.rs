@@ -43,6 +43,8 @@ pub struct PaneMeta {
     pub last_focus: u64,
     /// Set when the pane works in its own git worktree.
     pub worktree: Option<WorktreeInfo>,
+    /// The pane's account is at its usage limit.
+    pub limited: bool,
 }
 
 /// A pane's git worktree (see `worktree.rs`).
@@ -296,6 +298,16 @@ fn fit(s: &str, w: usize) -> String {
     }
 }
 
+/// The badge for a pane: its account's limit matters more than what the
+/// program last reported.
+pub fn badge(m: &PaneMeta) -> Option<(&'static str, fn(&str) -> String)> {
+    if m.limited {
+        Some(("limit", color::red))
+    } else {
+        status_badge(m.status)
+    }
+}
+
 pub fn status_badge(s: Status) -> Option<(&'static str, fn(&str) -> String)> {
     match s {
         Status::Unknown => None,
@@ -370,7 +382,7 @@ pub fn render_sidebar<T: HasMeta>(
                     }
                     TreeRow::Pane { idx, .. } => {
                         let m = items[*idx].meta();
-                        let badge = status_badge(m.status);
+                        let badge = badge(m);
                         let right_w = badge.map_or(0, |(t, _)| t.chars().count() + 1);
                         let title_w = inner.saturating_sub(1 + 4 + 2 + right_w);
                         let title = fit(&m.title, title_w);
@@ -419,7 +431,7 @@ mod tests {
     use super::*;
 
     fn pane(id: u64, profile: &str, project: &str, mode: Mode, status: Status, last: u64) -> PaneMeta {
-        PaneMeta { id, profile: profile.into(), project: PathBuf::from(project), title: format!("claude {id}"), shell: false, mode, status, last_focus: last, worktree: None }
+        PaneMeta { id, profile: profile.into(), project: PathBuf::from(project), title: format!("claude {id}"), shell: false, mode, status, last_focus: last, worktree: None, limited: false }
     }
 
     fn modes(v: &[PaneMeta]) -> Vec<Mode> {

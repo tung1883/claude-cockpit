@@ -31,16 +31,61 @@ pub fn load(profile: &str) -> Option<Quota> {
     serde_json::from_str(&text).ok()
 }
 
-/// Whether either window is at/near its cap. 95% instead of 100% because
-/// Claude Code stops issuing turns slightly before the reported number
-/// reaches an exact 100.
+/// How long a full window with no reset time is believed.
+const UNDATED_LIMIT_MS: f64 = 6.0 * 3_600_000.0;
+
+/// A window's usage, 0 once its reset time has passed: the statusline only
+/// refreshes a reading while the account is in use, so it can be long over.
+fn live_pct(pct: Option<f64>, resets_at: Option<f64>, now_secs: f64) -> f64 {
+    if resets_at.is_some_and(|t| t > 0.0 && t <= now_secs) {
+        0.0
+    } else {
+        pct.unwrap_or(0.0)
+    }
+}
+
+/// When either window is at/near its cap now, the limit period: the window's
+/// reset time, or 0 when it has none. 95% instead of 100% because Claude Code
+/// stops issuing turns slightly before the reported number reaches an exact
+/// 100.
+pub fn limit_at(q: &Quota, now_secs: f64) -> Option<u64> {
+    let recent = now_secs * 1000.0 - q.updated_ms < UNDATED_LIMIT_MS;
+    let full = |pct: Option<f64>, resets_at: Option<f64>| {
+        let dated = resets_at.filter(|&t| t > 0.0);
+        (pct.is_some_and(|p| p >= 95.0) && dated.map_or(recent, |t| t > now_secs)).then(|| dated.unwrap_or(0.0) as u64)
+    };
+    // With both full, the one that resets last is what holds the account.
+    full(q.five_pct, q.five_resets_at).max(full(q.seven_pct, q.seven_resets_at))
+}
+
+/// `limit_at` the present moment.
+pub fn limit(q: &Quota) -> Option<u64> {
+    limit_at(q, now_secs())
+}
+
 pub fn is_exhausted(quota: &Quota) -> bool {
-    quota.five_pct.is_some_and(|p| p >= 95.0) || quota.seven_pct.is_some_and(|p| p >= 95.0)
+    limit(quota).is_some()
 }
 
 /// Highest of the two usage percentages, for ranking candidate profiles.
 pub fn usage(quota: &Quota) -> f64 {
-    quota.five_pct.unwrap_or(0.0).max(quota.seven_pct.unwrap_or(0.0))
+    let now = now_secs();
+    live_pct(quota.five_pct, quota.five_resets_at, now).max(live_pct(quota.seven_pct, quota.seven_resets_at, now))
+}
+
+/// Whether `limit` is news for `account`: each limit period is announced once.
+/// `told` remembers what was announced.
+pub fn announce(told: &mut std::collections::HashMap<String, u64>, account: &str, limit: Option<u64>) -> bool {
+    match limit {
+        Some(period) => told.insert(account.to_string(), period) != Some(period),
+        None => {
+            // A period with no reset time can only be told apart by the gap.
+            if told.get(account) == Some(&0) {
+                told.remove(account);
+            }
+            false
+        }
+    }
 }
 
 fn now_secs() -> f64 {
@@ -75,11 +120,10 @@ pub fn describe_at(q: &Quota, now_secs: f64) -> String {
     if parts.is_empty() {
         return "usage unknown".to_string();
     }
-    if is_exhausted(q) {
-        let at = if q.five_pct.is_some_and(|p| p >= 95.0) { q.five_resets_at } else { q.seven_resets_at };
-        parts.push(match at.filter(|&v| v > 0.0) {
-            Some(t) => format!("at limit, resets {}", in_text(t, now_secs)),
-            None => "at limit".to_string(),
+    if let Some(period) = limit_at(q, now_secs) {
+        parts.push(match period {
+            0 => "at limit".to_string(),
+            t => format!("at limit, resets {}", in_text(t as f64, now_secs)),
         });
     }
     let age_h = (now_secs * 1000.0 - q.updated_ms) / 3_600_000.0;
@@ -96,6 +140,34 @@ pub fn describe(q: &Quota) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_ends_when_its_window_resets() {
+        let now = 1_000_000.0;
+        let q = |pct: f64, resets: Option<f64>, age_h: f64| Quota { five_pct: Some(pct), five_resets_at: resets, updated_ms: (now - age_h * 3600.0) * 1000.0, ..Default::default() };
+        assert_eq!(limit_at(&q(97.0, Some(now + 60.0), 48.0), now), Some(1_000_060));
+        assert_eq!(limit_at(&q(97.0, Some(now - 60.0), 1.0), now), None);
+        assert_eq!(limit_at(&q(97.0, None, 5.0), now), Some(0));
+        assert_eq!(limit_at(&q(97.0, None, 7.0), now), None);
+        assert_eq!(limit_at(&q(90.0, Some(now + 60.0), 0.0), now), None);
+        let both = Quota { seven_pct: Some(99.0), seven_resets_at: Some(now + 900.0), ..q(97.0, Some(now + 60.0), 0.0) };
+        assert_eq!(limit_at(&both, now), Some(1_000_900));
+        assert_eq!(live_pct(Some(80.0), Some(now - 1.0), now), 0.0);
+    }
+
+    #[test]
+    fn each_limit_period_is_announced_once() {
+        let mut told = Default::default();
+        assert!(announce(&mut told, "a", Some(10)));
+        assert!(!announce(&mut told, "a", Some(10)));
+        assert!(announce(&mut told, "b", Some(10)));
+        assert!(!announce(&mut told, "a", None));
+        assert!(!announce(&mut told, "a", Some(10)), "the same period seen again");
+        assert!(announce(&mut told, "a", Some(20)));
+        assert!(announce(&mut told, "c", Some(0)));
+        announce(&mut told, "c", None);
+        assert!(announce(&mut told, "c", Some(0)));
+    }
 
     #[test]
     fn describes_windows_limit_and_stale_readings() {
