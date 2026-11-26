@@ -1,9 +1,16 @@
 use std::path::PathBuf;
 
+/// `~/.claude-cockpit`, or the pre-rename `~/.claude-multi-cockpit` while that
+/// is the only one on disk (see `scripts/migrate-data-dir.ps1`).
 pub fn root() -> PathBuf {
-    dirs::home_dir()
-        .expect("home directory not found")
-        .join(".claude-multi-cockpit")
+    let home = dirs::home_dir().expect("home directory not found");
+    let new = home.join(".claude-cockpit");
+    let old = home.join(".claude-multi-cockpit");
+    if !new.exists() && old.exists() {
+        old
+    } else {
+        new
+    }
 }
 
 pub fn profiles_file() -> PathBuf {

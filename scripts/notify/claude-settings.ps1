@@ -3,7 +3,9 @@
 # these hook scripts too. Missing file or missing key both default to
 # "toast", matching Settings' Rust-side NotifyMode::default().
 function Get-NotifySettings {
-    $path = Join-Path $env:USERPROFILE '.claude-multi-cockpit\settings.json'
+    $root = Join-Path $env:USERPROFILE '.claude-cockpit'
+    if (-not (Test-Path $root)) { $root = Join-Path $env:USERPROFILE '.claude-multi-cockpit' }
+    $path = Join-Path $root 'settings.json'
     $mode = 'toast'
     try {
         $s = Get-Content $path -Raw | ConvertFrom-Json

@@ -107,7 +107,7 @@ Use `handoff` (or `h` inside the cockpit) to continue a transcript under another
 Each profile has its own credentials, sessions, plugins, and settings under:
 
 ```text
-%USERPROFILE%\.claude-multi-cockpit\profiles\<name>
+%USERPROFILE%\.claude-cockpit\profiles\<name>
 ```
 
 Authenticate each one independently:
@@ -255,9 +255,9 @@ Every project you launch Claude into through `ccpit` (any of `run`/`login`/`ccpi
 
 Conflict rule is last-write-wins: whichever side changed more recently (tracked by content hash, falling back to file mtime when neither side has prior sync history) overwrites the other. A reconciliation pass also runs once at the start and end of every session, to catch edits made while nothing was watching.
 
-Master files default to `~/.claude-multi-cockpit/TODO.md` and `.../PLAN.md`; point them elsewhere with `CLAUDE_COCKPIT_NOTES_DIR`. Turn the whole feature off with `CLAUDE_COCKPIT_NOTES=0`.
+Master files default to `~/.claude-cockpit/TODO.md` and `.../PLAN.md`; point them elsewhere with `CLAUDE_COCKPIT_NOTES_DIR`. Turn the whole feature off with `CLAUDE_COCKPIT_NOTES=0`.
 
-If notes syncing ever seems to hang, set `CLAUDE_COCKPIT_NOTES_DEBUG=1` before reproducing it — every step (git calls, file ensure, reconcile, watch setup/teardown) gets a timestamped line in `~/.claude-multi-cockpit/notes-debug.log`. The last line before it hangs is the call that never returned.
+If notes syncing ever seems to hang, set `CLAUDE_COCKPIT_NOTES_DEBUG=1` before reproducing it — every step (git calls, file ensure, reconcile, watch setup/teardown) gets a timestamped line in `~/.claude-cockpit/notes-debug.log`. The last line before it hangs is the call that never returned.
 
 **View/edit from the cockpit menu**: press `n`, pick a file, and `Enter` opens it in cockpit's own small built-in text editor right there in the terminal — no notepad, no external process. Arrow keys to move, type to insert, `Backspace`/`Delete`, `Ctrl+S` to save without leaving, `Esc` to save and exit, `Ctrl+C` to bail without saving. Press `e` instead of `Enter` if you'd rather open it in `$VISUAL`/`$EDITOR` (falls back to `notepad`/`nano`). Either way, closing it triggers an immediate two-way sync before you're back at the menu. Sync from the command line without opening anything: `ccpit notes [dir]`.
 

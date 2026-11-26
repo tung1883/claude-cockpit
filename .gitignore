@@ -3,6 +3,7 @@ npm-debug.log*
 .DS_Store
 
 # Local test/store data if the default location is overridden into the repo.
+.claude-cockpit/
 .claude-multi-cockpit/
 
 # ccpit
