@@ -46,7 +46,7 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path, start: &Start, track
         }
         Start::Shell => None,
     };
-    let sysprompt = write_system_prompt_file(profile, resumed);
+    let sysprompt = write_system_prompt_file(profile, cwd, resumed);
     if let Some(path) = &sysprompt {
         cmd.arg("--append-system-prompt-file");
         cmd.arg(path);
@@ -101,19 +101,14 @@ pub(crate) fn shell_pty_command(cwd: &Path) -> portable_pty::CommandBuilder {
 }
 
 /// The three cockpit-managed system-prompt levels, coarse to fine:
-/// profile-wide, then this project, then (only when resuming) this specific
-/// session. Composed into one string, in that order.
-fn compose_system_prompt(profile: &str, resume_session_id: Option<&str>) -> Vec<String> {
+/// profile-wide, then the project Claude starts in (`dir`), then (only when
+/// resuming) this specific session. Composed into one string, in that order.
+fn compose_system_prompt(profile: &str, dir: &Path, resume_session_id: Option<&str>) -> Vec<String> {
     let mut pieces = Vec::new();
     if let Some(text) = nonempty_content(&paths::profile_dir(profile).join(".cockpit-system-prompt.md")) {
         pieces.push(text);
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = notes::project_root(&cwd);
-        if let Some(text) = nonempty_content(&project_root.join(".cockpit-system-prompt.md")) {
-            pieces.push(text);
-        }
-    }
+    pieces.extend(project_prompt(dir));
     if let Some(session_id) = resume_session_id {
         if let Some(session_path) = session::session_file_path(profile, session_id) {
             if let Some(text) = nonempty_content(&session::system_prompt_sidecar(&session_path)) {
@@ -124,11 +119,16 @@ fn compose_system_prompt(profile: &str, resume_session_id: Option<&str>) -> Vec<
     pieces
 }
 
+/// The system prompt of the project `dir` is in, if it has one.
+fn project_prompt(dir: &Path) -> Option<String> {
+    nonempty_content(&notes::project_root(dir).join(".cockpit-system-prompt.md"))
+}
+
 /// Writes the composed system prompt to a unique temp file (or None if there
 /// is nothing to append). The caller owns cleanup. Unique per call so
 /// several panes launching at once don't clobber each other's file.
-pub(crate) fn write_system_prompt_file(profile: &str, resume_session_id: Option<&str>) -> Option<PathBuf> {
-    let pieces = compose_system_prompt(profile, resume_session_id);
+pub(crate) fn write_system_prompt_file(profile: &str, dir: &Path, resume_session_id: Option<&str>) -> Option<PathBuf> {
+    let pieces = compose_system_prompt(profile, dir, resume_session_id);
     if pieces.is_empty() {
         return None;
     }
@@ -209,7 +209,11 @@ pub fn launch_in(profile: &str, args: &[String], cwd: Option<&Path>) -> Result<i
     // flags for one invocation. Composed into a single file and appended,
     // since the flag only takes one path.
     let resume_id = args.iter().position(|a| a == "--resume").and_then(|i| args.get(i + 1)).map(|s| s.as_str());
-    let combined_path = write_system_prompt_file(profile, resume_id);
+    let start_dir = match cwd {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let combined_path = write_system_prompt_file(profile, &start_dir, resume_id);
     if let Some(path) = &combined_path {
         full_args.push("--append-system-prompt-file".to_string());
         full_args.push(path.to_string_lossy().to_string());
@@ -321,6 +325,17 @@ mod tests {
         assert!(wants_fullscreen(Some("{}")));
         assert!(wants_fullscreen(Some(r#"{"tui":"fullscreen"}"#)));
         assert!(!wants_fullscreen(Some(r#"{"tui":"default"}"#)));
+    }
+
+    #[test]
+    fn the_project_prompt_comes_from_the_folder_given() {
+        let root = std::env::temp_dir().join(format!("cockpit-prompt-{}", std::process::id()));
+        let deeper = root.join("src");
+        std::fs::create_dir_all(&deeper).unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
+        std::fs::write(root.join(".cockpit-system-prompt.md"), "theirs").unwrap();
+        assert_eq!(project_prompt(&deeper).as_deref(), Some("theirs"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
