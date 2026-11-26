@@ -535,6 +535,14 @@ fn restore_layout(profiles: &[profiles::Profile], saved: &workspace::Saved, sess
 /// running ones, if any), else plain Claude. Once nothing is left running, an
 /// account that hit its limit is offered a hand-off, which is opened in turn.
 fn dispatch(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, request: OpenRequest, session: &mut Option<panels::Session>) -> Result<()> {
+    if let Some(requests) = open::home_pane() {
+        if let Err(e) = open::send(&requests, &request) {
+            ui::home_clear();
+            eprintln!("{}", ui::color::red(&format!("Could not ask for a pane: {e}")));
+            picker::prompt_line("Press Enter...")?;
+        }
+        return Ok(());
+    }
     let mut next = Some(request);
     while let Some(request) = next.take() {
         if settings::session_wrapped() {
@@ -671,8 +679,10 @@ fn cockpit() -> Result<()> {
     // here so the cockpit can offer to resume it. Dropped (killing its panes)
     // when the cockpit exits.
     let mut session: Option<panels::Session> = None;
+    // As a pane of another cockpit, this one only asks it to open things.
+    let in_pane = open::home_pane().is_some();
     // A layout left by an earlier run is offered once, at the start.
-    let mut offer_restore = true;
+    let mut offer_restore = !in_pane;
 
     loop {
         let profiles = profiles::list_profiles()?;
@@ -703,8 +713,8 @@ fn cockpit() -> Result<()> {
                 }
             }
         }
-        let has_saved = !workspace::list().is_empty();
-        let action = picker::pick_profile(&profiles, cursor, session.is_some(), has_saved)?;
+        let has_saved = !in_pane && !workspace::list().is_empty();
+        let action = picker::pick_profile(&profiles, cursor, session.is_some(), has_saved, in_pane)?;
         let mark = match &action {
             Action::Open(n)
             | Action::Detail(n)

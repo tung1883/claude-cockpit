@@ -14,7 +14,7 @@
 use crate::clipboard;
 use crate::conpty;
 use crate::dirpick;
-use crate::open::OpenRequest;
+use crate::open::{self, OpenRequest};
 use crate::pane_picker::{self, Choice, Column, Cursor, FolderRow};
 use crate::sessions;
 use crate::notify;
@@ -57,6 +57,8 @@ struct Pane {
     /// session reports its id when `/clear` or `/resume` changes it.
     session_id: Option<String>,
     track: Option<std::path::PathBuf>,
+    /// Set for a main screen pane: the file it asks for panes in.
+    home: Option<std::path::PathBuf>,
     /// When set, a Ctrl+L is due to be sent to this (Claude) pane — see
     /// `RESIZE_NUDGE`.
     nudge_at: Mutex<Option<std::time::Instant>>,
@@ -133,7 +135,7 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        for path in [&self.sysprompt_tmp, &self.track].into_iter().flatten() {
+        for path in [&self.sysprompt_tmp, &self.track, &self.home].into_iter().flatten() {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -349,6 +351,38 @@ fn spawn_claude_pane(profile: &str, dir: &std::path::Path, start: &Start, cols: 
     Ok(pane)
 }
 
+/// cpit's main screen as a pane, listed under `profile`.
+fn spawn_home_pane(profile: &str, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
+    let requests = workspace::new_track_path().with_extension("open");
+    let mut pane = spawn_pane_cmd(launch::home_pty_command(cwd, &requests)?, None, false, profile, cwd, cols, rows)?;
+    pane.home = Some(requests);
+    Ok(pane)
+}
+
+/// Shows the main screen pane, starting one if there is none.
+fn add_home_pane(panes: &mut Vec<Pane>, focus: &mut usize, cwd: &std::path::Path) -> Result<Option<String>> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    if let Some(i) = panes.iter().position(|p| p.home.is_some()) {
+        return Ok(reveal(panes, focus, i, cols, rows));
+    }
+    if panes.len() >= MAX_TOTAL {
+        return Ok(Some("pane limit reached".to_string()));
+    }
+    let profile = panes[*focus].meta.profile.clone();
+    let (pc, pr) = spawn_geometry(panes, cols, rows);
+    let pane = spawn_home_pane(&profile, cwd, pc, pr)?;
+    Ok(show_new(panes, focus, pane, cols, rows))
+}
+
+/// Opens what the main screen pane asked for. Returns whether it asked, and a
+/// message worth showing. A pane that fails to start leaves the rest running.
+fn serve_home_pane(panes: &mut Vec<Pane>, focus: &mut usize, cwd: &std::path::Path) -> Option<Option<String>> {
+    let request = panes.iter().filter_map(|p| p.home.as_deref()).find_map(open::take)?;
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let target = Target::requested(&request, cwd);
+    Some(open_in(panes, focus, &target, cols, rows).unwrap_or_else(|e| Some(format!("{}: {e}", target.profile))))
+}
+
 /// A pane running a plain interactive shell instead of Claude, listed under
 /// `profile` (the profile of the pane it was opened from).
 fn spawn_shell_pane(profile: &str, cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Pane> {
@@ -406,7 +440,7 @@ fn spawn_pane_cmd(
         last_focus: 0,
         worktree: None,
     };
-    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, session_id: None, track: None, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
+    Ok(Pane { meta, parser, writer, master: pair.master, child, dirty, gen, rows_cache: Mutex::new(None), reported, sysprompt_tmp, claude, session_id: None, track: None, home: None, nudge_at: Mutex::new(None), last_input: Mutex::new(std::time::Instant::now()), notified_at: None, sub_notified_at: None })
 }
 
 /// Appends `;<sgr color params>` for one colour to an SGR sequence being built.
@@ -1320,6 +1354,14 @@ fn start_split(profiles: &[Profile], targets: &[Target], cwd: std::path::PathBuf
 /// How often a running split writes its layout.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 
+/// Where the focused pane lands once the panes marked in `left_out` are gone:
+/// its place among the rest, or the nearest one before it.
+fn saved_focus(left_out: &[bool], focus: usize) -> usize {
+    let before = left_out.iter().take(focus).filter(|&&out| !out).count();
+    let kept = left_out.iter().filter(|&&out| !out).count();
+    before.min(kept.saturating_sub(1))
+}
+
 /// Keeps a split's saved layout (see `workspace.rs`) in step with its panes.
 struct Keeper {
     store: Option<workspace::Store>,
@@ -1340,8 +1382,10 @@ impl Keeper {
     fn save(&mut self, panes: &[Pane], focus: usize) {
         self.saved_at = Some(std::time::Instant::now());
         let Some(store) = &mut self.store else { return };
-        let saved = panes.iter().map(Pane::saved).chain(self.lost.iter().cloned()).collect();
-        if store.save(&workspace::Workspace { cwd: self.cwd.clone(), focus, panes: saved }) {
+        // The main screen is not part of a layout: it is opened when wanted.
+        let home: Vec<bool> = panes.iter().map(|p| p.home.is_some()).collect();
+        let saved = panes.iter().filter(|p| p.home.is_none()).map(Pane::saved).chain(self.lost.iter().cloned()).collect();
+        if store.save(&workspace::Workspace { cwd: self.cwd.clone(), focus: saved_focus(&home, focus), panes: saved }) {
             if let Some(claim) = self.claim.take() {
                 claim.finish();
             }
@@ -1489,7 +1533,13 @@ fn settle(panes: &mut [Pane], focus: &mut usize, cols: u16, rows: u16) {
 /// profile + project + kind. Returns its index.
 fn register(panes: &mut Vec<Pane>, mut pane: Pane) -> usize {
     pane.meta.id = sidebar::next_id(panes);
-    let kind = if pane.meta.shell { "shell" } else { "claude" };
+    let kind = if pane.home.is_some() {
+        "home"
+    } else if pane.meta.shell {
+        "shell"
+    } else {
+        "claude"
+    };
     let mut n = 1;
     loop {
         let title = format!("{kind} {n}");
@@ -2304,6 +2354,7 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
                 ("x", "close"),
                 ("w", "waiting"),
                 ("b", "sidebar"),
+                ("m", "main screen"),
                 ("d", "home"),
                 ("1-9", "jump"),
                 ("←→↑↓", "move"),
@@ -2607,6 +2658,8 @@ enum Act {
     Move(Dir),
     /// Back to the cockpit with the panes left running.
     Detach,
+    /// The main screen as a pane.
+    Home,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2637,6 +2690,7 @@ fn leader_action(code: KeyCode) -> Option<Act> {
             'w' => Some(Act::Waiting),
             'b' => Some(Act::Sidebar),
             'd' => Some(Act::Detach),
+            'm' => Some(Act::Home),
             d @ '1'..='9' => Some(Act::Jump(d as usize - '0' as usize)),
             _ => None,
         },
@@ -2717,8 +2771,13 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
         ctl.prev.clear();
     }
     match a {
-        // Leaving the split is the run loop's job (see `run_command`).
+        // Leaving the split is the run loop's job, which sees this key first.
         Act::Detach => {}
+        Act::Home => match add_home_pane(panes, focus, cwd) {
+            Ok(Some(t)) => ctl.say(t),
+            Ok(None) => {}
+            Err(e) => ctl.say(format!("main screen: {e}")),
+        },
         Act::List => {
             ctl.side.focus = !ctl.side.focus;
             if ctl.side.focus {
@@ -2869,6 +2928,15 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                     let _ = w.flush();
                 }
             }
+        }
+        if let Some(message) = serve_home_pane(panes, focus, cwd) {
+            if let Some(message) = message {
+                ctl.say(message);
+            }
+            ctl.typed.clear();
+            ctl.sel = None;
+            ctl.prev.clear();
+            ctl.force = true;
         }
         if ctl.toast.as_ref().is_some_and(|(_, at)| at.elapsed() > TOAST_TTL) {
             ctl.toast = None;
@@ -3213,7 +3281,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         while i < panes.len() {
             if let Ok(Some(status)) = panes[i].child.try_wait() {
                 // A clean exit is the user closing it; a failed one stays saved.
-                if !status.success() {
+                if !status.success() && panes[i].home.is_none() {
                     keeper.lost.push(panes[i].saved());
                 }
                 if remove_pane(panes, focus, i) {
@@ -3332,6 +3400,14 @@ mod tests {
         assert_eq!(report(&parser, true), Some(vec![0x1b, b'[', b'M', 96, 37, 42]));
         parser.process(b"\x1b[?1000l");
         assert_eq!(report(&parser, true), None);
+    }
+
+    #[test]
+    fn the_saved_focus_skips_panes_left_out() {
+        assert_eq!(saved_focus(&[false, true, false], 2), 1);
+        assert_eq!(saved_focus(&[true, false, false], 0), 0);
+        assert_eq!(saved_focus(&[false, false, true], 2), 1, "the main screen had focus");
+        assert_eq!(saved_focus(&[true], 0), 0);
     }
 
     #[test]

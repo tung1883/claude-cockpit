@@ -93,6 +93,28 @@ pub fn account_lines(profiles: &[Profile], selected: i64, stats: &[Stat]) -> Vec
     lines
 }
 
+/// `hint_grid` that continues a row on the next line instead of letting it run
+/// past `width` (a narrow terminal, or the main screen in a small pane). For
+/// screens that can take the extra lines.
+pub fn hint_grid_wrapped(rows: &[&[(&str, &str)]], cell: usize, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        let mut start = 0;
+        // Columns used so far, after the leading space.
+        let mut used = 1;
+        for (i, (k, v)) in row.iter().enumerate() {
+            let text = k.chars().count() + 1 + v.chars().count();
+            if i > start && used + text > width {
+                out.extend(hint_grid(&[&row[start..i]], cell));
+                (start, used) = (i, 1);
+            }
+            used += text.max(cell);
+        }
+        out.extend(hint_grid(&[&row[start..]], cell));
+    }
+    out
+}
+
 /// Rows of key hints laid out on an aligned grid, e.g. `[("↑/↓","move"), ...]`.
 pub fn hint_grid(rows: &[&[(&str, &str)]], cell: usize) -> Vec<String> {
     rows.iter()
@@ -104,4 +126,19 @@ pub fn hint_grid(rows: &[&[(&str, &str)]], cell: usize) -> Vec<String> {
             format!(" {}", joined.trim_end())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_wrap_to_the_width() {
+        let row: &[(&str, &str)] = &[("a", "one"), ("b", "two"), ("c", "three"), ("d", "four")];
+        assert_eq!(hint_grid_wrapped(&[row], 10, 80), hint_grid(&[row], 10));
+        let narrow = hint_grid_wrapped(&[row], 10, 24);
+        assert_eq!(narrow.len(), 2);
+        assert!(narrow.iter().all(|l| vis_len(l) <= 24), "{narrow:?}");
+        assert_eq!(hint_grid_wrapped(&[row], 10, 3).len(), 4, "one each when nothing fits");
+    }
 }

@@ -43,7 +43,7 @@ fn notes_onboarding(profiles: &[Profile], selected: usize, stats: &[Stat]) -> st
 /// The main account picker. One blocking `read_key()` call per loop
 /// iteration — raw mode was already enabled once for the whole process by
 /// `ui::Terminal::enter`, so there's no per-screen mode toggling here at all.
-pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_saved: bool) -> std::io::Result<Action> {
+pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_saved: bool, in_pane: bool) -> std::io::Result<Action> {
     if profiles.is_empty() {
         return Ok(Action::Add);
     }
@@ -62,13 +62,17 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_s
             vec![("↑/↓", "move"), ("→", "view"), ("n", "notes"), ("r", "refresh"), ("m", "memory"), (",", "settings"), ("q", "quit")];
         let mut row2: Vec<(&str, &str)> =
             vec![("a", "add"), ("i", "import"), ("d", "delete"), ("s", "sync"), ("g", "shell"), ("p", "panels"), ("/", "sessions")];
+        if in_pane {
+            // Panes are managed by the cockpit around this one.
+            row2.retain(|(key, _)| *key != "p");
+        }
         if has_session {
             row2.push(("^B", "resume"));
         }
         if has_saved {
             row1.push(("o", "restore"));
         }
-        lines.extend(layout::hint_grid(&[&row1, &row2], 16));
+        lines.extend(layout::hint_grid_wrapped(&[&row1, &row2], 16, ui::term_width()));
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
@@ -146,7 +150,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_s
                 ui::show_cursor();
                 return Ok(Action::Memory(profiles[selected].name.clone()));
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('p') if !in_pane => {
                 ui::show_cursor();
                 return Ok(Action::Panels);
             }

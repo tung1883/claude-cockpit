@@ -1195,6 +1195,17 @@ fn note_indexing() -> String {
     }
 }
 
+/// Makes room for `below` more lines in a `th`-line frame by dropping the
+/// lines just above its closing rule (blank filler and the detail strip).
+fn fit_above(lines: &mut Vec<String>, th: usize, below: usize) {
+    let over = (lines.len() + below).saturating_sub(th);
+    if over == 0 || lines.is_empty() {
+        return;
+    }
+    let rule = lines.len() - 1;
+    lines.drain(rule.saturating_sub(over)..rule);
+}
+
 fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<String>, Option<(usize, usize)>) {
     let mut lines: Vec<String> = header.to_vec();
     let flash = if u.flash.is_empty() { String::new() } else { format!("  {}", ui::color::yellow(&u.flash)) };
@@ -1248,7 +1259,11 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
         let it = hits.get(u.ssel).map(|h| Item::Sess(h.s, None));
         lines.extend(strip(m, it.as_ref(), &u.q, tw));
         lines.push(ui::rule(None));
-        lines.extend(layout::hint_grid(&[&[("↑/↓", "move"), ("Enter", if u.pick { "pick" } else { "open" }), ("Tab", "scope"), ("type", "to search"), ("Esc", "back")]], (tw / 5).clamp(16, 22)));
+        // The one hint row `foot` allows for; wrapped rows take their room from
+        // the empty lines and the detail strip above.
+        let hints = layout::hint_grid_wrapped(&[&[("↑/↓", "move"), ("Enter", if u.pick { "pick" } else { "open" }), ("Tab", "scope"), ("type", "to search"), ("Esc", "back")]], (tw / 5).clamp(16, 22), tw);
+        fit_above(&mut lines, th, hints.len());
+        lines.extend(hints);
         // lines.len() already fills the screen; cursor sits on the Search row
         return (lines, cursor);
     }
@@ -1357,7 +1372,10 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
         hs.push(("d", "unpin"));
     }
     hs.push((back, "back"));
-    lines.extend(layout::hint_grid(&[&hs], (tw / hs.len()).clamp(14, 22)));
+    let hints = layout::hint_grid_wrapped(&[&hs], (tw / hs.len()).clamp(14, 22), tw);
+    // One hint row and the prompt row below it are allowed for.
+    fit_above(&mut lines, th, hints.len() + 1);
+    lines.extend(hints);
     if let Some(ask) = &u.ask {
         let q = match ask {
             Ask::Delete(v) => {

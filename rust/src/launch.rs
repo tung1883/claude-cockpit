@@ -61,6 +61,7 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path, start: &Start, track
     // for this pane (see notify.rs), so they stay quiet.
     cmd.env("CPIT_PANES", "1");
     cmd.env(workspace::TRACK_ENV, track);
+    cmd.env_remove(crate::open::HOME_PANE_ENV);
     let settings = std::fs::read_to_string(paths::profile_dir(profile).join("settings.json")).ok();
     let chosen = std::env::var_os("CLAUDE_CODE_NO_FLICKER").is_some() || std::env::var_os("SSH_CONNECTION").is_some();
     if !chosen && wants_fullscreen(settings.as_deref()) {
@@ -97,7 +98,18 @@ pub(crate) fn shell_pty_command(cwd: &Path) -> portable_pty::CommandBuilder {
     cmd.cwd(cwd);
     // Inherited when cpit itself runs inside a pane; not this pane's.
     cmd.env_remove(workspace::TRACK_ENV);
+    cmd.env_remove(crate::open::HOME_PANE_ENV);
     cmd
+}
+
+/// PTY command for cpit's own main screen as a pane. It asks for panes by
+/// writing to `requests` (see `open.rs`).
+pub(crate) fn home_pty_command(cwd: &Path, requests: &Path) -> Result<portable_pty::CommandBuilder> {
+    let mut cmd = portable_pty::CommandBuilder::new(std::env::current_exe()?);
+    cmd.cwd(cwd);
+    cmd.env_remove(workspace::TRACK_ENV);
+    cmd.env(crate::open::HOME_PANE_ENV, requests);
+    Ok(cmd)
 }
 
 /// The three cockpit-managed system-prompt levels, coarse to fine:
@@ -237,6 +249,7 @@ pub fn launch_in(profile: &str, args: &[String], cwd: Option<&Path>) -> Result<i
     cmd.env("CLAUDE_CONFIG_DIR", paths::profile_dir(profile));
     // Not a pane: it must not report into one cpit may be running inside.
     cmd.env_remove(workspace::TRACK_ENV);
+    cmd.env_remove(crate::open::HOME_PANE_ENV);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
