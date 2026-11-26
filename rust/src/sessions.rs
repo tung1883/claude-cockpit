@@ -52,7 +52,7 @@ pub fn norm_path(p: &str) -> String {
     s
 }
 
-fn same_path(a: &str, b: &str) -> bool {
+pub fn same_path(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
@@ -63,7 +63,7 @@ fn under(p: &str, folder: &str) -> bool {
 }
 
 /// `…/work/x` for paths under the usual work folder, `~/…` under home.
-fn short_path(p: &str) -> String {
+pub fn short_path(p: &str) -> String {
     if let Some(home) = dirs::home_dir().map(|h| norm_path(&h.to_string_lossy())) {
         let work = format!("{home}/Documents/work");
         if p.len() >= work.len() && p[..work.len()].eq_ignore_ascii_case(&work) {
@@ -1081,6 +1081,9 @@ struct Ui {
     home_pos: (usize, usize),
     /// Sessions marked with Space (by transcript path), for deleting several at once.
     picked: HashSet<String>,
+    /// Choosing a session for another screen: Enter returns it, and nothing
+    /// changes sessions or pins.
+    pick: bool,
     /// A question waiting for an answer at the bottom of the screen, and the text typed so far.
     ask: Option<Ask>,
     ask_buf: String,
@@ -1245,7 +1248,7 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
         let it = hits.get(u.ssel).map(|h| Item::Sess(h.s, None));
         lines.extend(strip(m, it.as_ref(), &u.q, tw));
         lines.push(ui::rule(None));
-        lines.extend(layout::hint_grid(&[&[("↑/↓", "move"), ("Enter", "open"), ("Tab", "scope"), ("type", "to search"), ("Esc", "back")]], (tw / 5).clamp(16, 22)));
+        lines.extend(layout::hint_grid(&[&[("↑/↓", "move"), ("Enter", if u.pick { "pick" } else { "open" }), ("Tab", "scope"), ("type", "to search"), ("Esc", "back")]], (tw / 5).clamp(16, 22)));
         // lines.len() already fills the screen; cursor sits on the Search row
         return (lines, cursor);
     }
@@ -1342,14 +1345,15 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
     let on_folder = matches!(cur.and_then(|c| items.get(c)), Some(Item::Folder(_)));
     let on_sess = matches!(cur.and_then(|c| items.get(c)), Some(Item::Sess(..)));
     let on_pin = matches!(cur.and_then(|c| items.get(c)), Some(Item::Pin(_)));
-    let mut hs: Vec<(&str, &str)> = vec![("↑/↓", "move"), ("Enter", "open"), ("/", "filter"), ("Ctrl+F", "search all")];
+    let enter = if u.pick { "pick" } else { "open" };
+    let mut hs: Vec<(&str, &str)> = vec![("↑/↓", "move"), ("Enter", enter), ("/", "filter"), ("Ctrl+F", "search all")];
     if on_folder {
         hs.push(("←/→", "fold"));
     }
-    if on_sess {
+    if on_sess && !u.pick {
         hs.extend([("Space", "select"), ("d", "delete"), ("p", "pin")]);
     }
-    if on_pin {
+    if on_pin && !u.pick {
         hs.push(("d", "unpin"));
     }
     hs.push((back, "back"));
@@ -1443,14 +1447,35 @@ fn pin_menu(profiles: &[Profile], mark: i64, header: &[String], m: &Model, pin: 
     }
 }
 
+/// The request that reopens `s`, in the folder it started in when that is
+/// known and not already the cockpit's.
+fn picked(s: &Sess) -> OpenRequest {
+    let dir = started_folder(&s.file).map(|d| PathBuf::from(d.replace('/', std::path::MAIN_SEPARATOR_STR)));
+    OpenRequest { dir, ..OpenRequest::resume(&s.acct, &s.id) }
+}
+
 /// The sessions browser. Returns what the user asked to open, if anything.
 pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Option<OpenRequest>> {
+    browse(profiles, mark, scope, false)
+}
+
+/// The browser as a chooser, starting on search over every account: returns
+/// the session chosen, or None when backed out of.
+pub fn pick(profiles: &[Profile]) -> anyhow::Result<Option<OpenRequest>> {
+    browse(profiles, -1, Scope::All, true)
+}
+
+fn browse(profiles: &[Profile], mark: i64, scope: Scope, pick: bool) -> anyhow::Result<Option<OpenRequest>> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut header = layout::account_lines(profiles, mark, &stats);
     let mut header_w = ui::term_width();
     let mut m = Model::load(profiles, &scope);
-    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), ask: None, ask_buf: String::new() };
+    let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), pick: false, ask: None, ask_buf: String::new() };
     let mut was_indexing = indexing().is_some();
+    if pick {
+        u.pick = true;
+        u.screen = Screen::Search;
+    }
     ui::hide_cursor();
     loop {
         // One row short of the terminal: a frame that fills every row scrolls the
@@ -1581,7 +1606,8 @@ pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Opti
                 KeyCode::Enter => {
                     if let Some(h) = hits.get(u.ssel) {
                         let s = m.sessions[h.s].clone();
-                        if let Some(request) = open_menu(profiles, mark, &s)? {
+                        let request = if pick { Some(picked(&s)) } else { open_menu(profiles, mark, &s)? };
+                        if let Some(request) = request {
                             ui::show_cursor();
                             return Ok(Some(request));
                         }
@@ -1621,7 +1647,10 @@ pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Opti
             continue;
         }
 
-        let key = input::gate_vim(raw, &[]);
+        let mut key = input::gate_vim(raw, &[]);
+        if pick && !key.ctrl && matches!(key.code, KeyCode::Char(' ' | 'd' | 'p')) {
+            key.code = KeyCode::Null;
+        }
         let items = if u.screen == Screen::Home { home_items(&m, &u) } else { folder_items(&m, &u).0 };
         let sel = selectable(&items);
         let n = sel.len();
@@ -1716,7 +1745,8 @@ pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Opti
                 match it {
                     Item::Sess(si, _) => {
                         let s = m.sessions[*si].clone();
-                        if let Some(request) = open_menu(profiles, mark, &s)? {
+                        let request = if pick { Some(picked(&s)) } else { open_menu(profiles, mark, &s)? };
+                        if let Some(request) = request {
                             ui::show_cursor();
                             return Ok(Some(request));
                         }
@@ -1736,6 +1766,16 @@ pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Opti
                             u.open_here = 20;
                         } else {
                             u.open_else = 20;
+                        }
+                    }
+                    Item::Pin(pi) if pick => {
+                        let pin = &m.pins[*pi];
+                        match m.sessions.iter().find(|s| s.acct == pin.acct && s.id == pin.session_id) {
+                            Some(s) => {
+                                ui::show_cursor();
+                                return Ok(Some(picked(s)));
+                            }
+                            None => u.flash = "that session was deleted".into(),
                         }
                     }
                     Item::Pin(pi) => {
@@ -1913,7 +1953,7 @@ mod tests {
             let hits = find(&m, &pool, q);
             println!("find {:>16?}: {:>3} hits in {:?}", q, hits.len(), t.elapsed());
         }
-        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), ask: None, ask_buf: String::new() };
+        let mut u = Ui { screen: Screen::Home, folder: None, sel: 0, top: 0, filter: String::new(), filtering: false, q: String::new(), ssel: 0, stop: 0, scope: 0, open_here: 5, open_else: 5, flash: String::new(), expanded: HashSet::new(), home_pos: (0, 0), picked: HashSet::new(), pick: false, ask: None, ask_buf: String::new() };
         let t = Instant::now();
         for _ in 0..200 {
             let _ = draw(&m, &mut u, &[], 120, 39);

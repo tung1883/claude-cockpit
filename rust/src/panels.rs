@@ -15,6 +15,8 @@ use crate::clipboard;
 use crate::conpty;
 use crate::dirpick;
 use crate::open::OpenRequest;
+use crate::pane_picker::{self, Choice, Column, Cursor, FolderRow};
+use crate::sessions;
 use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
@@ -721,9 +723,7 @@ fn make_layout(cols: u16, rows: u16, n: usize) -> Layout {
     Layout { main_x, grows, gcols, pane_cols, pane_rows }
 }
 
-/// Queue box on the right of the pane picker: narrowest terminal that gets it,
-/// and its width.
-const QUEUE_BOX_MIN_COLS: u16 = 100;
+/// Width of the queue box on the right of the pane picker.
 const QUEUE_BOX_W: usize = 36;
 
 /// The right-hand queue box, fully framed: one entry per queued pane
@@ -805,217 +805,184 @@ enum PaneAdd {
     Pick(Target),
 }
 
-/// One flattened, navigable row in `pick_pane_target`'s list.
-enum TargetRow {
-    Start,
-    Profile(usize),
-    /// `profile_idx`'s project at `path` — the always-shown "(current)" row
-    /// when `is_current`, else one revealed by expanding that profile.
-    Project { profile_idx: usize, path: std::path::PathBuf, is_current: bool },
-    /// "Choose path" — type any directory for `profile_idx`'s pane.
-    ChoosePath(usize),
-    /// "New worktree" — a fresh worktree of the launch directory's repo.
-    NewWorktree(usize),
+/// What the picker's session column and `/` search turn into: a target that
+/// resumes `session_id` for `profile` in `dir`, unless that can't be opened.
+fn resume_target(profile: &str, session_id: &str, dir: std::path::PathBuf, queued: &[Target]) -> std::result::Result<Target, String> {
+    if queued.iter().any(|t| t.profile == profile && t.resume.as_deref() == Some(session_id)) {
+        return Err("that session is already queued".to_string());
+    }
+    if !dir.is_dir() {
+        return Err(format!("folder {} is gone", dir.display()));
+    }
+    Ok(Target { resume: Some(session_id.to_string()), ..Target::plain(profile, dir) })
 }
 
-/// Profile picker for adding a pane, with each profile expandable (→) into
-/// the projects it has sessions in — collapsed, a profile shows just one
-/// row (the cwd cockpit itself was launched from, "(current)"); expanding
-/// reveals its other recent projects (from `session::grouped_sessions`,
-/// the same source the Notes/Detail screens use) so a pane can be launched
-/// into a *different* project than the one cockpit is sitting in.
+/// A folder path for the folder column: home shortened, separators uniform.
+fn folder_label(path: &std::path::Path) -> String {
+    sessions::short_path(&sessions::norm_path(&path.to_string_lossy()))
+}
+
+/// Picker for adding a pane, in three columns: the account, a folder (the one
+/// cockpit was launched from, then the account's other projects, then Choose
+/// path and New worktree) and a session there, new or existing. `/` searches
+/// every account's sessions instead.
 ///
 /// `queue` is `run_split`'s list of panes chosen so far: when `Some`, a
-/// "Start" row appears first, picks are pushed onto the queue (the picker
-/// stays open until Start or the open-pane limit), and the queue is shown — as a box on
-/// the right when the terminal is wide enough, else as a header list — where
-/// Tab moves into it to re-path (Enter) or remove (x) a pane. `None` is the
-/// mid-split "add a pane" picker (F7): one pick, returned directly.
+/// "Start" row appears above the columns, picks are pushed onto the queue (the
+/// picker stays open until Start or the open-pane limit), and the queue is
+/// shown — as a box on the right when the columns still fit beside it, else as
+/// a header list — where Tab moves into it to re-path (Enter) or remove (x) a
+/// pane. `None` is the mid-split "add a pane" picker (F7): one pick, returned
+/// directly.
 fn pick_pane_target(
     profiles: &[Profile],
     cwd: &std::path::Path,
     heading: &str,
     mut queue: Option<&mut Vec<Target>>,
 ) -> Result<Option<PaneAdd>> {
-    let cwd_norm = cwd.to_string_lossy().replace('\\', "/");
-    // Only one profile expanded at a time — keeps "collapse" unambiguous
-    // (see the Left/Esc handling below) instead of needing to track which
-    // of several expanded profiles a given key press should affect.
-    let mut expanded: Option<usize> = None;
-    // Fetched once per profile, only on first expand — grouped_sessions
-    // scans every session file's cwd, not worth paying for a profile
-    // that's never expanded.
-    let mut projects_cache: std::collections::HashMap<usize, Vec<session::SessionGroup>> = std::collections::HashMap::new();
-    let mut selected = 0usize;
-    let mut top = 0usize;
-    // Set on collapse, resolved against the freshly-rebuilt row list at
-    // the top of the next iteration — restores the highlight to the
-    // profile row itself, instead of leaving `selected` at whatever
-    // numeric position it was at among the expanded project rows, which
-    // could now land on a completely different (and shorter) profile
-    // after the list shrinks back down.
-    let mut refocus_profile: Option<usize> = None;
-    // Queue-box focus (Tab) and its highlighted pane.
+    let mut cursor = Cursor::default();
+    // Fetched once per account, when it is first highlighted — grouped_sessions
+    // scans every session file's cwd, not worth paying for the others.
+    let mut projects: std::collections::HashMap<usize, Vec<session::SessionGroup>> = std::collections::HashMap::new();
+    // Session column titles, read only for rows that have been on screen.
+    let mut titles: std::collections::HashMap<std::path::PathBuf, String> = std::collections::HashMap::new();
+    // Queue focus (Tab) and its highlighted pane.
     let mut focus_q = false;
     let mut qsel = 0usize;
-    // Rows turned into worktree panes with `w` (profile index + project), and
-    // a one-line message for the next frame.
+    // Folders turned into worktree panes with `w` (account index + folder),
+    // and a one-line message for the next frame.
     let mut marked: std::collections::HashSet<(usize, std::path::PathBuf)> = std::collections::HashSet::new();
     let mut note: Option<String> = None;
-    // Computed once, not per frame — this used to call `account_stat`
-    // (a full directory walk per profile) on every single keystroke via
-    // `quota_note`/`account_lines`, which is what made the screen laggy.
+    // Computed once, not per frame: `account_stat` walks a whole directory.
     let stats: Vec<layout::Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
+    let longest = profiles.iter().map(|p| p.name.chars().count()).max().unwrap_or(0);
 
     ui::hide_cursor();
-    loop {
-        // Rebuilt every frame from `expanded` — cheap (a handful of
-        // profiles/projects), and simplest way to keep the flattened
-        // row list in sync with expand state without a parallel index.
-        let mut rows: Vec<TargetRow> = Vec::new();
-        if queue.as_deref().map_or(false, |q| !q.is_empty()) {
-            rows.push(TargetRow::Start);
-        }
-        for i in 0..profiles.len() {
-            rows.push(TargetRow::Profile(i));
-            rows.push(TargetRow::Project { profile_idx: i, path: cwd.to_path_buf(), is_current: true });
-            if expanded == Some(i) {
-                rows.push(TargetRow::ChoosePath(i));
-                rows.push(TargetRow::NewWorktree(i));
-                if let Some(groups) = projects_cache.get(&i) {
-                    for g in groups {
-                        if g.folder.replace('\\', "/") == cwd_norm {
-                            continue; // already shown as the "(current)" row
-                        }
-                        rows.push(TargetRow::Project { profile_idx: i, path: std::path::PathBuf::from(&g.folder), is_current: false });
-                    }
-                }
-            }
-        }
-        // The always-shown "(current)" row under each profile is display
-        // only, not a distinct pick from the profile row itself (Enter on
-        // the profile already means "use current project") — excluded
-        // from ↑/↓ so a profile moves straight to the next one instead of
-        // stopping on a line that duplicates its own default action.
-        let selectable_idx: Vec<usize> =
-            rows.iter().enumerate().filter(|(_, r)| !matches!(r, TargetRow::Project { is_current: true, .. })).map(|(i, _)| i).collect();
-        if let Some(pi) = refocus_profile.take() {
-            if let Some(pos) = selectable_idx.iter().position(|&i| matches!(rows[i], TargetRow::Profile(p) if p == pi)) {
-                selected = pos;
-            }
-        }
-        selected = selected.min(selectable_idx.len().saturating_sub(1));
-        let active_row = selectable_idx[selected];
+    let result = loop {
+        cursor.account = cursor.account.min(profiles.len().saturating_sub(1));
+        let account = cursor.account;
+        let groups = projects.entry(account).or_insert_with(|| session::grouped_sessions(&profiles[account].name));
+        let rows = pane_picker::folder_rows(cwd, groups);
+        cursor.folder = cursor.folder.min(rows.len() - 1);
+        let session_rows = pane_picker::session_count(&rows[cursor.folder], groups);
+        cursor.session = cursor.session.min(session_rows.saturating_sub(1));
+        let queued = queue.as_deref().map_or(0, |q| q.len());
+        cursor.on_start &= queued > 0;
+        focus_q &= queued > 0;
+        qsel = qsel.min(queued.saturating_sub(1));
 
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let drawn_cap = shown_cap(term_cols, term_rows);
-        let show_box = queue.is_some() && term_cols >= QUEUE_BOX_MIN_COLS;
-        if let Some(q) = queue.as_deref() {
-            qsel = qsel.min(q.len().saturating_sub(1));
-        }
-        let mut header = layout::account_lines(profiles, -1, &stats);
-        match queue.as_deref() {
-            Some(q) if show_box => {
-                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Add pane {}", q.len() + 1))));
+        let (term_cols, term_rows) = (term_cols as usize, term_rows as usize);
+        let drawn_cap = shown_cap(term_cols as u16, term_rows as u16);
+        // The queue box only where the three columns still fit beside it.
+        let show_box = queue.is_some() && term_cols >= pane_picker::MIN_COLUMNS_W + QUEUE_BOX_W + 4;
+        let width = if show_box { term_cols - QUEUE_BOX_W - 4 } else { term_cols.saturating_sub(1) };
+
+        let title = match queue.as_deref() {
+            Some(q) => format!("Add pane {}", q.len() + 1),
+            None => heading.to_string(),
+        };
+        let mut header = vec![ui::banner(), format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&title))];
+        if let Some(q) = queue.as_deref().filter(|q| !show_box && !q.is_empty()) {
+            header.push(ui::color::dim(&format!("   queued {} ({drawn_cap} shown at once)", q.len())));
+            // A few around the selected one, so the columns keep their room.
+            for i in dirpick::window(q.len(), if focus_q { qsel } else { q.len() - 1 }, 4) {
+                let marker = if focus_q && i == qsel { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
+                let tag = if q[i].resume.is_some() { ui::color::dim(" (resume)") } else { q[i].worktree.as_ref().map(|w| ui::color::cyan(&format!(" wt:{}", w.name))).unwrap_or_default() };
+                header.push(format!("  {marker}{} {}{tag}  {}", ui::color::orange(&(i + 1).to_string()), q[i].profile, ui::color::dim(&pane_picker::clip_left(&folder_label(&q[i].dir), width.saturating_sub(30)))));
             }
-            Some(q) => {
-                header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(&format!("Panes so far ({}, {drawn_cap} shown at once)", q.len()))));
-                for (i, t) in q.iter().enumerate() {
-                    let tag = t.worktree.as_ref().map(|w| ui::color::cyan(&format!(" wt:{}", w.name))).unwrap_or_default();
-                    header.push(format!("   {} {}{tag}  {}", ui::color::orange(&(i + 1).to_string()), t.profile, ui::color::dim(&t.dir.display().to_string())));
-                }
-            }
-            None => header.push(format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(heading))),
         }
-        header.push(ui::color::dim("   Enter select · → on a profile: recent projects, Choose path & New worktree · w worktree"));
         header.push(match note.take() {
             Some(n) => ui::color::red(&format!("   {n}")),
             None => String::new(),
         });
+        if queued > 0 {
+            let label = if queued == 1 { "Start (solo session)".to_string() } else { format!("Start ({queued} panes)") };
+            header.push(if cursor.on_start {
+                format!(" {} {}", ui::color::orange(ui::glyph::pointer()), ui::color::orange_bold(&label))
+            } else {
+                format!("   {label}")
+            });
+            header.push(String::new());
+        }
         let body_start = header.len();
 
-        // Same viewport-paging pattern as every other scrollable list here
-        // (e.g. `choose_from_list_lazy`) — without it, expanding a profile
-        // with several projects can push later rows off the bottom of a
-        // short terminal with no way to see them: the selection still
-        // moves there on ↓, it's just invisible, which looked like
-        // "arrow keys don't work."
-        let chrome = header.len() + 4;
-        let viewport = (crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)).saturating_sub(chrome).max(3);
-        if active_row < top {
-            top = active_row;
+        // Column title, then the hint rows below.
+        let height = term_rows.saturating_sub(body_start + 5).max(3);
+        let widths = pane_picker::widths(width, longest);
+        let narrow = width < pane_picker::MIN_COLUMNS_W;
+        let active = |c: Column| cursor.column == c && !cursor.on_start && !focus_q;
+        let width_of = |i: usize| if narrow { width } else { widths[i] };
+        let mut columns: Vec<Vec<String>> = Vec::new();
+        if !narrow || cursor.column == Column::Account {
+            columns.push(pane_picker::column("Account", profiles.len(), cursor.account, active(Column::Account), width_of(0), height, |i, room| {
+                let count = stats[i].count.to_string();
+                let name = pane_picker::clip(&profiles[i].name, room.saturating_sub(count.len() + 1));
+                format!("{}{count}", layout::pad_to(&name, room.saturating_sub(count.len())))
+            }));
         }
-        if active_row >= top + viewport {
-            top = active_row - viewport + 1;
+        if !narrow || cursor.column == Column::Folder {
+            columns.push(pane_picker::column("Folder", rows.len(), cursor.folder, active(Column::Folder), width_of(1), height, |i, room| match &rows[i] {
+                FolderRow::Folder { path, current, .. } => {
+                    let tag = if marked.contains(&(account, path.clone())) { " [wt]" } else if *current { " (cur)" } else { "" };
+                    format!("{}{tag}", pane_picker::clip_left(&folder_label(path), room.saturating_sub(tag.len())))
+                }
+                FolderRow::ChoosePath => "Choose path…".to_string(),
+                FolderRow::NewWorktree => "New worktree…".to_string(),
+            }));
         }
-        top = top.min(rows.len().saturating_sub(viewport));
-        let end = (top + viewport).min(rows.len());
+        if !narrow || cursor.column == Column::Session {
+            let group = match &rows[cursor.folder] {
+                FolderRow::Folder { group, .. } => group.and_then(|g| groups.get(g)),
+                _ => None,
+            };
+            columns.push(pane_picker::column("Session", session_rows, cursor.session, active(Column::Session), width_of(2), height, |i, room| {
+                let Some(file) = i.checked_sub(1).and_then(|s| group?.sessions.get(s)) else { return "+ New session".to_string() };
+                let name = titles.entry(file.file.clone()).or_insert_with(|| {
+                    let (name, summary) = session::session_preview(&file.file);
+                    crate::session_label(file, &name, &summary)
+                });
+                let age = session::relative_age(Some(file.modified));
+                pane_picker::clip(&format!("{age:<9} {name}"), room)
+            }));
+        }
 
         let mut lines = header;
-        if top > 0 {
-            lines.push(ui::color::dim(&format!("    ↑ {top} more")));
+        if narrow && cursor.column != Column::Account {
+            let mut crumb = profiles[account].name.clone();
+            if let (Column::Session, FolderRow::Folder { path, .. }) = (cursor.column, &rows[cursor.folder]) {
+                crumb.push_str(&format!(" › {}", folder_label(path)));
+            }
+            lines.push(ui::color::dim(&format!("  {}", pane_picker::clip_left(&crumb, width.saturating_sub(2)))));
         }
-        for (i, row) in rows.iter().enumerate().take(end).skip(top) {
-            let on = i == active_row;
-            let marker = if on { ui::color::orange(ui::glyph::pointer()) } else { " ".to_string() };
-            let text = match row {
-                TargetRow::Start => {
-                    let n = queue.as_deref().map_or(0, |q| q.len());
-                    let label = if n <= 1 { "Start (solo session)".to_string() } else { format!("Start ({n} panes)") };
-                    if on { ui::color::orange_bold(&label) } else { label }
-                }
-                TargetRow::Profile(pi) => {
-                    let name = &profiles[*pi].name;
-                    if on { ui::color::orange_bold(name) } else { name.clone() }
-                }
-                TargetRow::ChoosePath(_) => {
-                    let text = "    Choose path…";
-                    if on { ui::color::orange_bold(text) } else { ui::color::dim(text) }
-                }
-                TargetRow::NewWorktree(_) => {
-                    let text = "    New worktree…";
-                    if on { ui::color::orange_bold(text) } else { ui::color::cyan(text) }
-                }
-                TargetRow::Project { profile_idx, path, is_current } => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let tag = if *is_current { ui::color::dim("(current)") } else { String::new() };
-                    let wt = if marked.contains(&(*profile_idx, path.clone())) { ui::color::cyan(" worktree") } else { String::new() };
-                    let text = format!("    {name} {tag}");
-                    format!("{}{wt}", if on { ui::color::orange_bold(&text) } else { ui::color::dim(&text) })
-                }
-            };
-            lines.push(format!(" {marker} {text}"));
-        }
-        if end < rows.len() {
-            lines.push(ui::color::dim(&format!("    ↓ {} more", rows.len() - end)));
-        }
+        lines.extend(pane_picker::join(&columns));
         if show_box {
             let box_lines = render_queue_box(queue.as_deref().unwrap(), drawn_cap, focus_q, qsel);
             // Keep the box off the terminal's last column — a glyph written there is
             // eaten by the pending-wrap state, which is what hid the right border.
-            let left_w = term_cols as usize - QUEUE_BOX_W - 4;
             for (k, bl) in box_lines.into_iter().enumerate() {
                 let at = body_start + k;
                 if at >= lines.len() {
                     lines.push(String::new());
                 }
-                lines[at] = format!("{}  {bl}", layout::pad_to(&lines[at], left_w));
+                lines[at] = format!("{}  {bl}", layout::pad_to(&lines[at], width));
             }
         }
         lines.push(String::new());
         lines.push(ui::rule(None));
-        lines.push(format!(
-            " {} move   {} select   {} expand   {} {}",
-            ui::color::dim("↑/↓"),
-            ui::color::dim("Enter"),
-            ui::color::dim("→"),
-            ui::color::dim(&format!("{}/Esc", ui::glyph::back())),
-            if expanded.is_some() { "collapse" } else { "back" },
-        ) + &if show_box { format!("   {} queue", ui::color::dim("Tab")) } else { String::new() });
+        let hints: &[(&str, &str)] = if focus_q {
+            &[("↑/↓", "move"), ("Enter", "folder"), ("x", "remove"), ("Tab/Esc", "back")]
+        } else {
+            &[("↑/↓", "move"), ("←/→", "column"), ("Enter", "select"), ("/", "search"), ("w", "worktree"), ("Esc", "back")]
+        };
+        let mut hint_line = format!(" {}", hints.iter().map(|(k, v)| format!("{} {v}", ui::color::dim(k))).collect::<Vec<_>>().join("   "));
+        if queued > 0 && !focus_q {
+            hint_line.push_str(&format!("   {} queue", ui::color::dim("Tab")));
+        }
+        lines.push(hint_line);
         ui::repaint(&lines);
 
         let key = crate::input::gate_vim(read_key()?, &[]);
-        if crate::input::vim_jump(&key, &mut selected, selectable_idx.len(), 8, true) { continue; }
         if key.ctrl && key.code == KeyCode::Char('c') {
             ui::show_cursor();
             std::process::exit(130);
@@ -1026,12 +993,13 @@ fn pick_pane_target(
                     KeyCode::Tab | KeyCode::Esc | KeyCode::Left => focus_q = false,
                     KeyCode::Up | KeyCode::Char('k') => qsel = (qsel + q.len() - 1) % q.len(),
                     KeyCode::Down | KeyCode::Char('j') => qsel = (qsel + 1) % q.len(),
-                    // Pane 1 is the profile cockpit was launched from; the
-                    // start needs at least one pane, so it can't be removed.
+                    // The start needs at least one pane, so the first stays.
                     KeyCode::Char('x') | KeyCode::Delete if qsel > 0 => {
                         q.remove(qsel);
                         qsel = qsel.min(q.len() - 1);
                     }
+                    // A resumed session stays in its own folder.
+                    KeyCode::Enter if q[qsel].resume.is_some() => note = Some("a resumed session keeps its folder".to_string()),
                     KeyCode::Enter => {
                         if let Some(dir) = prompt_dir(&format!("Pane {} — which directory?", qsel + 1), &q[qsel].dir)? {
                             if q[qsel].dir != dir {
@@ -1046,40 +1014,54 @@ fn pick_pane_target(
             }
             continue;
         }
+        let column_len = match cursor.column {
+            Column::Account => profiles.len(),
+            Column::Folder => rows.len(),
+            Column::Session => session_rows,
+        };
+        if !cursor.on_start {
+            let mut at = match cursor.column {
+                Column::Account => cursor.account,
+                Column::Folder => cursor.folder,
+                Column::Session => cursor.session,
+            };
+            if crate::input::vim_jump(&key, &mut at, column_len, 8, true) {
+                cursor.set(at);
+                continue;
+            }
+        }
+        let taken: Vec<String> = queue.as_deref().map(|q| q.iter().filter_map(|t| t.worktree.as_ref().map(|w| w.name.clone())).collect()).unwrap_or_default();
+        let mut pick: Option<Target> = None;
         match key.code {
-            KeyCode::Tab if show_box => focus_q = true,
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
-                // First press collapses whichever profile is expanded and
-                // stays on this screen; only actually backs out once
-                // nothing is expanded — matches every other drill-down
-                // list in the cockpit, where Back unwinds one level.
-                if let Some(pi) = expanded.take() {
-                    refocus_profile = Some(pi);
-                } else {
-                    ui::show_cursor();
-                    return Ok(None);
+            KeyCode::Tab if queued > 0 => focus_q = true,
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                if !cursor.left() {
+                    break None;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                selected = (selected + selectable_idx.len() - 1) % selectable_idx.len();
-            }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                selected = (selected + 1) % selectable_idx.len();
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if let TargetRow::Profile(pi) = &rows[active_row] {
-                    let pi = *pi;
-                    projects_cache.entry(pi).or_insert_with(|| session::grouped_sessions(&profiles[pi].name));
-                    expanded = Some(pi);
+            KeyCode::Char('q') => break None,
+            KeyCode::Up | KeyCode::Char('k') => cursor.vertical(false, column_len, queued > 0),
+            KeyCode::Down | KeyCode::Char('j') => cursor.vertical(true, column_len, queued > 0),
+            KeyCode::Right | KeyCode::Char('l') => cursor.right(session_rows),
+            KeyCode::Char('/') => {
+                if let Some(request) = sessions::pick(profiles)? {
+                    let target = Target::requested(&request, cwd);
+                    let id = request.resume.unwrap_or_default();
+                    match resume_target(&target.profile, &id, target.dir, queue.as_deref().map_or(&[][..], |q| q)) {
+                        Ok(t) => pick = Some(t),
+                        Err(why) => note = Some(why),
+                    }
                 }
+                ui::hide_cursor();
             }
             KeyCode::Char('w') => {
-                let key = match &rows[active_row] {
-                    TargetRow::Profile(pi) => Some((*pi, cwd.to_path_buf())),
-                    TargetRow::Project { profile_idx, path, .. } => Some((*profile_idx, path.clone())),
+                let folder = match (cursor.column, &rows[cursor.folder]) {
+                    (Column::Account, _) => Some(cwd.to_path_buf()),
+                    (Column::Folder, FolderRow::Folder { path, .. }) => Some(path.clone()),
                     _ => None,
                 };
-                if let Some(k) = key {
+                if let Some(folder) = folder {
+                    let k = (account, folder);
                     if worktree::repo_root(&k.1).is_none() {
                         note = Some("not a git repository — no worktree possible here".to_string());
                     } else if !marked.remove(&k) {
@@ -1087,63 +1069,52 @@ fn pick_pane_target(
                     }
                 }
             }
+            KeyCode::Enter if cursor.on_start => break Some(PaneAdd::Start),
             KeyCode::Enter => {
-                let queued: Vec<String> = queue.as_deref().map(|q| q.iter().filter_map(|t| t.worktree.as_ref().map(|w| w.name.clone())).collect()).unwrap_or_default();
-                let pick: Target = match &rows[active_row] {
-                    TargetRow::Start => {
-                        ui::show_cursor();
-                        return Ok(Some(PaneAdd::Start));
-                    }
-                    TargetRow::Profile(pi) | TargetRow::Project { profile_idx: pi, .. } => {
-                        let dir = match &rows[active_row] {
-                            TargetRow::Project { path, .. } => path.clone(),
-                            _ => cwd.to_path_buf(),
-                        };
-                        if marked.contains(&(*pi, dir.clone())) {
-                            match ask_worktree(&profiles[*pi].name, &dir, &queued)? {
-                                Some(t) => t,
-                                None => continue,
-                            }
+                let profile = &profiles[account].name;
+                match cursor.choice(&rows, cwd) {
+                    Choice::Fresh(dir) => {
+                        pick = if marked.contains(&(account, dir.clone())) {
+                            ask_worktree(profile, &dir, &taken)?
                         } else {
-                            Target::plain(&profiles[*pi].name, dir)
+                            Some(Target::plain(profile, dir))
+                        };
+                    }
+                    Choice::Resume { folder, group, session } => {
+                        if let Some(file) = projects.get(&account).and_then(|g| g.get(group)).and_then(|g| g.sessions.get(session)) {
+                            // Claude finds a session by the folder it started in.
+                            let dir = sessions::started_folder(&file.file).map(|d| std::path::PathBuf::from(d.replace('/', std::path::MAIN_SEPARATOR_STR))).unwrap_or(folder);
+                            match resume_target(profile, &file.id, dir, queue.as_deref().map_or(&[][..], |q| q)) {
+                                Ok(t) => pick = Some(t),
+                                Err(why) => note = Some(why),
+                            }
                         }
                     }
-                    TargetRow::NewWorktree(pi) => {
-                        match prompt_worktree_with_dir(&profiles[*pi].name, cwd, &queued)? {
-                            Some(t) => t,
-                            None => continue,
-                        }
-                    }
-                    TargetRow::ChoosePath(pi) => {
-                        let title = format!("{} — which directory?", profiles[*pi].name);
-                        // Esc in the prompt just returns to this list.
-                        match prompt_dir(&title, cwd)? {
-                            Some(dir) => Target::plain(&profiles[*pi].name, dir),
-                            None => continue,
-                        }
-                    }
-                };
-                match queue.as_deref_mut() {
-                    Some(q) => {
-                        if q.len() < MAX_TOTAL {
-                            q.push(pick);
-                        }
-                        // At the open-pane limit nothing more can be added,
-                        // so launch.
-                        if q.len() >= MAX_TOTAL {
-                            ui::show_cursor();
-                            return Ok(Some(PaneAdd::Start));
-                        }
-                    }
-                    None => {
-                        ui::show_cursor();
-                        return Ok(Some(PaneAdd::Pick(pick)));
-                    }
+                    Choice::NewWorktree => pick = prompt_worktree_with_dir(profile, cwd, &taken)?,
+                    // Esc in the prompt just returns to the columns.
+                    Choice::ChoosePath => pick = prompt_dir(&format!("{profile} — which directory?"), cwd)?.map(|dir| Target::plain(profile, dir)),
                 }
+                ui::hide_cursor();
             }
             _ => {}
         }
-    }
+        let Some(pick) = pick else { continue };
+        match queue.as_deref_mut() {
+            Some(q) => {
+                if q.len() < MAX_TOTAL {
+                    q.push(pick);
+                }
+                // At the open-pane limit nothing more can be added, so launch.
+                if q.len() >= MAX_TOTAL {
+                    break Some(PaneAdd::Start);
+                }
+            }
+            None => break Some(PaneAdd::Pick(pick)),
+        }
+    };
+    session::flush_preview_cache();
+    ui::show_cursor();
+    Ok(result)
 }
 
 /// N Claude sessions side by side, chosen here. With panes already running,

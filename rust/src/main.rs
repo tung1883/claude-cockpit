@@ -14,6 +14,7 @@ mod layout;
 mod panels;
 mod paths;
 mod open;
+mod pane_picker;
 mod picker;
 mod profiles;
 mod quota;
