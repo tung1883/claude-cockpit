@@ -14,6 +14,7 @@
 use crate::clipboard;
 use crate::conpty;
 use crate::dirpick;
+use crate::open::OpenRequest;
 use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
@@ -240,7 +241,10 @@ fn spawn_target(t: &Target, cols: u16, rows: u16) -> Result<Pane> {
         return Ok(pane);
     }
     let Some(spec) = &t.worktree else {
-        return spawn_pane(&t.profile, &t.dir, cols, rows);
+        return match &t.resume {
+            Some(id) => spawn_claude_pane(&t.profile, &t.dir, &Start::Resume(id.clone()), cols, rows),
+            None => spawn_pane(&t.profile, &t.dir, cols, rows),
+        };
     };
     let repo = worktree::repo_root(&t.dir).ok_or_else(|| anyhow::anyhow!("{} is not in a git repository", t.dir.display()))?;
     let made = worktree::create(&repo, &spec.name, &spec.base)?;
@@ -262,7 +266,7 @@ fn spawn_target(t: &Target, cols: u16, rows: u16) -> Result<Pane> {
 fn ask_worktree(profile: &str, dir: &std::path::Path, queued: &[String]) -> Result<Option<Target>> {
     let Some(repo) = worktree::repo_root(dir) else { return Ok(None) };
     let spec = prompt_worktree(&repo, queued)?;
-    Ok(spec.map(|spec| Target { profile: profile.to_string(), dir: dir.to_path_buf(), worktree: Some(spec), restore: None }))
+    Ok(spec.map(|spec| Target { worktree: Some(spec), ..Target::plain(profile, dir.to_path_buf()) }))
 }
 
 /// The worktree name prompt: Name (typed), From (Tab switches between the
@@ -777,13 +781,21 @@ struct Target {
     profile: String,
     dir: std::path::PathBuf,
     worktree: Option<WorktreeSpec>,
+    /// The session to continue; a new one when None.
+    resume: Option<String>,
     /// Set when reopening a saved pane; it then decides folder and session.
     restore: Option<workspace::Planned>,
 }
 
 impl Target {
+    /// What `request` asks for; `cwd` is used when it names no folder.
+    fn requested(request: &OpenRequest, cwd: &std::path::Path) -> Target {
+        let dir = request.dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+        Target { resume: request.resume.clone(), ..Target::plain(&request.profile, dir) }
+    }
+
     fn plain(profile: &str, dir: std::path::PathBuf) -> Target {
-        Target { profile: profile.to_string(), dir, worktree: None, restore: None }
+        Target { profile: profile.to_string(), dir, worktree: None, resume: None, restore: None }
     }
 }
 
@@ -1134,12 +1146,12 @@ fn pick_pane_target(
     }
 }
 
-/// N Claude sessions side by side, `first` plus profiles chosen here. Panes
-/// can be added (F7) and closed (F8) while running, and a pane whose session
-/// exits on its own is dropped without disturbing the others; the split ends
-/// only when the last pane is gone (or Ctrl+Q). v1 scope: no system-prompt
-/// composition for the panes (plain launches only).
-pub fn run_split(profiles: &[Profile], _first: &str) -> Result<Option<Session>> {
+/// N Claude sessions side by side, chosen here. With panes already running,
+/// the chosen ones are added to them. Panes can be added (F7) and closed (F8)
+/// while running, and a pane whose session exits on its own is dropped without
+/// disturbing the others; the split ends only when the last pane is gone (or
+/// Ctrl+Q). `session` is left holding the panes if the user detaches.
+pub fn run_split(profiles: &[Profile], session: &mut Option<Session>) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     let mut chosen: Vec<Target> = vec![];
@@ -1148,12 +1160,74 @@ pub fn run_split(profiles: &[Profile], _first: &str) -> Result<Option<Session>> 
     // whole thing. Only the first few are drawn (as many as fit, at most 9);
     // the rest start in the pane list.
     if pick_pane_target(profiles, &cwd, "", Some(&mut chosen))?.is_none() {
-        return Ok(None);
+        return Ok(());
     }
     if chosen.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
-    run_split_targets(profiles, &chosen)
+    open_targets(profiles, session, &chosen)
+}
+
+/// Opens `request` as a pane: beside the running ones, if there are any.
+pub fn open(profiles: &[Profile], session: &mut Option<Session>, request: &OpenRequest) -> Result<()> {
+    let target = Target::requested(request, &std::env::current_dir()?);
+    open_targets(profiles, session, std::slice::from_ref(&target))
+}
+
+/// Shows `targets` as panes and runs the split until it ends or detaches. A
+/// running session takes them in, so it is never replaced (which would kill its
+/// panes); a pane that fails to start there only leaves a message.
+fn open_targets(profiles: &[Profile], session: &mut Option<Session>, targets: &[Target]) -> Result<()> {
+    let Some(mut running) = session.take() else {
+        *session = run_split_targets(profiles, targets)?;
+        return Ok(());
+    };
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    settle(&mut running.panes, &mut running.focus, cols, rows);
+    let mut toast = None;
+    for target in targets {
+        match open_in(&mut running.panes, &mut running.focus, target, cols, rows) {
+            Ok(message) => toast = message.or(toast),
+            Err(e) => toast = Some(format!("{}: {e}", target.profile)),
+        }
+    }
+    *session = resume_with(running, profiles, toast)?;
+    Ok(())
+}
+
+/// The pane already running `session_id` for `profile`.
+fn running_session(panes: &[Pane], profile: &str, session_id: &str) -> Option<usize> {
+    panes.iter().position(|p| p.claude && p.meta.profile == profile && p.saved().session_id.as_deref() == Some(session_id))
+}
+
+/// Brings pane `idx` on screen and focuses it. Returns a message worth showing.
+fn reveal(panes: &mut Vec<Pane>, focus: &mut usize, idx: usize, cols: u16, rows: u16) -> Option<String> {
+    let full = sidebar::full_index(panes);
+    let mut toast = None;
+    if panes[idx].meta.mode == Mode::Hidden || full.is_some_and(|f| f != idx) {
+        let mode = if full.is_some() { Mode::Full } else { Mode::Small };
+        toast = sidebar::set_mode(panes, focus, idx, mode, shown_cap(cols, rows));
+    }
+    if panes[idx].meta.mode != Mode::Hidden {
+        sidebar::focus_pane(panes, focus, idx);
+    }
+    settle(panes, focus, cols, rows);
+    toast
+}
+
+/// Adds the pane `target` describes to a running set. A session that already
+/// has a pane is shown there instead: two Claudes must not write one transcript.
+fn open_in(panes: &mut Vec<Pane>, focus: &mut usize, target: &Target, cols: u16, rows: u16) -> Result<Option<String>> {
+    if let Some(i) = target.resume.as_deref().and_then(|id| running_session(panes, &target.profile, id)) {
+        let toast = reveal(panes, focus, i, cols, rows);
+        return Ok(toast.or_else(|| Some("that session is already open".to_string())));
+    }
+    if panes.len() >= MAX_TOTAL {
+        return Ok(Some("pane limit reached".to_string()));
+    }
+    let (pc, pr) = spawn_geometry(panes, cols, rows);
+    let pane = spawn_target(target, pc, pr)?;
+    Ok(show_new(panes, focus, pane, cols, rows))
 }
 
 /// Run a split of exactly the given profiles (one pane each, in order), all
@@ -1366,12 +1440,17 @@ fn finish(mut panes: Vec<Pane>, focus: usize, cwd: std::path::PathBuf, keeper: K
 /// Re-enters a previously detached session, reflowing it to the current
 /// terminal size first. Same return contract as `run_split_profiles`. On
 /// quit or error `session` is dropped, which kills its children.
-pub fn resume(mut session: Session, profiles: &[Profile]) -> Result<Option<Session>> {
+pub fn resume(session: Session, profiles: &[Profile]) -> Result<Option<Session>> {
+    resume_with(session, profiles, None)
+}
+
+/// `resume`, showing `toast` as the split comes back.
+fn resume_with(mut session: Session, profiles: &[Profile], toast: Option<String>) -> Result<Option<Session>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     settle(&mut session.panes, &mut session.focus, cols, rows);
     ui::hide_cursor();
     let cwd = session.cwd.clone();
-    let exit = run_loop(&mut session.panes, &mut session.focus, profiles, &cwd, &mut session.keeper, None);
+    let exit = run_loop(&mut session.panes, &mut session.focus, profiles, &cwd, &mut session.keeper, toast);
     ui::show_cursor();
     match exit {
         Ok(LoopExit::Detach) => Ok(Some(session)),
@@ -1486,9 +1565,8 @@ fn add_pane(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile], cwd:
     ui::hide_cursor(); // the picker shows it again
     let mut toast = None;
     if let Some(PaneAdd::Pick(target)) = choice {
-        let (pc, pr) = spawn_geometry(panes, cols, rows);
-        match spawn_target(&target, pc, pr) {
-            Ok(pane) => toast = show_new(panes, focus, pane, cols, rows),
+        match open_in(panes, focus, &target, cols, rows) {
+            Ok(message) => toast = message,
             // A failed worktree (git refused) must not take the panel down.
             Err(e) if target.worktree.is_some() => toast = Some(format!("worktree failed: {e}")),
             Err(e) => return Err(e),
@@ -1728,7 +1806,7 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
                             error = p;
                         } else {
                             let resolved = resolve_dir_input(&dir.buf, cwd);
-                            break Some(Target { profile: profile.to_string(), dir: resolved, worktree: Some(WorktreeSpec { name, base: bases[base_i].clone() }), restore: None });
+                            break Some(Target { worktree: Some(WorktreeSpec { name, base: bases[base_i].clone() }), ..Target::plain(profile, resolved) });
                         }
                     }
                 }

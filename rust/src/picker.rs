@@ -16,7 +16,7 @@ pub enum Action {
     Refresh,
     Shell,
     Memory(String),
-    Panels(String),
+    Panels,
     ResumeSession,
     Restore,
     Settings(String),
@@ -148,7 +148,7 @@ pub fn pick_profile(profiles: &[Profile], start: usize, has_session: bool, has_s
             }
             KeyCode::Char('p') => {
                 ui::show_cursor();
-                return Ok(Action::Panels(profiles[selected].name.clone()));
+                return Ok(Action::Panels);
             }
             KeyCode::Char(',') => {
                 ui::show_cursor();

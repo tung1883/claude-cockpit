@@ -13,6 +13,7 @@ mod osc7501;
 mod layout;
 mod panels;
 mod paths;
+mod open;
 mod picker;
 mod profiles;
 mod quota;
@@ -33,6 +34,7 @@ mod workspace;
 mod worktree;
 
 use anyhow::Result;
+use open::OpenRequest;
 use picker::Action;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -118,14 +120,14 @@ fn not_yet_implemented(what: &str) -> Result<()> {
 
 /// The shared tail of every handoff flow once a session is chosen: pick a
 /// target profile, copy the transcript, offer to resume there immediately.
-fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, session_id: &str) -> Result<()> {
+fn run_handoff(profiles: &[profiles::Profile], mark: i64, from: &str, session_id: &str) -> Result<Option<OpenRequest>> {
     let others: Vec<&profiles::Profile> = profiles.iter().filter(|p| p.name != from).collect();
     if others.is_empty() {
         ui::home_clear();
         println!("{}\n", ui::banner());
         println!("{}", ui::color::dim("Need a second profile to hand off into."));
         picker::prompt_line("Press Enter...")?;
-        return Ok(());
+        return Ok(None);
     }
     // Most headroom first: a target with a known low usage ranks above one that is
     // nearly full, and one with no reading goes last.
@@ -148,7 +150,7 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
         .collect();
     let target = match picker::choose_from_list(profiles, mark, "Copy session into…", Some("most headroom first"), &target_options, None)? {
         picker::ListChoice::Picked(t) => t,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
 
     ui::home_clear();
@@ -157,15 +159,7 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
             println!("{}", ui::color::green(&format!("Copied session {session_id} to '{target}'{}.", strip_note(stripped))));
             let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
             if matches!(go.as_deref(), Some("")) {
-                let suspend = term.suspend();
-                ui::clear_screen();
-                println!(
-                    "{} resuming as {} — exit Claude to return here\n",
-                    ui::color::dim(ui::glyph::spark()),
-                    ui::color::orange(&target),
-                );
-                launch::launch(&target, &["--resume".to_string(), session_id.to_string()])?;
-                drop(suspend);
+                return Ok(Some(OpenRequest::resume(&target, session_id)));
             }
         }
         Err(e) => {
@@ -173,7 +167,7 @@ fn run_handoff(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i6
             picker::prompt_line("Press Enter...")?;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// A small file browser over one of Claude Code's own auto-memory
@@ -244,7 +238,7 @@ fn session_label(s: &session::SessionFile, title: &str, summary: &str) -> String
     s.id.chars().take(8).collect()
 }
 
-pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup, preselect: Option<&str>) -> Result<()> {
+pub(crate) fn open_folder_sessions(profiles: &[profiles::Profile], mark: i64, from: &str, group: &session::SessionGroup, preselect: Option<&str>) -> Result<Option<OpenRequest>> {
     // session_preview() reads/scans each transcript (a folder can hold ones
     // tens of MB each), so rows used to fill in lazily on cursor approach —
     // but that made the 3rd column visibly pop in as you scrolled. Resolving
@@ -293,7 +287,7 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
         Some(id) => id,
         None => {
             let choice = picker::choose_from_list(profiles, mark, &heading, Some("choose a session"), &options, None)?;
-            let picker::ListChoice::Picked(id) = choice else { return Ok(()) };
+            let picker::ListChoice::Picked(id) = choice else { return Ok(None) };
             id
         }
     };
@@ -322,33 +316,19 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
         let picker::ListChoice::Picked(action) = choice else {
             // Opened straight onto one session: back leaves, no list to land on.
             if preselect.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             continue 'list;
         };
         match action.as_str() {
-            "resume" => {
-                let suspend = term.suspend();
-                ui::clear_screen();
-                println!("{} resuming as {} — exit Claude to return here\n", ui::color::dim(ui::glyph::spark()), ui::color::orange(from));
-                launch::launch(from, &["--resume".to_string(), id.clone()])?;
-                drop(suspend);
-                return Ok(());
-            }
+            "resume" => return Ok(Some(OpenRequest::resume(from, &id))),
             "resume-start" => {
                 if let Some(dir) = &started_dir {
-                    let suspend = term.suspend();
-                    ui::clear_screen();
-                    println!("{} resuming as {} in {} — exit Claude to return here\n", ui::color::dim(ui::glyph::spark()), ui::color::orange(from), dir);
-                    launch::launch_in(from, &["--resume".to_string(), id.clone()], Some(std::path::Path::new(dir)))?;
-                    drop(suspend);
-                    return Ok(());
+                    let dir = PathBuf::from(dir.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    return Ok(Some(OpenRequest { dir: Some(dir), ..OpenRequest::resume(from, &id) }));
                 }
             }
-            "handoff" => {
-                run_handoff(term, profiles, mark, from, &id)?;
-                return Ok(());
-            }
+            "handoff" => return run_handoff(profiles, mark, from, &id),
             "view" => {
                 view_conversation(profiles, mark, group, &id)?;
                 // Back to the action menu, not the whole folder — you
@@ -374,7 +354,7 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
                             .open(&file.file)
                             .and_then(|mut f| { use std::io::Write; writeln!(f, "{entry}") });
                     }
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             "clone" => {
@@ -392,7 +372,7 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
                             let _ = std::io::stdin().read_line(&mut String::new());
                         }
                     }
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             "edit" => {
@@ -420,7 +400,7 @@ pub(crate) fn open_folder_sessions(term: &mut ui::Terminal, profiles: &[profiles
                         session::delete_session(&profile_dir, file)?;
                         println!("{}", ui::color::green("Deleted."));
                         let _ = std::io::stdin().read_line(&mut String::new());
-                        return Ok(());
+                        return Ok(None);
                     } else {
                         println!("{}", ui::color::dim("Cancelled."));
                         let _ = std::io::stdin().read_line(&mut String::new());
@@ -550,6 +530,109 @@ fn restore_layout(profiles: &[profiles::Profile], saved: &workspace::Saved, sess
     Ok(())
 }
 
+/// Opens what a menu asked for: a pane when sessions are wrapped (added to the
+/// running ones, if any), else plain Claude. Once nothing is left running, an
+/// account that hit its limit is offered a hand-off, which is opened in turn.
+fn dispatch(term: &mut ui::Terminal, profiles: &[profiles::Profile], mark: i64, request: OpenRequest, session: &mut Option<panels::Session>) -> Result<()> {
+    let mut next = Some(request);
+    while let Some(request) = next.take() {
+        if settings::session_wrapped() {
+            // Wrapped session: its own PTY, composited so /shell, F7 add-pane
+            // and Ctrl+B work. Cockpit keeps terminal ownership (no suspend).
+            if let Err(e) = panels::open(profiles, session, &request) {
+                ui::home_clear();
+                eprintln!("{}", ui::color::red(&format!("Session error: {e}")));
+                picker::prompt_line("Press Enter...")?;
+            }
+        } else {
+            let suspend = term.suspend(); // give Claude the real terminal
+            // Hard wipe, not the soft home_clear: the primary buffer keeps
+            // scrolling across launches, so a soft clear would stack every
+            // past "launching Claude as..." line above.
+            ui::clear_screen();
+            let verb = if request.resume.is_some() { "resuming" } else { "launching Claude" };
+            let place = request.dir.as_ref().map(|d| format!(" in {}", d.display())).unwrap_or_default();
+            println!("{} {verb} as {}{place} — exit Claude to return here\n", ui::color::dim(ui::glyph::spark()), ui::color::orange(&request.profile));
+            launch::launch_in(&request.profile, &request.claude_args(), request.dir.as_deref())?;
+            drop(suspend); // restore alt screen + raw mode before the next repaint
+        }
+        // Skipped while panes are only detached (still running).
+        if session.is_none() {
+            next = offer_limit_handoff(profiles, mark, &request.profile)?;
+        }
+    }
+    Ok(())
+}
+
+/// Auto-handoff: the statusline hook cached the last quota reading it saw while
+/// Claude was running (main.rs can't see Claude's own output — stdio was
+/// inherited straight through). If that reading says `name` just ran dry, offer
+/// to copy its latest session onto another account.
+fn offer_limit_handoff(profiles: &[profiles::Profile], mark: i64, name: &str) -> Result<Option<OpenRequest>> {
+    if !quota::load(name).is_some_and(|q| quota::is_exhausted(&q)) {
+        return Ok(None);
+    }
+    let Some(latest) = session::session_files(name).into_iter().next() else { return Ok(None) };
+    // Candidates ranked best-first (known usage data beats an untested profile
+    // with no cache at all, then lowest usage wins) — but that ranking is just
+    // the *default position* in a real picker, not an auto-pick. You see every
+    // non-exhausted profile and choose.
+    let mut candidates: Vec<&profiles::Profile> = profiles
+        .iter()
+        .filter(|p| p.name != name)
+        .filter(|p| !quota::load(&p.name).is_some_and(|q| quota::is_exhausted(&q)))
+        .collect();
+    candidates.sort_by(|a, b| {
+        let qa = quota::load(&a.name);
+        let qb = quota::load(&b.name);
+        let rank = |q: &Option<quota::Quota>| i32::from(q.is_none());
+        rank(&qa).cmp(&rank(&qb)).then_with(|| {
+            let ua = qa.as_ref().map(quota::usage).unwrap_or(0.0);
+            let ub = qb.as_ref().map(quota::usage).unwrap_or(0.0);
+            ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    if candidates.is_empty() {
+        ui::home_clear();
+        println!("{}\n", ui::banner());
+        println!("{}", ui::color::yellow(&format!("'{name}' just hit its usage limit.")));
+        println!("{}", ui::color::dim("No other profile has headroom to hand off to right now."));
+        picker::prompt_line("Press Enter...")?;
+        return Ok(None);
+    }
+    let target_options: Vec<picker::ListOption> = candidates
+        .iter()
+        .map(|p| {
+            let count = layout::account_stat(&p.name).count;
+            let count_label = layout::pad_to(&format!("{count} sessions"), 12);
+            let note = match quota::load(&p.name) {
+                Some(q) => format!("{count_label}·  {:.0}% used", quota::usage(&q)),
+                None => format!("{count_label}·  usage unknown"),
+            };
+            picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(note) }
+        })
+        .collect();
+    let heading = format!("{} just hit its usage limit — hand off to…", ui::color::orange(name));
+    let picker::ListChoice::Picked(candidate) = picker::choose_from_list(profiles, mark, &heading, Some("pick where to continue, or back to skip"), &target_options, None)? else {
+        return Ok(None);
+    };
+    ui::home_clear();
+    match handoff::copy_session(name, &candidate, &latest.id) {
+        Ok((_, _, stripped)) => {
+            println!("{}", ui::color::green(&format!("Copied session {} to '{candidate}'{}.", latest.id, strip_note(stripped))));
+            let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
+            if matches!(go.as_deref(), Some("")) {
+                return Ok(Some(OpenRequest::resume(&candidate, &latest.id)));
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", ui::color::red(&format!("Handoff failed: {e}")));
+            picker::prompt_line("Press Enter...")?;
+        }
+    }
+    Ok(None)
+}
+
 /// Detail-view data (plugin/skill/MCP scan + session grouping) keyed by
 /// profile name, filled in by a background thread started at cockpit
 /// startup so it's usually already sitting there by the time you press →
@@ -638,7 +721,9 @@ fn cockpit() -> Result<()> {
             Action::Quit => return Ok(()),
             Action::Sessions => {
                 let m = mark.map(|m| m as i64).unwrap_or(-1);
-                sessions::run(&mut term, &profiles, m, sessions::Scope::All)?;
+                if let Some(request) = sessions::run(&profiles, m, sessions::Scope::All)? {
+                    dispatch(&mut term, &profiles, m, request, &mut session)?;
+                }
             }
             Action::Refresh => {
                 layout::invalidate_stats();
@@ -655,19 +740,16 @@ fn cockpit() -> Result<()> {
                 launch::open_shell(&cwd)?;
                 drop(suspend);
             }
-            Action::Panels(name) => {
+            Action::Panels => {
                 // Unlike Shell/external-editor, cockpit stays the terminal
                 // owner here (its own raw mode + alt screen already active)
                 // — panels.rs draws the PTYs into it directly rather than
                 // handing the console away, so no term.suspend(). A Ctrl+B
                 // detach hands back a live Session we hold onto.
-                match panels::run_split(&profiles, &name) {
-                    Ok(s) => session = s,
-                    Err(e) => {
-                        ui::home_clear();
-                        eprintln!("{}", ui::color::red(&format!("Split view error: {e}")));
-                        picker::prompt_line("Press Enter...")?;
-                    }
+                if let Err(e) = panels::run_split(&profiles, &mut session) {
+                    ui::home_clear();
+                    eprintln!("{}", ui::color::red(&format!("Split view error: {e}")));
+                    picker::prompt_line("Press Enter...")?;
                 }
             }
             Action::Restore => {
@@ -875,113 +957,7 @@ fn cockpit() -> Result<()> {
                 }
             }
             Action::Open(name) => {
-                if settings::session_wrapped() {
-                    // Wrapped session: its own PTY, composited so /shell, F7
-                    // add-pane, and Ctrl+B detach work. Cockpit keeps terminal
-                    // ownership (no suspend). Detaching hands back a live
-                    // Session we hold onto.
-                    match panels::run_split_profiles(&profiles, std::slice::from_ref(&name)) {
-                        Ok(s) => session = s,
-                        Err(e) => {
-                            ui::home_clear();
-                            eprintln!("{}", ui::color::red(&format!("Session error: {e}")));
-                            picker::prompt_line("Press Enter...")?;
-                        }
-                    }
-                } else {
-                    let suspend = term.suspend(); // give Claude the real terminal
-                    // Hard wipe, not the soft home_clear: the primary buffer
-                    // keeps scrolling across launches, so a soft clear would
-                    // stack every past "launching Claude as..." line above.
-                    ui::clear_screen();
-                    println!(
-                        "{} launching Claude as {} — exit Claude to return here\n",
-                        ui::color::dim(ui::glyph::spark()),
-                        ui::color::orange(&name),
-                    );
-                    launch::launch(&name, &[])?;
-                    drop(suspend); // restore alt screen + raw mode before the next repaint
-                }
-
-                // Auto-handoff: the statusline hook cached the last quota
-                // reading it saw while Claude was running (main.rs can't see
-                // Claude's own output — stdio was inherited straight
-                // through). If that reading says this profile just ran dry,
-                // offer to copy the session that was just running onto
-                // whichever other profile has the most headroom. Skipped while
-                // a wrapped session is only detached (still running).
-                if session.is_none() && quota::load(&name).is_some_and(|q| quota::is_exhausted(&q)) {
-                    // Candidates ranked best-first (known usage data beats
-                    // an untested profile with no cache at all, then lowest
-                    // usage wins) — but that ranking is just the *default
-                    // position* in a real picker, not an auto-pick. You see
-                    // every non-exhausted profile and choose.
-                    let mut candidates: Vec<&profiles::Profile> = profiles
-                        .iter()
-                        .filter(|p| p.name != name)
-                        .filter(|p| !quota::load(&p.name).is_some_and(|q| quota::is_exhausted(&q)))
-                        .collect();
-                    candidates.sort_by(|a, b| {
-                        let qa = quota::load(&a.name);
-                        let qb = quota::load(&b.name);
-                        let rank = |q: &Option<quota::Quota>| i32::from(q.is_none());
-                        rank(&qa).cmp(&rank(&qb)).then_with(|| {
-                            let ua = qa.as_ref().map(quota::usage).unwrap_or(0.0);
-                            let ub = qb.as_ref().map(quota::usage).unwrap_or(0.0);
-                            ua.partial_cmp(&ub).unwrap()
-                        })
-                    });
-                    let latest = session::session_files(&name).into_iter().next();
-                    if let Some(latest) = latest {
-                        if candidates.is_empty() {
-                            ui::home_clear();
-                            println!("{}\n", ui::banner());
-                            println!("{}", ui::color::yellow(&format!("'{name}' just hit its usage limit.")));
-                            println!("{}", ui::color::dim("No other profile has headroom to hand off to right now."));
-                            picker::prompt_line("Press Enter...")?;
-                        } else {
-                            let m = mark.map(|m| m as i64).unwrap_or(-1);
-                            let target_options: Vec<picker::ListOption> = candidates
-                                .iter()
-                                .map(|p| {
-                                    let count = layout::account_stat(&p.name).count;
-                                    let count_label = layout::pad_to(&format!("{count} sessions"), 12);
-                                    let note = match quota::load(&p.name) {
-                                        Some(q) => format!("{count_label}·  {:.0}% used", quota::usage(&q)),
-                                        None => format!("{count_label}·  usage unknown"),
-                                    };
-                                    picker::ListOption { label: p.name.clone(), value: p.name.clone(), note: Some(note) }
-                                })
-                                .collect();
-                            let heading = format!("{} just hit its usage limit — hand off to…", ui::color::orange(&name));
-                            let choice = picker::choose_from_list(&profiles, m, &heading, Some("pick where to continue, or back to skip"), &target_options, None)?;
-                            if let picker::ListChoice::Picked(candidate) = choice {
-                                ui::home_clear();
-                                match handoff::copy_session(&name, &candidate, &latest.id) {
-                                    Ok((_, _, stripped)) => {
-                                        println!("{}", ui::color::green(&format!("Copied session {} to '{candidate}'{}.", latest.id, strip_note(stripped))));
-                                        let go = picker::prompt_line("Enter to resume it there now (anything else to skip): ")?;
-                                        if matches!(go.as_deref(), Some("")) {
-                                            let suspend = term.suspend();
-                                            ui::clear_screen();
-                                            println!(
-                                                "{} resuming as {} — exit Claude to return here\n",
-                                                ui::color::dim(ui::glyph::spark()),
-                                                ui::color::orange(&candidate),
-                                            );
-                                            launch::launch(&candidate, &["--resume".to_string(), latest.id.clone()])?;
-                                            drop(suspend);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("{}", ui::color::red(&format!("Handoff failed: {e}")));
-                                        picker::prompt_line("Press Enter...")?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                dispatch(&mut term, &profiles, mark.map(|m| m as i64).unwrap_or(-1), OpenRequest::fresh(&name), &mut session)?;
             }
             Action::Detail(name) => {
                 let (snap, groups) = detail_cache
@@ -998,7 +974,10 @@ fn cockpit() -> Result<()> {
                     at = Some(pick.clone());
 
                     if pick.starts_with("folder:") || pick.starts_with("recent:") || pick == "sessions-more" {
-                        sessions::run(&mut term, &profiles, m, sessions::Scope::Account(name.clone()))?;
+                        if let Some(request) = sessions::run(&profiles, m, sessions::Scope::Account(name.clone()))? {
+                            dispatch(&mut term, &profiles, m, request, &mut session)?;
+                            break;
+                        }
                         continue;
                     }
                     if pick == "plugin-more" || pick == "skill-more" || pick == "mcp-more" {

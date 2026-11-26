@@ -15,6 +15,7 @@
 
 use crate::input::{self, read_key};
 use crate::layout::{self, Stat};
+use crate::open::OpenRequest;
 use crate::profiles::Profile;
 use crate::session::{self, SessionFile, SessionGroup};
 use crate::ui;
@@ -1380,9 +1381,9 @@ fn draw(m: &Model, u: &mut Ui, header: &[String], tw: usize, th: usize) -> (Vec<
 /// One session's action menu — resume (here / in the folder it started in),
 /// hand off, view, rename, clone, edit, delete — is the existing menu, opened
 /// on a one-session group so it works the same from every list.
-fn open_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, s: &Sess) -> anyhow::Result<()> {
+fn open_menu(profiles: &[Profile], mark: i64, s: &Sess) -> anyhow::Result<Option<OpenRequest>> {
     let group = SessionGroup { folder: short_path(&s.started), sessions: vec![SessionFile { id: s.id.clone(), file: s.file.clone(), modified: s.modified }] };
-    crate::open_folder_sessions(term, profiles, mark, &s.acct, &group, Some(&s.id))
+    crate::open_folder_sessions(profiles, mark, &s.acct, &group, Some(&s.id))
 }
 
 /// What the pin menu wants the browser to do next.
@@ -1390,11 +1391,12 @@ enum PinOutcome {
     Nothing,
     Rename,
     Changed,
+    Open(OpenRequest),
 }
 
 /// The menu for one pin: read the saved text, open its part in the transcript
 /// editor (selected), open the session's own menu, rename or unpin.
-fn pin_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, header: &[String], m: &Model, pin: &crate::pins::Pin) -> anyhow::Result<PinOutcome> {
+fn pin_menu(profiles: &[Profile], mark: i64, header: &[String], m: &Model, pin: &crate::pins::Pin) -> anyhow::Result<PinOutcome> {
     use crate::picker::{self, ListChoice, ListOption};
     let live = m.sessions.iter().find(|s| s.acct == pin.acct && s.id == pin.session_id).cloned();
     let mut options = vec![ListOption { label: "View saved text".into(), value: "view".into(), note: Some("read the part as it was pinned".into()) }];
@@ -1427,7 +1429,9 @@ fn pin_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, header: &[
         }
         "open" => {
             if let Some(s) = &live {
-                open_menu(term, profiles, mark, s)?;
+                if let Some(request) = open_menu(profiles, mark, s)? {
+                    return Ok(PinOutcome::Open(request));
+                }
             }
             Ok(PinOutcome::Changed)
         }
@@ -1439,7 +1443,8 @@ fn pin_menu(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, header: &[
     }
 }
 
-pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<()> {
+/// The sessions browser. Returns what the user asked to open, if anything.
+pub fn run(profiles: &[Profile], mark: i64, scope: Scope) -> anyhow::Result<Option<OpenRequest>> {
     let stats: Vec<Stat> = profiles.iter().map(|p| layout::account_stat(&p.name)).collect();
     let mut header = layout::account_lines(profiles, mark, &stats);
     let mut header_w = ui::term_width();
@@ -1576,7 +1581,10 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                 KeyCode::Enter => {
                     if let Some(h) = hits.get(u.ssel) {
                         let s = m.sessions[h.s].clone();
-                        open_menu(term, profiles, mark, &s)?;
+                        if let Some(request) = open_menu(profiles, mark, &s)? {
+                            ui::show_cursor();
+                            return Ok(Some(request));
+                        }
                         m = Model::load(profiles, &scope);
                         ui::hide_cursor();
                     }
@@ -1708,7 +1716,10 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                 match it {
                     Item::Sess(si, _) => {
                         let s = m.sessions[*si].clone();
-                        open_menu(term, profiles, mark, &s)?;
+                        if let Some(request) = open_menu(profiles, mark, &s)? {
+                            ui::show_cursor();
+                            return Ok(Some(request));
+                        }
                         m = Model::load(profiles, &scope);
                         ui::hide_cursor();
                     }
@@ -1729,13 +1740,17 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                     }
                     Item::Pin(pi) => {
                         let pin = m.pins[*pi].clone();
-                        match pin_menu(term, profiles, mark, &header, &m, &pin)? {
+                        match pin_menu(profiles, mark, &header, &m, &pin)? {
                             PinOutcome::Rename => {
                                 u.ask_buf = pin.label.clone();
                                 u.ask = Some(Ask::RenamePin(pin.id));
                             }
                             PinOutcome::Changed => m = Model::load(profiles, &scope),
                             PinOutcome::Nothing => {}
+                            PinOutcome::Open(request) => {
+                                ui::show_cursor();
+                                return Ok(Some(request));
+                            }
                         }
                         ui::hide_cursor();
                     }
@@ -1754,7 +1769,7 @@ pub fn run(term: &mut ui::Terminal, profiles: &[Profile], mark: i64, scope: Scop
                     }
                 } else {
                     ui::show_cursor();
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             _ => {}
