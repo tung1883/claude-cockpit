@@ -61,7 +61,22 @@ pub(crate) fn claude_pty_command(profile: &str, cwd: &Path, start: &Start, track
     // for this pane (see notify.rs), so they stay quiet.
     cmd.env("CPIT_PANES", "1");
     cmd.env(workspace::TRACK_ENV, track);
+    let settings = std::fs::read_to_string(paths::profile_dir(profile).join("settings.json")).ok();
+    let chosen = std::env::var_os("CLAUDE_CODE_NO_FLICKER").is_some() || std::env::var_os("SSH_CONNECTION").is_some();
+    if !chosen && wants_fullscreen(settings.as_deref()) {
+        cmd.env("CLAUDE_CODE_NO_FLICKER", "1");
+    }
     (cmd, sysprompt)
+}
+
+/// Whether a pane should force Claude's fullscreen renderer: unless the
+/// profile's settings ask for the classic one. Left to itself, Claude turns
+/// fullscreen off for good after two launches are killed while starting (as
+/// closing a pane or cpit does), and the classic renderer has no scrolling in
+/// the transcript view and no "jump to bottom".
+fn wants_fullscreen(settings: Option<&str>) -> bool {
+    let tui = settings.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).and_then(|v| v.get("tui")?.as_str().map(str::to_string));
+    tui.as_deref() != Some("default")
 }
 
 /// PTY command for a plain interactive shell in `cwd` (same shell choice as
@@ -299,6 +314,14 @@ fn split_command(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panes_are_fullscreen_unless_settings_say_classic() {
+        assert!(wants_fullscreen(None));
+        assert!(wants_fullscreen(Some("{}")));
+        assert!(wants_fullscreen(Some(r#"{"tui":"fullscreen"}"#)));
+        assert!(!wants_fullscreen(Some(r#"{"tui":"default"}"#)));
+    }
 
     #[test]
     fn only_sessions_take_the_plugin() {
