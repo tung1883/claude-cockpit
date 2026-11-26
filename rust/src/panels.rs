@@ -2267,6 +2267,7 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
                 ("x", "close"),
                 ("w", "waiting"),
                 ("b", "sidebar"),
+                ("d", "home"),
                 ("1-9", "jump"),
                 ("←→↑↓", "move"),
                 ("Esc", "cancel"),
@@ -2285,7 +2286,7 @@ fn compose_frame(panes: &[Pane], focus: usize, cols: u16, rows: u16, side: &mut 
             ("F10", if full { "unfull" } else { "full" }),
             ("F3", "hide"),
             ("F8", "close"),
-            ("Ctrl+B", "back"),
+            ("Ctrl+B", "home"),
             ("Ctrl+Q", "quit"),
         ])
     };
@@ -2420,26 +2421,59 @@ const WHEEL_LINES: usize = 3;
 /// pane's top or bottom edge.
 const AUTOSCROLL_EVERY: Duration = Duration::from_millis(50);
 
-/// One wheel notch at pane cell (`col`, `row`), 0-based, as the program in the
-/// pane asked to be told about the mouse; None when it did not ask.
-fn wheel_report(mode: MouseProtocolMode, encoding: MouseProtocolEncoding, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
-    if mode == MouseProtocolMode::None {
+/// The mouse button codes used in reports.
+const BUTTON_LEFT: u16 = 0;
+const WHEEL_UP: u16 = 64;
+const WHEEL_DOWN: u16 = 65;
+
+/// A press (or release) of `button` at pane cell (`col`, `row`), 0-based, as
+/// the program in the pane asked to be told about the mouse; None when it did
+/// not ask, or asked for presses only and this is a release.
+fn mouse_report(mode: MouseProtocolMode, encoding: MouseProtocolEncoding, button: u16, pressed: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    if mode == MouseProtocolMode::None || (mode == MouseProtocolMode::Press && !pressed) {
         return None;
     }
-    let button: u16 = if up { 64 } else { 65 };
     let (x, y) = (col.saturating_add(1), row.saturating_add(1));
+    // Only the SGR form says which button was released; the older ones send 3.
+    let legacy = if pressed { button } else { 3 };
     Some(match encoding {
-        MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}{}", if pressed { 'M' } else { 'm' }).into_bytes(),
         // The older forms send each value as one character, offset by 32.
         MouseProtocolEncoding::Default => {
             let byte = |v: u16| v.saturating_add(32).min(255) as u8;
-            vec![0x1b, b'[', b'M', byte(button), byte(x), byte(y)]
+            vec![0x1b, b'[', b'M', byte(legacy), byte(x), byte(y)]
         }
         MouseProtocolEncoding::Utf8 => {
             let ch = |v: u16| char::from_u32(u32::from(v) + 32).unwrap_or(' ');
-            format!("\x1b[M{}{}{}", ch(button), ch(x), ch(y)).into_bytes()
+            format!("\x1b[M{}{}{}", ch(legacy), ch(x), ch(y)).into_bytes()
         }
     })
+}
+
+/// One wheel notch, or None when the program did not ask for the mouse.
+fn wheel_report(mode: MouseProtocolMode, encoding: MouseProtocolEncoding, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    mouse_report(mode, encoding, if up { WHEEL_UP } else { WHEEL_DOWN }, true, col, row)
+}
+
+/// A left click: the press and, where the program wants it, the release.
+fn click_report(mode: MouseProtocolMode, encoding: MouseProtocolEncoding, col: u16, row: u16) -> Option<Vec<u8>> {
+    let mut bytes = mouse_report(mode, encoding, BUTTON_LEFT, true, col, row)?;
+    bytes.extend(mouse_report(mode, encoding, BUTTON_LEFT, false, col, row).unwrap_or_default());
+    Some(bytes)
+}
+
+/// Passes a click at cell (`col`, `row`) to `pane`'s program if it takes the
+/// mouse. Not while scrolled back: what is on screen is not what it drew last.
+fn click_pane(pane: &Pane, col: u16, row: u16) {
+    let report = pane.parser.lock().ok().and_then(|p| {
+        let screen = p.screen();
+        (screen.scrollback() == 0).then(|| click_report(screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), col, row)).flatten()
+    });
+    // Written directly, like the wheel: it is not typing.
+    if let (Some(bytes), Ok(mut w)) = (report, pane.writer.lock()) {
+        let _ = w.write_all(&bytes);
+        let _ = w.flush();
+    }
 }
 
 /// The wheel over `pane` at cell (`col`, `row`). A program that takes the mouse
@@ -2534,6 +2568,8 @@ enum Act {
     Prev,
     Jump(usize),
     Move(Dir),
+    /// Back to the cockpit with the panes left running.
+    Detach,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2563,6 +2599,7 @@ fn leader_action(code: KeyCode) -> Option<Act> {
             'x' => Some(Act::Close),
             'w' => Some(Act::Waiting),
             'b' => Some(Act::Sidebar),
+            'd' => Some(Act::Detach),
             d @ '1'..='9' => Some(Act::Jump(d as usize - '0' as usize)),
             _ => None,
         },
@@ -2613,6 +2650,9 @@ struct Ctl {
     sel: Option<Sel>,
     /// The left button is held down and extending `sel`.
     dragging: bool,
+    /// The press landed in the pane that already had focus, so a release
+    /// without a drag is a click for its program.
+    click: bool,
     /// Last pointer position while dragging, to keep scrolling when it rests
     /// outside the pane.
     pointer: (u16, u16),
@@ -2640,6 +2680,8 @@ fn act(a: Act, ctl: &mut Ctl, panes: &mut Vec<Pane>, focus: &mut usize, profiles
         ctl.prev.clear();
     }
     match a {
+        // Leaving the split is the run loop's job (see `run_command`).
+        Act::Detach => {}
         Act::List => {
             ctl.side.focus = !ctl.side.focus;
             if ctl.side.focus {
@@ -2769,6 +2811,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         window_focused: true,
         sel: None,
         dragging: false,
+        click: false,
         pointer: (0, 0),
         pending: VecDeque::new(),
         last_autoscroll: std::time::Instant::now(),
@@ -2928,6 +2971,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                             }
                         } else if k.code != KeyCode::Esc {
                             match leader_action(k.code) {
+                                Some(Act::Detach) => return Ok(LoopExit::Detach),
                                 Some(a) => {
                                     if act(a, &mut ctl, panes, focus, profiles, cwd)? {
                                         return Ok(LoopExit::Quit);
@@ -3057,8 +3101,12 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                         MouseEventKind::Down(MouseButton::Left) => {
                             ctl.sel = None;
                             ctl.dragging = false;
+                            ctl.click = false;
                             ctl.force = true;
                             if let Some((idx, row, col)) = pane_cell(&lay, &drawn, m.column, m.row) {
+                                // A click that moves focus only moves focus, so
+                                // nothing is pressed by accident.
+                                ctl.click = idx == *focus;
                                 if idx != *focus {
                                     sidebar::focus_pane(panes, focus, idx);
                                     ctl.typed.clear();
@@ -3094,6 +3142,14 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                             if let Some(sel) = ctl.sel {
                                 if sel.anchor == sel.head {
                                     ctl.sel = None; // a plain click
+                                    if std::mem::take(&mut ctl.click) {
+                                        if let (Some(p), Some((c0, r0))) = (panes.get(sel.pane), pane_origin(&lay, &drawn, sel.pane)) {
+                                            // The cell that was pressed.
+                                            let row = ctl.pointer.1.saturating_sub(r0).min(lay.pane_rows.saturating_sub(1));
+                                            let col = ctl.pointer.0.saturating_sub(c0).min(lay.pane_cols.saturating_sub(1));
+                                            click_pane(p, col, row);
+                                        }
+                                    }
                                 } else if let Some(p) = panes.get(sel.pane) {
                                     let text = selection_text(p, &sel);
                                     if !text.is_empty() {
@@ -3239,6 +3295,17 @@ mod tests {
         assert_eq!(report(&parser, true), Some(vec![0x1b, b'[', b'M', 96, 37, 42]));
         parser.process(b"\x1b[?1000l");
         assert_eq!(report(&parser, true), None);
+    }
+
+    #[test]
+    fn a_click_is_a_press_and_a_release() {
+        use MouseProtocolEncoding::{Default, Sgr, Utf8};
+        let all = MouseProtocolMode::PressRelease;
+        assert_eq!(click_report(all, Sgr, 4, 9), Some(b"\x1b[<0;5;10M\x1b[<0;5;10m".to_vec()));
+        assert_eq!(click_report(all, Default, 4, 9), Some(vec![0x1b, b'[', b'M', 32, 37, 42, 0x1b, b'[', b'M', 35, 37, 42]));
+        assert_eq!(click_report(all, Utf8, 4, 9), Some(b"\x1b[M %*\x1b[M#%*".to_vec()));
+        assert_eq!(click_report(MouseProtocolMode::Press, Sgr, 0, 0), Some(b"\x1b[<0;1;1M".to_vec()));
+        assert_eq!(click_report(MouseProtocolMode::None, Sgr, 0, 0), None);
     }
 
     #[test]
