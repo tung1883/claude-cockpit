@@ -186,6 +186,15 @@ edited-file counts, and a preview of the selected one.
 - It needs a Claude Code version with plugin hooks modules. Set
   `CPIT_NO_PLUGIN=1` to start without it.
 
+## Panes: typing and folders (cpit)
+
+- Pasting several lines into a pane arrives as one paste, not one submit per
+  line.
+- Ctrl+`←` / `→` move by a word; other modified movement keys reach the program
+  too.
+- Directory prompts list the folders under what you typed: `↑` / `↓` choose,
+  `Tab` opens the chosen one, Shift+`Tab` goes up, `Enter` confirms.
+
 ## Restoring panes (cpit)
 
 cpit saves which panes are open: account, folder, worktree, layout and the

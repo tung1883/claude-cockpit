@@ -13,6 +13,7 @@
 // arrives. See PLAN.md for the full history of chasing this.
 use crate::clipboard;
 use crate::conpty;
+use crate::dirpick;
 use crate::notify;
 use crate::osc7501;
 use crate::sidebar::{self, HasMeta, Mode, PaneMeta, Status, WorktreeInfo};
@@ -22,7 +23,7 @@ use anyhow::Result;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -473,10 +474,37 @@ fn render_row(screen: &vt100::Screen, row: u16, width: u16, selected: Option<(u1
     out
 }
 
+/// The movement and editing keys that carry their modifiers in the sequence
+/// (Ctrl+Left is "move a word left"), as xterm sends them. None for other keys
+/// and for these without a modifier.
+fn modified_key(code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    if modifier == 1 {
+        return None;
+    }
+    let (number, last) = match code {
+        KeyCode::Up => (1, 'A'),
+        KeyCode::Down => (1, 'B'),
+        KeyCode::Right => (1, 'C'),
+        KeyCode::Left => (1, 'D'),
+        KeyCode::Home => (1, 'H'),
+        KeyCode::End => (1, 'F'),
+        KeyCode::Insert => (2, '~'),
+        KeyCode::Delete => (3, '~'),
+        KeyCode::PageUp => (5, '~'),
+        KeyCode::PageDown => (6, '~'),
+        _ => return None,
+    };
+    Some(format!("\x1b[{number};{modifier}{last}").into_bytes())
+}
+
 /// Translates a crossterm key press into the raw bytes a real terminal
 /// would send a child process — normal typing, arrows, and Ctrl-letter
 /// combos; exotic function keys aren't mapped and are silently dropped.
-fn key_bytes(code: KeyCode, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
+fn key_bytes(code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
+    if let Some(bytes) = modified_key(code, ctrl, alt, shift) {
+        return Some(bytes);
+    }
     let base: Vec<u8> = match code {
         KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => vec![(c.to_ascii_uppercase() as u8) & 0x1f],
         KeyCode::Char('@') if ctrl => vec![0],
@@ -509,6 +537,70 @@ fn key_bytes(code: KeyCode, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
         Some(out)
     } else {
         Some(base)
+    }
+}
+
+/// How long to wait for a second key before treating one as typed on its own
+/// (the delay this adds to typing).
+const FIRST_GAP: Duration = Duration::from_millis(5);
+/// Once keys are arriving together, how long a pause ends the piece. Longer, so
+/// a large paste delivered in parts stays whole.
+const PASTE_GAP: Duration = Duration::from_millis(40);
+
+/// The character a key press stands for in pasted text; None for a key that is
+/// not text. Line breaks come out as '\r'.
+fn pasted_char(event: &Event) -> Option<char> {
+    let Event::Key(k) = event else { return None };
+    let (ctrl, alt) = (k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT));
+    match k.code {
+        KeyCode::Enter if !alt => Some('\r'),
+        // A line feed arrives as Ctrl+J.
+        KeyCode::Char('j' | '\n') if ctrl && !alt => Some('\r'),
+        KeyCode::Tab if !ctrl && !alt => Some('\t'),
+        // Ctrl with Alt is AltGr, which types characters on many layouts.
+        KeyCode::Char(c) if ctrl == alt => Some(c),
+        _ => None,
+    }
+}
+
+/// Whether keys that arrived together are pasted text: there is a line break
+/// with more text after it. A line typed quickly while the screen was busy ends
+/// with its Enter, so it still submits.
+fn is_paste(text: &str) -> bool {
+    text.find('\r').is_some_and(|at| at + 1 < text.len())
+}
+
+/// Reads what follows `first` without a pause. Returns the events (with
+/// `first`) and, if together they are a paste, its text.
+fn read_burst(first: Event) -> Result<(Vec<Event>, Option<String>)> {
+    let mut events = vec![first];
+    let mut text: String = pasted_char(&events[0]).into_iter().collect();
+    if text.is_empty() {
+        return Ok((events, None));
+    }
+    while event::poll(if text.chars().count() < 2 { FIRST_GAP } else { PASTE_GAP })? {
+        let next = event::read()?;
+        if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
+            continue;
+        }
+        let c = pasted_char(&next);
+        events.push(next);
+        // Anything else ends the text, and is handled after it.
+        let Some(c) = c else { break };
+        text.push(c);
+    }
+    let paste = is_paste(&text).then_some(text);
+    Ok((events, paste))
+}
+
+/// What to write to a pane for pasted `text`. A program that asked for
+/// bracketed paste is told where it starts and ends, so that line breaks in it
+/// are not taken as Enter.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -1442,20 +1534,94 @@ fn resolve_dir_input(input: &str, cwd: &std::path::Path) -> std::path::PathBuf {
     if p.is_absolute() { p } else { cwd.join(expanded) }
 }
 
+/// The folders offered under a directory field: those matching what is typed.
+#[derive(Default)]
+struct Folders {
+    /// The text the list was made for.
+    input: Option<String>,
+    names: Vec<String>,
+    selected: usize,
+}
+
+impl Folders {
+    fn refresh(&mut self, input: &str, cwd: &std::path::Path) {
+        if self.input.as_deref() == Some(input) {
+            return;
+        }
+        let (parent, name) = dirpick::split(input);
+        let dir = if parent.is_empty() { cwd.to_path_buf() } else { resolve_dir_input(parent, cwd) };
+        self.names = dirpick::matches(&dir, name);
+        self.selected = 0;
+        self.input = Some(input.to_string());
+    }
+
+    /// Handles Tab (open the selected folder), Shift+Tab (one folder up) and
+    /// Up/Down (select). Returns false for any other key.
+    fn key(&mut self, code: KeyCode, edit: &mut LineEdit) -> bool {
+        let count = self.names.len();
+        match code {
+            KeyCode::Tab => {
+                if let Some(name) = self.names.get(self.selected) {
+                    *edit = LineEdit::new(&dirpick::accept(&edit.buf, name));
+                }
+            }
+            KeyCode::BackTab => *edit = LineEdit::new(&dirpick::up(&edit.buf)),
+            KeyCode::Up if count > 0 => self.selected = (self.selected + count - 1) % count,
+            KeyCode::Down if count > 0 => self.selected = (self.selected + 1) % count,
+            KeyCode::Up | KeyCode::Down => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// The list and its key hint, to draw under the field.
+    fn lines(&self) -> Vec<String> {
+        let room = crossterm::terminal::size().map(|(_, h)| (h as usize).saturating_sub(11)).unwrap_or(10);
+        let range = dirpick::window(self.names.len(), self.selected, room);
+        let mut lines = Vec::new();
+        if range.start > 0 {
+            lines.push(ui::color::dim(&format!("     ↑ {} more", range.start)));
+        }
+        for i in range.clone() {
+            let name = format!("{}{}", self.names[i], std::path::MAIN_SEPARATOR);
+            lines.push(if i == self.selected {
+                format!("   {} {}", ui::color::orange(ui::glyph::pointer()), ui::color::orange_bold(&name))
+            } else {
+                format!("     {name}")
+            });
+        }
+        if range.end < self.names.len() {
+            lines.push(ui::color::dim(&format!("     ↓ {} more", self.names.len() - range.end)));
+        }
+        if self.names.is_empty() {
+            lines.push(ui::color::dim("     (no folder matches)"));
+        }
+        lines.push(ui::color::dim("   Tab open · Shift+Tab up · ↑/↓ choose"));
+        lines
+    }
+}
+
 fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
-    let mut edit = LineEdit::new(&cwd.to_string_lossy());
+    let mut edit = LineEdit::new(&dirpick::open(&cwd.to_string_lossy()));
+    let mut folders = Folders::default();
     let mut error = String::new();
     const PREFIX: &str = "   Directory: ";
     ui::show_cursor();
     let result = loop {
-        let lines = vec![
+        folders.refresh(&edit.buf, cwd);
+        let mut lines = vec![
             format!("{} {}", ui::color::orange(ui::glyph::back()), ui::color::bold(title)),
             String::new(),
             format!("{PREFIX}{}", edit.buf),
-            if error.is_empty() { String::new() } else { ui::color::red(&format!("   {error}")) },
         ];
+        lines.extend(folders.lines());
+        lines.push(if error.is_empty() { ui::color::dim("   Enter confirm · Esc cancel") } else { ui::color::red(&format!("   {error}")) });
         ui::repaint_at(&lines, 3, edit.col(PREFIX.len()));
         let key = read_key()?;
+        if folders.key(key.code, &mut edit) {
+            error.clear();
+            continue;
+        }
         match key.code {
             KeyCode::Esc => break None,
             KeyCode::Enter => {
@@ -1483,7 +1649,8 @@ fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::Pa
 fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[String]) -> Result<Option<Target>> {
     const DIR_PREFIX: &str = "   Directory: ";
     const NAME_PREFIX: &str = "   Name    ";
-    let mut dir = LineEdit::new(&cwd.to_string_lossy());
+    let mut dir = LineEdit::new(&dirpick::open(&cwd.to_string_lossy()));
+    let mut folders = Folders::default();
     let mut name_edit = LineEdit::new("");
     let mut error = String::new();
     let mut on_name = false;
@@ -1522,7 +1689,12 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
             format!("{DIR_PREFIX}{}", if on_name { ui::color::dim(&dir.buf) } else { dir.buf.clone() }),
             String::new(),
         ];
-        if let Some(r) = &repo {
+        if !on_name {
+            folders.refresh(&dir.buf, cwd);
+            lines.extend(folders.lines());
+        }
+        // The repository's fields, once the directory has been confirmed.
+        if let Some(r) = repo.as_ref().filter(|_| on_name) {
             if on_name {
                 lines.push(format!("{NAME_PREFIX}{}{}", ui::color::cyan(&name_edit.buf), if name_edit.buf.is_empty() { ui::color::dim(&suggested) } else { String::new() }));
             } else {
@@ -1570,6 +1742,10 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
                 _ => {}
             }
         } else {
+            if folders.key(key.code, &mut dir) {
+                error.clear();
+                continue;
+            }
             match key.code {
                 KeyCode::Esc => break None,
                 KeyCode::Enter => {
@@ -2362,6 +2538,8 @@ struct Ctl {
     /// Last pointer position while dragging, to keep scrolling when it rests
     /// outside the pane.
     pointer: (u16, u16),
+    /// Events already read while looking for a paste, still to be handled.
+    pending: VecDeque<Event>,
     last_autoscroll: std::time::Instant,
 }
 
@@ -2514,6 +2692,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
         sel: None,
         dragging: false,
         pointer: (0, 0),
+        pending: VecDeque::new(),
         last_autoscroll: std::time::Instant::now(),
     };
     if let Some(t) = toast {
@@ -2606,8 +2785,43 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
             }
         }
 
-        if event::poll(Duration::from_millis(30))? {
-            match event::read()? {
+        if !ctl.pending.is_empty() || event::poll(Duration::from_millis(30))? {
+            // Pasted text arrives as a run of keys (Windows sends no paste
+            // event), so look for one before treating a key as typed.
+            let next = match ctl.pending.pop_front() {
+                Some(queued) => Some(queued),
+                None => {
+                    let first = event::read()?;
+                    let typing = matches!(&first, Event::Key(k) if k.kind != KeyEventKind::Release) && !ctl.side.focus && !ctl.leader;
+                    if !typing {
+                        Some(first)
+                    } else {
+                        let (events, paste) = read_burst(first)?;
+                        let mut events = VecDeque::from(events);
+                        match paste {
+                            Some(text) => {
+                                // What ended the paste is still to be handled.
+                                let used = text.chars().count();
+                                ctl.pending = events.split_off(used.min(events.len()));
+                                let pane = &panes[*focus];
+                                let bracketed = pane.parser.lock().is_ok_and(|p| p.screen().bracketed_paste());
+                                send_to_pane(pane, &paste_bytes(&text, bracketed));
+                                ctl.typed.clear();
+                                ctl.sel = None;
+                                ctl.force = true;
+                                None
+                            }
+                            None => {
+                                let first = events.pop_front();
+                                ctl.pending = events;
+                                first
+                            }
+                        }
+                    }
+                }
+            };
+            // A paste was dealt with above; an empty one matches nothing.
+            match next.unwrap_or_else(|| Event::Paste(String::new())) {
                 Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                     if ctl.sel.take().is_some() {
                         ctl.force = true;
@@ -2705,7 +2919,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                         KeyCode::Enter if !ctrl && !alt => ctl.typed.clear(),
                         _ => ctl.typed.clear(),
                     }
-                    if let Some(bytes) = key_bytes(k.code, ctrl, alt) {
+                    if let Some(bytes) = key_bytes(k.code, ctrl, alt, shift) {
                         send_to_pane(&panes[*focus], &bytes);
                     }
                 }
@@ -2733,7 +2947,7 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                             // to zoom and typing at the same time — but
                             // free to handle).
                             Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) && !ctl.side.focus && !ctl.leader => {
-                                if let Some(bytes) = key_bytes(k.code, k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT)) {
+                                if let Some(bytes) = key_bytes(k.code, k.modifiers.contains(KeyModifiers::CONTROL), k.modifiers.contains(KeyModifiers::ALT), k.modifiers.contains(KeyModifiers::SHIFT)) {
                                     send_to_pane(&panes[*focus], &bytes);
                                 }
                             }
@@ -2947,16 +3161,71 @@ mod tests {
     }
 
     #[test]
+    fn modified_arrows_carry_their_modifiers() {
+        let keys = |code, ctrl, alt, shift| key_bytes(code, ctrl, alt, shift).unwrap();
+        assert_eq!(keys(KeyCode::Left, true, false, false), b"\x1b[1;5D");
+        assert_eq!(keys(KeyCode::Right, true, false, false), b"\x1b[1;5C");
+        assert_eq!(keys(KeyCode::Left, true, false, true), b"\x1b[1;6D");
+        assert_eq!(keys(KeyCode::Up, false, true, false), b"\x1b[1;3A");
+        assert_eq!(keys(KeyCode::End, false, false, true), b"\x1b[1;2F");
+        assert_eq!(keys(KeyCode::Delete, true, false, false), b"\x1b[3;5~");
+        assert_eq!(keys(KeyCode::Left, false, false, false), b"\x1b[D");
+        // Shift does not change typed characters.
+        assert_eq!(keys(KeyCode::Char('A'), false, false, true), b"A");
+    }
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn pasted_keys_become_text() {
+        let none = KeyModifiers::NONE;
+        let alt_gr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let events = [
+            press(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            press(KeyCode::Tab, none),
+            press(KeyCode::Enter, none),
+            press(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            press(KeyCode::Char('@'), alt_gr),
+        ];
+        assert_eq!(events.iter().filter_map(pasted_char).collect::<String>(), "A\t\r\r@");
+        for other in [press(KeyCode::Left, none), press(KeyCode::Char('c'), KeyModifiers::CONTROL), press(KeyCode::Char('f'), KeyModifiers::ALT), Event::FocusGained] {
+            assert_eq!(pasted_char(&other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn only_text_with_more_after_a_line_break_is_a_paste() {
+        assert!(is_paste("a\rb"));
+        assert!(is_paste("1: x,\r  2: y\r"));
+        assert!(!is_paste("yes\r"), "a typed line still submits");
+        assert!(!is_paste("hello"));
+        assert!(!is_paste("\r"));
+        assert!(!is_paste(""));
+    }
+
+    #[test]
+    fn a_paste_is_bracketed_when_the_program_asked() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert!(!parser.screen().bracketed_paste());
+        parser.process(b"\x1b[?2004h");
+        assert!(parser.screen().bracketed_paste());
+        assert_eq!(paste_bytes("a\rb", true), b"\x1b[200~a\rb\x1b[201~");
+        assert_eq!(paste_bytes("a\rb", false), b"a\rb");
+    }
+
+    #[test]
     fn plain_backspace_is_one_delete_ctrl_backspace_kills_a_word() {
-        assert_eq!(key_bytes(KeyCode::Backspace, false, false), Some(vec![0x7f]));
-        assert_eq!(key_bytes(KeyCode::Backspace, true, false), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(key_bytes(KeyCode::Backspace, false, false, false), Some(vec![0x7f]));
+        assert_eq!(key_bytes(KeyCode::Backspace, true, false, false), Some(b"\x1b\x7f".to_vec()));
     }
 
     #[test]
     fn typing_and_ctrl_letters_still_map() {
-        assert_eq!(key_bytes(KeyCode::Char('a'), false, false), Some(vec![b'a']));
-        assert_eq!(key_bytes(KeyCode::Char('c'), true, false), Some(vec![0x03]));
-        assert_eq!(key_bytes(KeyCode::Enter, false, false), Some(vec![b'\r']));
+        assert_eq!(key_bytes(KeyCode::Char('a'), false, false, false), Some(vec![b'a']));
+        assert_eq!(key_bytes(KeyCode::Char('c'), true, false, false), Some(vec![0x03]));
+        assert_eq!(key_bytes(KeyCode::Enter, false, false, false), Some(vec![b'\r']));
     }
 
     #[test]
