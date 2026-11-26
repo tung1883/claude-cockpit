@@ -3007,12 +3007,15 @@ fn run_loop_inner(panes: &mut Vec<Pane>, focus: &mut usize, profiles: &[Profile]
                                 }
                             }
                         }
-                        MouseEventKind::Up(MouseButton::Left) => {
+                        // The release can also arrive as plain movement with no
+                        // button held, with no Up event at all.
+                        MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Moved if ctl.dragging => {
                             ctl.dragging = false;
+                            // Draws the "copied" note even while panes are quiet.
+                            ctl.force = true;
                             if let Some(sel) = ctl.sel {
                                 if sel.anchor == sel.head {
                                     ctl.sel = None; // a plain click
-                                    ctl.force = true;
                                 } else if let Some(p) = panes.get(sel.pane) {
                                     let text = selection_text(p, &sel);
                                     if !text.is_empty() {
