@@ -1732,6 +1732,9 @@ struct Folders {
     /// The arrows move through the grid; otherwise Left/Right belong to the
     /// text field.
     browsing: bool,
+    /// While Tab is cycling through the matches: what was typed, which the
+    /// list was made for and Esc brings back.
+    cycling: Option<String>,
 }
 
 impl Folders {
@@ -1744,6 +1747,7 @@ impl Folders {
         self.names = dirpick::matches(&dir, name);
         self.selected = 0;
         self.browsing = false;
+        self.cycling = None;
         self.input = Some(input.to_string());
     }
 
@@ -1751,38 +1755,42 @@ impl Folders {
         dirpick::grid(&self.names, width.saturating_sub(FOLDER_INDENT + 1), FOLDER_CELL_EXTRA)
     }
 
-    /// Handles Tab (open the selected folder), Shift+Tab (one folder up) and
-    /// the grid keys: Up/Down enter it, then the arrows move, Enter opens and
-    /// Esc goes back to typing. Returns false for any key left to the field.
-    fn key(&mut self, code: KeyCode, edit: &mut LineEdit) -> bool {
-        self.key_at(code, edit, ui::term_width())
+    /// Handles the folder keys. Tab and Shift+Tab put the next or previous
+    /// match in the field (a lone match is opened at once); Enter or a
+    /// separator then opens it and Esc brings back what was typed. Ctrl+
+    /// Backspace or Alt+Up goes one folder up. Up/Down enter the grid, where
+    /// the arrows move, Enter opens and Esc goes back to typing. Returns false
+    /// for any key left to the field.
+    fn key(&mut self, code: KeyCode, ctrl: bool, alt: bool, edit: &mut LineEdit) -> bool {
+        self.key_at(code, ctrl, alt, edit, ui::term_width())
     }
 
-    fn key_at(&mut self, code: KeyCode, edit: &mut LineEdit, width: usize) -> bool {
-        let count = self.names.len();
-        let to = match code {
-            KeyCode::Up => Some(dirpick::Move::Up),
-            KeyCode::Down => Some(dirpick::Move::Down),
-            KeyCode::Left => Some(dirpick::Move::Left),
-            KeyCode::Right => Some(dirpick::Move::Right),
-            _ => None,
-        };
+    fn key_at(&mut self, code: KeyCode, ctrl: bool, alt: bool, edit: &mut LineEdit, width: usize) -> bool {
+        // Resize arrives as Null and must not change anything.
+        if code == KeyCode::Null {
+            return false;
+        }
+        if (code == KeyCode::Backspace && ctrl) || (code == KeyCode::Up && alt) {
+            let from = self.cycling.take().unwrap_or_else(|| edit.buf.clone());
+            self.move_to(edit, dirpick::up(&from));
+            return true;
+        }
         match code {
-            KeyCode::Tab => self.open(edit),
+            KeyCode::Tab => self.cycle(true, edit),
+            KeyCode::BackTab => self.cycle(false, edit),
+            _ if self.cycling.is_some() => return self.key_while_cycling(code, edit),
             KeyCode::Enter if self.browsing => self.open(edit),
-            KeyCode::BackTab => {
-                *edit = LineEdit::new(&dirpick::up(&edit.buf));
-                self.browsing = false;
-            }
             KeyCode::Esc if self.browsing => self.browsing = false,
-            KeyCode::Up | KeyCode::Down if !self.browsing => self.browsing = count > 0,
+            KeyCode::Up | KeyCode::Down if !self.browsing => self.browsing = !self.names.is_empty(),
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if self.browsing => {
-                if let Some(to) = to {
-                    self.selected = dirpick::step(self.selected, count, self.grid(width).0, to);
-                }
+                let to = match code {
+                    KeyCode::Up => dirpick::Move::Up,
+                    KeyCode::Down => dirpick::Move::Down,
+                    KeyCode::Left => dirpick::Move::Left,
+                    _ => dirpick::Move::Right,
+                };
+                self.selected = dirpick::step(self.selected, self.names.len(), self.grid(width).0, to);
             }
-            // Resize arrives as Null and must not end browsing.
-            KeyCode::Null => return false,
             _ => {
                 self.browsing = false;
                 return false;
@@ -1791,11 +1799,76 @@ impl Folders {
         true
     }
 
+    fn key_while_cycling(&mut self, code: KeyCode, edit: &mut LineEdit) -> bool {
+        match code {
+            // The field already ends in a separator: just open the folder.
+            KeyCode::Enter | KeyCode::Char('/') | KeyCode::Char('\\') => self.settle(),
+            KeyCode::Esc => {
+                if let Some(typed) = self.cycling.take() {
+                    self.input = Some(typed.clone());
+                    *edit = LineEdit::new(&typed);
+                    self.selected = 0;
+                }
+            }
+            // Into the grid, on the folder the cycle had reached.
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(typed) = self.cycling.take() {
+                    self.input = Some(typed.clone());
+                    *edit = LineEdit::new(&typed);
+                    self.browsing = true;
+                }
+            }
+            // Anything else works on the text as it now stands.
+            _ => {
+                self.settle();
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Puts the next (or previous) match in the field, keeping the list that
+    /// was made for what was typed.
+    fn cycle(&mut self, forward: bool, edit: &mut LineEdit) {
+        let count = self.names.len();
+        if count == 0 {
+            return;
+        }
+        if count == 1 {
+            self.open(edit);
+            return;
+        }
+        self.selected = match (&self.cycling, self.browsing) {
+            (Some(_), _) => (self.selected + if forward { 1 } else { count - 1 }) % count,
+            // From the grid, take the highlighted folder first.
+            (None, true) => self.selected,
+            (None, false) => if forward { 0 } else { count - 1 },
+        };
+        let typed = self.cycling.take().unwrap_or_else(|| edit.buf.clone());
+        *edit = LineEdit::new(&dirpick::accept(&typed, &self.names[self.selected]));
+        // The list stays: this text is not a new search.
+        self.input = Some(edit.buf.clone());
+        self.cycling = Some(typed);
+        self.browsing = false;
+    }
+
+    /// Ends a cycle where it is: the next `refresh` lists for the field's text.
+    fn settle(&mut self) {
+        self.cycling = None;
+        self.input = None;
+        self.browsing = false;
+    }
+
+    fn move_to(&mut self, edit: &mut LineEdit, text: String) {
+        *edit = LineEdit::new(&text);
+        self.settle();
+    }
+
     fn open(&mut self, edit: &mut LineEdit) {
         if let Some(name) = self.names.get(self.selected) {
-            *edit = LineEdit::new(&dirpick::accept(&edit.buf, name));
+            let text = dirpick::accept(&edit.buf, name);
+            self.move_to(edit, text);
         }
-        self.browsing = false;
     }
 
     /// The grid and its key hint, to draw under the field.
@@ -1839,10 +1912,12 @@ impl Folders {
         if self.names.is_empty() {
             lines.push(ui::color::dim("     (no folder matches)"));
         }
-        lines.push(ui::color::dim(if self.browsing {
-            "   ←↑↓→ move · Enter/Tab open · Esc back to typing"
+        lines.push(ui::color::dim(if self.cycling.is_some() {
+            "   Tab/Shift+Tab cycle · Enter or \\ open · Esc undo"
+        } else if self.browsing {
+            "   ←↑↓→ move · Enter open · Tab cycle · Esc back to typing"
         } else {
-            "   Tab open · Shift+Tab up · ↑/↓ browse"
+            "   Tab cycle · ↑/↓ browse · Ctrl+Backspace up a folder"
         }));
         lines
     }
@@ -1865,7 +1940,7 @@ fn prompt_dir(title: &str, cwd: &std::path::Path) -> Result<Option<std::path::Pa
         lines.push(if error.is_empty() { ui::color::dim("   Enter confirm · Esc cancel") } else { ui::color::red(&format!("   {error}")) });
         ui::repaint_at(&lines, 3, edit.col(PREFIX.len()));
         let key = read_key()?;
-        if folders.key(key.code, &mut edit) {
+        if folders.key(key.code, key.ctrl, key.alt, &mut edit) {
             error.clear();
             continue;
         }
@@ -1989,7 +2064,7 @@ fn prompt_worktree_with_dir(profile: &str, cwd: &std::path::Path, queued: &[Stri
                 _ => {}
             }
         } else {
-            if folders.key(key.code, &mut dir) {
+            if folders.key(key.code, key.ctrl, key.alt, &mut dir) {
                 error.clear();
                 continue;
             }
@@ -3542,7 +3617,7 @@ mod tests {
         let mut folders = Folders { names: ["a", "b", "c", "d", "e"].map(String::from).to_vec(), ..Default::default() };
         let mut edit = LineEdit::new("x/");
         // Width 22 leaves 18 columns: three cells of 6.
-        let mut press = |f: &mut Folders, code| f.key_at(code, &mut edit, 22);
+        let mut press = |f: &mut Folders, code| f.key_at(code, false, false, &mut edit, 22);
         assert!(!press(&mut folders, KeyCode::Left));
         assert!(press(&mut folders, KeyCode::Down));
         assert_eq!((folders.browsing, folders.selected), (true, 0));
@@ -3558,6 +3633,55 @@ mod tests {
         assert!(press(&mut folders, KeyCode::Enter));
         assert_eq!(edit.buf, "x/e/");
         assert_eq!(folders.lines_at(22, 10).len(), 3, "two rows and the hint");
+    }
+
+    /// A real folder tree, driven the way the prompt drives it: `refresh`
+    /// before every key.
+    #[test]
+    fn tab_cycles_through_the_matches_of_what_was_typed() {
+        let root = std::env::temp_dir().join(format!("cockpit-cycle-{}", std::process::id()));
+        for d in ["docs/inner", "Documents", "Downloads", "other/only"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let (mut folders, mut edit) = (Folders::default(), LineEdit::new("Do"));
+        let mut press = |folders: &mut Folders, edit: &mut LineEdit, code, ctrl, alt| {
+            folders.refresh(&edit.buf, &root);
+            let used = folders.key_at(code, ctrl, alt, edit, 80);
+            folders.refresh(&edit.buf, &root);
+            (used, edit.buf.clone())
+        };
+        let sep = std::path::MAIN_SEPARATOR;
+        let with = |name: &str| format!("{name}{sep}");
+        let mut tab = |f: &mut Folders, e: &mut LineEdit| press(f, e, KeyCode::Tab, false, false).1;
+        assert_eq!(tab(&mut folders, &mut edit), with("docs"));
+        assert_eq!(tab(&mut folders, &mut edit), with("Documents"));
+        assert_eq!(tab(&mut folders, &mut edit), with("Downloads"));
+        assert_eq!(tab(&mut folders, &mut edit), with("docs"), "round again");
+        assert_eq!(folders.names.len(), 3, "the list stays the one for what was typed");
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::BackTab, false, false).1, with("Downloads"));
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Esc, false, false), (true, "Do".to_string()));
+        assert!(!press(&mut folders, &mut edit, KeyCode::Esc, false, false).0, "the next Esc cancels");
+        // Enter opens the folder reached; a separator does too, without doubling.
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Tab, false, false).1, with("docs"));
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Enter, false, false), (true, with("docs")));
+        assert_eq!(folders.names, ["inner"]);
+        assert!(!press(&mut folders, &mut edit, KeyCode::Enter, false, false).0, "a second Enter confirms");
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Backspace, true, false).1, "");
+        edit = LineEdit::new("Do");
+        press(&mut folders, &mut edit, KeyCode::Tab, false, false);
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Char('/'), false, false), (true, with("docs")));
+        assert_eq!(folders.names, ["inner"]);
+        // A lone match is opened at once, and Alt+Up goes back up.
+        edit = LineEdit::new("oth");
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Tab, false, false).1, with("other"));
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Tab, false, false).1, format!("{}only{sep}", with("other")));
+        assert_eq!(press(&mut folders, &mut edit, KeyCode::Up, false, true).1, with("other"));
+        // Typing ends a cycle and the list follows the text again.
+        edit = LineEdit::new("Do");
+        press(&mut folders, &mut edit, KeyCode::Tab, false, false);
+        assert!(!press(&mut folders, &mut edit, KeyCode::Char('x'), false, false).0);
+        assert!(folders.cycling.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -210,9 +210,12 @@ With session wrapping on, everything that opens Claude (an account, resume, hand
   too.
 - Clicking in the focused pane reaches its program; clicking another pane only
   focuses it. Dragging selects and copies.
-- Directory prompts show the folders under what you typed in a grid. `Tab` opens
-  the highlighted one, Shift+`Tab` goes up, `Enter` confirms. `↑` / `↓` enter
-  the grid: there the arrows move, `Enter` opens and `Esc` returns to typing.
+- Directory prompts show the folders under what you typed in a grid. `Tab` and
+  Shift+`Tab` cycle through them (a lone match opens at once); `Enter` or a
+  slash opens the one reached and `Esc` brings back what you typed. `Enter`
+  again confirms. Ctrl+`Backspace` (or Alt+`↑`) goes up a folder. `↑` / `↓`
+  enter the grid: there the arrows move, `Enter` opens and `Esc` returns to
+  typing.
 
 ## Restoring panes (cpit)
 

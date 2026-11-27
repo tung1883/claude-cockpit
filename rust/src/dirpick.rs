@@ -39,8 +39,10 @@ pub fn up(input: &str) -> String {
     if !name.is_empty() {
         return parent.to_string();
     }
-    let (above, _) = split(parent.trim_end_matches(['/', '\\']));
-    if above.is_empty() {
+    let folder = parent.trim_end_matches(['/', '\\']);
+    let (above, _) = split(folder);
+    // A drive or the root has nothing above it; a lone relative folder does.
+    if above.is_empty() && (folder.is_empty() || folder.ends_with(':')) {
         input.to_string()
     } else {
         above.to_string()
@@ -151,6 +153,8 @@ mod tests {
         assert_eq!(up("C:/Users/Tung/Docu"), "C:/Users/Tung/");
         assert_eq!(up("C:/Users/Tung/"), "C:/Users/");
         assert_eq!(up("C:/"), "C:/");
+        assert_eq!(up("/"), "/");
+        assert_eq!(up("docs/"), "");
     }
 
     #[test]
